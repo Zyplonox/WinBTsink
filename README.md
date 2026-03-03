@@ -1,4 +1,4 @@
-# BT-AudioSink
+# WinBTsink
 
 > **Disclaimer:** This project was built entirely with the assistance of [Claude Code](https://claude.ai/code) (Anthropic's AI coding assistant). All code, scripts, and documentation were generated through an AI-guided development session.
 
