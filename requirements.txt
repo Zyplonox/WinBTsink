@@ -1,0 +1,26 @@
+# Python dependencies for BT-AudioSink
+#
+# Installation:
+#   pip install -r requirements.txt
+
+# ── Bluetooth stack ───────────────────────────────────────────────────────────
+# Replaces the Windows BT stack entirely via WinUSB / libusb
+bumble>=0.0.180
+
+# ── Audio ─────────────────────────────────────────────────────────────────────
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Bundles FFmpeg automatically (no winget / manual installation required)
+imageio-ffmpeg>=0.4.9
+
+# ── GUI ───────────────────────────────────────────────────────────────────────
+customtkinter>=5.2.0
+Pillow>=10.0.0
+
+# System tray icon (minimize to tray)
+pystray>=0.19.4
+
+# ── Optional ──────────────────────────────────────────────────────────────────
+# USB device enumeration (debugging / dongle detection)
+pyusb>=1.2.1
