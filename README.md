@@ -103,9 +103,9 @@ powershell -ExecutionPolicy Bypass -File setup\install.ps1
 
 | Element | Function |
 |---------|----------|
-| **▶ Start** | Start the BT stack and activate the dongle |
-| **■ Stop** | Stop everything cleanly |
-| **⚙ Settings** | Device name, latency, audio device, autostart |
+| **Start** | Start the BT stack and activate the dongle |
+| **Stop** | Stop everything cleanly |
+| **Settings** | Device name, latency, audio device, autostart |
 | **USB Dongle** | Dropdown + Scan button: select the WinUSB dongle |
 | **Volume** | Output volume slider (0–200%) |
 | **Install WinUSB…** | Download & launch Zadig |
