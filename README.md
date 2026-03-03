@@ -43,9 +43,9 @@ USB dongle ──(libusb / WinUSB)──▶  Bumble (Python BT stack)
 ### Option A – Pre-built EXE
 
 1. Download `BT-AudioSink.exe` from the [Releases](../../releases) page
-2. Run it (double-click)
-3. Install the WinUSB driver once: **⚙ Settings → Install WinUSB…**
-4. Click **▶ Start** → pair your device → done
+2. Run it
+3. Install the WinUSB driver once: **Settings → Install WinUSB…**
+5. Click **Start** → pair your device → done
 
 > **Note:** The EXE is ~94 MB. This is expected — it bundles a full FFmpeg binary (~83 MB)
 > needed to decode Bluetooth SBC audio. There is no lighter alternative.
@@ -71,18 +71,18 @@ python src\gui.py
 
 ## Installation (one-time)
 
-### Step 1 – Install Python *(Option B / C only)*
+### Step 1 – Install Python
 
 If not already installed: https://www.python.org/downloads/
 **Important:** Check "Add Python to PATH" during setup!
 
-### Step 2 – Install dependencies *(Option B / C only)*
+### Step 2 – Install dependencies
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File setup\install.ps1
 ```
 
-### Step 3 – Install the WinUSB driver *(most important step!)*
+### Step 3 – Install the WinUSB driver
 
 1. Plug in your Bluetooth dongle
 2. Download **Zadig**: https://zadig.akeo.ie/
@@ -115,7 +115,7 @@ powershell -ExecutionPolicy Bypass -File setup\install.ps1
 
 ### Pairing from a Bluetooth device (e.g. Nintendo Switch)
 
-1. Click **▶ Start** and wait until status shows "Waiting for device…" (blue)
+1. Click **Start** and wait until status shows "Waiting for device…" (blue)
 2. Switch: **System Settings → Bluetooth Audio → Pair Device**
 3. Select `PC-AudioSink` from the list
 4. Play audio → it comes out of your PC speakers
