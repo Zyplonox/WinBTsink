@@ -355,7 +355,7 @@ class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, parent: "App"):
         super().__init__(parent)
         self.title("Settings")
-        self.geometry("420x620")
+        self.geometry("420x670")
         self.resizable(False, False)
         self.grab_set()  # Block interaction with the main window
 
@@ -367,6 +367,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self._add_bitpool_row()
         self._add_audio_device_row()
         self._add_checkboxes()
+        self._add_clear_keys_row()
         self._add_buttons()
 
     # ------------------------------------------------------------------
@@ -463,6 +464,29 @@ class SettingsDialog(ctk.CTkToplevel):
             text="Start with Windows (autostart, minimized to tray)",
             variable=self._autostart_var,
         ).pack(anchor="w", padx=20, pady=(8, 0))
+
+    def _add_clear_keys_row(self) -> None:
+        """Button to wipe all saved bonding keys."""
+        ctk.CTkButton(
+            self,
+            text="Clear saved devices (delete keys.json)",
+            fg_color="#374151", hover_color="#6B7280",
+            command=self._clear_keys,
+        ).pack(fill="x", padx=20, pady=(20, 0))
+
+    def _clear_keys(self) -> None:
+        path = _keys_file()
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                msg = "Bonding keys deleted – all devices must re-pair."
+            else:
+                msg = "No keys file found (nothing to delete)."
+        except Exception as exc:
+            msg = f"Failed to delete keys: {exc}"
+        # Forward message to the main window log
+        if hasattr(self.master, "_log"):
+            self.master._log(msg)
 
     def _add_buttons(self) -> None:
         """Cancel / Save button row at the bottom of the dialog."""
