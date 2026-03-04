@@ -919,15 +919,14 @@ class SinkBackend:
 
     def _on_avdtp_connection(self, server, device: Device) -> None:
         """Called by the AVDTP Listener when a new AVDTP session is established."""
-        # Check if this connection still needs user approval (dialog is open).
-        # If so, defer sink registration until the user clicks Allow/Deny.
-        try:
-            peer_addr = str(server.l2cap_channel.connection.peer_address).upper()
-        except Exception:
-            peer_addr = None
+        # If a pairing dialog is open for any device, defer AVDTP sink
+        # registration until the user approves or denies.  We take the first
+        # (and in practice only) pending future; the connection is single at
+        # this point because Classic BT is serial.
+        if self._pending_approvals:
+            pending = next(iter(self._pending_approvals.values()))
+            self._log("AVDTP: waiting for pairing approval…")
 
-        pending = self._pending_approvals.get(peer_addr) if peer_addr else None
-        if pending is not None:
             async def _deferred_connect() -> None:
                 try:
                     result = await asyncio.shield(pending)
@@ -937,8 +936,8 @@ class SinkBackend:
                 if approved:
                     self._log("AVDTP connection established")
                     self._register_sbc_sink(server)
-                # If denied, the ACL disconnect triggered by _handle_result
-                # will also close the AVDTP channel automatically.
+                # If denied, _handle_result disconnects the ACL which also
+                # closes this AVDTP channel automatically.
             asyncio.ensure_future(_deferred_connect())
             return
 
