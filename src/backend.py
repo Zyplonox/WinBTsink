@@ -571,6 +571,7 @@ class SinkBackend:
         # Pairing control
         self._pairing_allowed = True           # Allow new (unknown) device pairings
         self._remember_map: dict[str, bool] = {}  # addr -> should persist key to disk
+        self._pending_approvals: dict[str, "asyncio.Future"] = {}  # addr_upper -> approval future (gates AVDTP)
 
         # Runtime state – all set during start()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -843,6 +844,11 @@ class SinkBackend:
                 loop = asyncio.get_event_loop()
                 future: "asyncio.Future[tuple]" = loop.create_future()
 
+                # Gate the AVDTP handler: it will wait on this future before
+                # registering the audio sink, so audio cannot start until the
+                # user explicitly approves.
+                self._pending_approvals[addr_upper] = future
+
                 def resolve(approved: bool, remember: bool) -> None:
                     if not future.done():
                         loop.call_soon_threadsafe(future.set_result, (approved, remember))
@@ -854,6 +860,9 @@ class SinkBackend:
                         approved, remember = await asyncio.wait_for(future, timeout=30.0)
                     except asyncio.TimeoutError:
                         approved, remember = False, False
+
+                    # Release the AVDTP gate regardless of outcome
+                    self._pending_approvals.pop(addr_upper, None)
 
                     if not approved:
                         self._log(f"Pairing denied: {name} ({addr})")
@@ -910,6 +919,29 @@ class SinkBackend:
 
     def _on_avdtp_connection(self, server, device: Device) -> None:
         """Called by the AVDTP Listener when a new AVDTP session is established."""
+        # Check if this connection still needs user approval (dialog is open).
+        # If so, defer sink registration until the user clicks Allow/Deny.
+        try:
+            peer_addr = str(server.l2cap_channel.connection.peer_address).upper()
+        except Exception:
+            peer_addr = None
+
+        pending = self._pending_approvals.get(peer_addr) if peer_addr else None
+        if pending is not None:
+            async def _deferred_connect() -> None:
+                try:
+                    result = await asyncio.shield(pending)
+                    approved = result[0] if isinstance(result, tuple) else bool(result)
+                except Exception:
+                    approved = False
+                if approved:
+                    self._log("AVDTP connection established")
+                    self._register_sbc_sink(server)
+                # If denied, the ACL disconnect triggered by _handle_result
+                # will also close the AVDTP channel automatically.
+            asyncio.ensure_future(_deferred_connect())
+            return
+
         self._log("AVDTP connection established")
         self._register_sbc_sink(server)
 
