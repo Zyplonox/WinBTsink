@@ -956,6 +956,15 @@ class SinkBackend:
             self._log(f"Stream START → {sample_rate} Hz, {channels} ch")
 
             def _launch_pipeline() -> None:
+                # Stop any existing pipeline before creating a new one so we
+                # never accumulate multiple simultaneous pipelines.
+                if pipeline_ref[0] is not None:
+                    pipeline_ref[0].stop()
+                    pipeline_ref[0] = None
+                if self._pipeline is not None:
+                    self._pipeline.stop()
+                    self._pipeline = None
+
                 pipeline = SbcAudioPipeline(
                     ffmpeg_exe=self._ffmpeg_exe,
                     latency_ms=self._latency_ms,
@@ -986,7 +995,10 @@ class SinkBackend:
                         approved = result[0] if isinstance(result, tuple) else bool(result)
                     except Exception:
                         approved = False
-                    if approved:
+                    # Guard: only launch if no pipeline is already running.
+                    # Multiple on_start events before approval would otherwise
+                    # each spawn a pipeline when the future resolves.
+                    if approved and pipeline_ref[0] is None:
                         _launch_pipeline()
                     # If denied, _handle_result disconnects the ACL which
                     # also stops the AVDTP stream automatically.
