@@ -55,6 +55,9 @@ def _config_file() -> str:
 def _keys_file() -> str:
     return os.path.join(_appdata_dir(), "keys.json")
 
+def _allowed_macs_file() -> str:
+    return os.path.join(_appdata_dir(), "allowed_macs.json")
+
 
 # ---------------------------------------------------------------------------
 # USB dongle enumeration
@@ -475,16 +478,27 @@ class SettingsDialog(ctk.CTkToplevel):
         ).pack(fill="x", padx=20, pady=(20, 0))
 
     def _clear_keys(self) -> None:
-        path = _keys_file()
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-                msg = "Bonding keys deleted – all devices must re-pair."
-            else:
-                msg = "No keys file found (nothing to delete)."
-        except Exception as exc:
-            msg = f"Failed to delete keys: {exc}"
-        # Forward message to the main window log
+        deleted = []
+        errors = []
+        for path in (_keys_file(), _allowed_macs_file()):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    deleted.append(os.path.basename(path))
+            except Exception as exc:
+                errors.append(f"{os.path.basename(path)}: {exc}")
+
+        # Also wipe the in-memory allowed-MACs set in the running backend
+        if hasattr(self.master, "_backend") and self.master._backend:
+            self.master._backend.clear_allowed_macs()
+
+        if errors:
+            msg = "Error clearing devices: " + ", ".join(errors)
+        elif deleted:
+            msg = f"Saved devices cleared ({', '.join(deleted)}) – all devices must re-pair."
+        else:
+            msg = "No saved devices found (nothing to delete)."
+
         if hasattr(self.master, "_log"):
             self.master._log(msg)
 
@@ -1223,6 +1237,7 @@ class App(ctk.CTk):
             ffmpeg_exe=_get_ffmpeg(),
             debug=settings.debug_mode,
             keystore_path=_keys_file(),
+            allowed_macs_path=_allowed_macs_file(),
             # Route all callbacks through after() to stay on the mainloop thread
             on_state_change=lambda s: self.after(0, self._on_state_change, s),
             on_device_connected=lambda n, a: self.after(0, self._on_device_connected, n, a),

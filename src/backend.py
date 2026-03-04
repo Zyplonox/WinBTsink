@@ -141,6 +141,29 @@ def _is_in_keystore(keystore, addr_str: str) -> bool:
     return any(str(a).upper() == addr_str.upper() for a in keystore.store)
 
 
+def _load_allowed_macs(path: Path) -> set:
+    """Loads the set of previously allowed MAC addresses from disk."""
+    try:
+        if path.exists():
+            with open(path, encoding="utf-8") as f:
+                data = _json.load(f)
+            if isinstance(data, list):
+                return {str(m).upper() for m in data}
+    except Exception as e:
+        log.debug("Load allowed_macs: %s", e)
+    return set()
+
+
+def _save_allowed_macs(macs: set, path: Path) -> None:
+    """Persists the allowed MAC set to disk."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(sorted(macs), f, indent=2)
+    except Exception as e:
+        log.debug("Save allowed_macs: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Pairing confirmation delegate
 # ---------------------------------------------------------------------------
@@ -507,6 +530,7 @@ class SinkBackend:
         ffmpeg_exe: str = "ffmpeg",
         debug: bool = False,
         keystore_path: Optional[str] = None,
+        allowed_macs_path: Optional[str] = None,
         # Callbacks
         on_state_change: Optional[Callable[[SinkState], None]] = None,
         on_device_connected: Optional[Callable[[str, str], None]] = None,
@@ -530,6 +554,11 @@ class SinkBackend:
         # Feature flags
         self._debug = debug
         self._keystore_path = Path(keystore_path) if keystore_path else None
+        self._allowed_macs_path = Path(allowed_macs_path) if allowed_macs_path else None
+        self._allowed_macs: set = (
+            _load_allowed_macs(self._allowed_macs_path)
+            if self._allowed_macs_path else set()
+        )
 
         # GUI callbacks
         self._cb_state = on_state_change
@@ -568,6 +597,10 @@ class SinkBackend:
         self._volume = max(0.0, min(2.0, volume))
         if self._pipeline:
             self._pipeline.set_volume(self._volume)
+
+    def clear_allowed_macs(self) -> None:
+        """Wipes the in-memory allowed-MAC set (file already deleted by the GUI)."""
+        self._allowed_macs.clear()
 
     def set_pairing_mode(self, allowed: bool) -> None:
         """Allow (True) or block (False) pairing requests from unknown devices.
@@ -769,7 +802,10 @@ class SinkBackend:
         def _pairing_config_factory(connection) -> PairingConfig:
             addr = str(connection.peer_address)
             name = str(getattr(connection, "peer_name", None) or connection.peer_address)
-            is_known = _is_in_keystore(device.keystore, addr)
+            is_known = (
+                addr.upper() in self._allowed_macs
+                or _is_in_keystore(device.keystore, addr)
+            )
 
             if not self._pairing_allowed and not is_known:
                 # Silently reject – user disabled new pairings
@@ -814,11 +850,23 @@ class SinkBackend:
         def on_connection(connection):
             name = str(connection.peer_name or connection.peer_address)
             addr = str(connection.peer_address)
+            addr_upper = addr.upper()
 
-            if not self._pairing_allowed and not _is_in_keystore(device.keystore, addr):
+            is_known = (
+                addr_upper in self._allowed_macs
+                or _is_in_keystore(device.keystore, addr)
+            )
+
+            if not self._pairing_allowed and not is_known:
                 self._log(f"Rejected unknown device: {name} ({addr})")
                 asyncio.ensure_future(connection.disconnect())
                 return
+
+            # Remember this device for future sessions
+            if addr_upper not in self._allowed_macs:
+                self._allowed_macs.add(addr_upper)
+                if self._allowed_macs_path:
+                    _save_allowed_macs(self._allowed_macs, self._allowed_macs_path)
 
             self._log(f"BT connected: {name} ({addr})")
             self._set_state(SinkState.CONNECTED)
