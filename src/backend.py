@@ -919,28 +919,6 @@ class SinkBackend:
 
     def _on_avdtp_connection(self, server, device: Device) -> None:
         """Called by the AVDTP Listener when a new AVDTP session is established."""
-        # If a pairing dialog is open for any device, defer AVDTP sink
-        # registration until the user approves or denies.  We take the first
-        # (and in practice only) pending future; the connection is single at
-        # this point because Classic BT is serial.
-        if self._pending_approvals:
-            pending = next(iter(self._pending_approvals.values()))
-            self._log("AVDTP: waiting for pairing approval…")
-
-            async def _deferred_connect() -> None:
-                try:
-                    result = await asyncio.shield(pending)
-                    approved = result[0] if isinstance(result, tuple) else bool(result)
-                except Exception:
-                    approved = False
-                if approved:
-                    self._log("AVDTP connection established")
-                    self._register_sbc_sink(server)
-                # If denied, _handle_result disconnects the ACL which also
-                # closes this AVDTP channel automatically.
-            asyncio.ensure_future(_deferred_connect())
-            return
-
         self._log("AVDTP connection established")
         self._register_sbc_sink(server)
 
@@ -977,23 +955,46 @@ class SinkBackend:
             sample_rate, channels = _extract_codec_params(sink)
             self._log(f"Stream START → {sample_rate} Hz, {channels} ch")
 
-            pipeline = SbcAudioPipeline(
-                ffmpeg_exe=self._ffmpeg_exe,
-                latency_ms=self._latency_ms,
-                device_index=self._audio_device_index,
-                on_level=self._cb_level,
-            )
-            pipeline.set_volume(self._volume)
+            def _launch_pipeline() -> None:
+                pipeline = SbcAudioPipeline(
+                    ffmpeg_exe=self._ffmpeg_exe,
+                    latency_ms=self._latency_ms,
+                    device_index=self._audio_device_index,
+                    on_level=self._cb_level,
+                )
+                pipeline.set_volume(self._volume)
+                try:
+                    pipeline.start(sample_rate, channels)
+                    self._log("Audio pipeline started")
+                except Exception as exc:
+                    self._log(f"Pipeline error: {exc}")
+                    return
+                self._pipeline = pipeline
+                pipeline_ref[0] = pipeline
 
-            try:
-                pipeline.start(sample_rate, channels)
-                self._log("Audio pipeline started")
-            except Exception as exc:
-                self._log(f"Pipeline error: {exc}")
+            # If a pairing dialog is open, wait for user approval before
+            # starting audio.  The AVDTP handshake has already completed so
+            # the remote device stays connected; we just don't produce sound
+            # until the user clicks Allow.
+            if self._pending_approvals:
+                pending = next(iter(self._pending_approvals.values()))
+                self._log("Audio: waiting for pairing approval…")
+
+                async def _deferred_start() -> None:
+                    try:
+                        result = await asyncio.shield(pending)
+                        approved = result[0] if isinstance(result, tuple) else bool(result)
+                    except Exception:
+                        approved = False
+                    if approved:
+                        _launch_pipeline()
+                    # If denied, _handle_result disconnects the ACL which
+                    # also stops the AVDTP stream automatically.
+
+                asyncio.ensure_future(_deferred_start())
                 return
 
-            self._pipeline = pipeline
-            pipeline_ref[0] = pipeline
+            _launch_pipeline()
 
         @sink.on("stop")
         def on_stop():
