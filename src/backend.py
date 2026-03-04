@@ -797,34 +797,9 @@ class SinkBackend:
             device.keystore = _load_keystore(self._keystore_path, self._bt_address)
             log.debug("Keystore loaded: %s", self._keystore_path)
 
-        # Pairing policy: auto-accept known devices, ask user for unknown ones,
-        # or silently reject unknown ones when pairing mode is disabled.
-        def _pairing_config_factory(connection) -> PairingConfig:
-            addr = str(connection.peer_address)
-            name = str(getattr(connection, "peer_name", None) or connection.peer_address)
-            is_known = (
-                addr.upper() in self._allowed_macs
-                or _is_in_keystore(device.keystore, addr)
-            )
-
-            if not self._pairing_allowed and not is_known:
-                # Silently reject – user disabled new pairings
-                class _Reject(PairingDelegate):
-                    async def accept(self) -> bool:
-                        return False
-                return PairingConfig(mitm=False, delegate=_Reject())
-
-            if self._cb_pairing_request and not is_known:
-                # Ask the user via GUI dialog
-                delegate = ConfirmingPairingDelegate(
-                    name, addr, self._cb_pairing_request, self._remember_map
-                )
-                return PairingConfig(mitm=False, delegate=delegate)
-
-            # Known device or no pairing callback – auto-accept
-            return PairingConfig(mitm=False)
-
-        device.pairing_config_factory = _pairing_config_factory
+        # Connection-level access control is handled in on_connection.
+        # The pairing factory only needs to allow the BT handshake to proceed.
+        device.pairing_config_factory = lambda conn: PairingConfig(mitm=False)
 
         return device
 
@@ -857,12 +832,47 @@ class SinkBackend:
                 or _is_in_keystore(device.keystore, addr)
             )
 
-            if not self._pairing_allowed and not is_known:
+            # Unknown device, pairing blocked → reject immediately
+            if not is_known and not self._pairing_allowed:
                 self._log(f"Rejected unknown device: {name} ({addr})")
                 asyncio.ensure_future(connection.disconnect())
                 return
 
-            # Remember this device for future sessions
+            # Unknown device, pairing allowed, dialog callback set → ask user
+            if not is_known and self._cb_pairing_request:
+                loop = asyncio.get_event_loop()
+                future: "asyncio.Future[tuple]" = loop.create_future()
+
+                def resolve(approved: bool, remember: bool) -> None:
+                    if not future.done():
+                        loop.call_soon_threadsafe(future.set_result, (approved, remember))
+
+                self._cb_pairing_request(name, addr, resolve)
+
+                async def _handle_result() -> None:
+                    try:
+                        approved, remember = await asyncio.wait_for(future, timeout=30.0)
+                    except asyncio.TimeoutError:
+                        approved, remember = False, False
+
+                    if not approved:
+                        self._log(f"Pairing denied: {name} ({addr})")
+                        await connection.disconnect()
+                        return
+
+                    self._allowed_macs.add(addr_upper)
+                    if remember and self._allowed_macs_path:
+                        _save_allowed_macs(self._allowed_macs, self._allowed_macs_path)
+
+                    self._log(f"BT connected: {name} ({addr})")
+                    self._set_state(SinkState.CONNECTED)
+                    if self._cb_connected:
+                        self._cb_connected(name, addr)
+
+                asyncio.ensure_future(_handle_result())
+                return
+
+            # Known device or no dialog callback → proceed directly
             if addr_upper not in self._allowed_macs:
                 self._allowed_macs.add(addr_upper)
                 if self._allowed_macs_path:

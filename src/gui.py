@@ -1259,6 +1259,7 @@ class App(ctk.CTk):
         )
         self._scan_dongle_btn.configure(state="normal")
         if self._backend:
+            self._log("BT stack stopped.")
             # Stop on a daemon thread so the UI stays responsive during cleanup
             threading.Thread(target=self._backend.stop, daemon=True).start()
             self._backend = None
