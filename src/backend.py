@@ -170,45 +170,59 @@ def _save_allowed_macs(macs: set, path: Path) -> None:
 
 class ConfirmingPairingDelegate(PairingDelegate):
     """
-    Pairing delegate that calls an on_request callback to ask the user
-    whether to accept or reject a new pairing.
+    BT Classic pairing delegate that mirrors the connection-level approval state.
 
-    The callback signature is: on_request(name, address, resolve)
-    where resolve(approved: bool, remember: bool) can be called from any thread.
+    The user-facing dialog is shown by _attach_connection_handlers (on_connection).
+    This delegate gates the BT key exchange to match that decision without showing
+    a second dialog:
 
-    If the user does not respond within TIMEOUT seconds the pairing is
-    automatically rejected.
+      - Device already in allowed_macs (user already approved)  → auto-approve
+      - Approval future pending in _pending_approvals            → wait for user
+      - Pairing blocked (_pairing_allowed=False)                 → auto-reject
+      - Unknown device, no dialog open (shouldn't happen)        → reject
+
+    Timeout is slightly longer than the 30 s on_connection timeout so that the
+    key exchange always resolves after the dialog does.
     """
 
-    TIMEOUT = 30.0
+    TIMEOUT = 35.0
 
     def __init__(
         self,
-        name: str,
-        address: str,
-        on_request: Callable,
-        remember_map: dict,
+        address_upper: str,
+        allowed_macs_ref: set,
+        pending_approvals_ref: dict,
+        pairing_allowed_fn: Callable[[], bool],
     ):
         super().__init__(PairingDelegate.IoCapability.NO_OUTPUT_NO_INPUT)
-        self._name = name
-        self._address = address
-        self._on_request = on_request
-        self._remember_map = remember_map
+        self._address_upper = address_upper
+        self._allowed_macs = allowed_macs_ref
+        self._pending_approvals = pending_approvals_ref
+        self._pairing_allowed_fn = pairing_allowed_fn
 
     async def accept(self) -> bool:
-        loop = asyncio.get_running_loop()
-        future: "asyncio.Future[bool]" = loop.create_future()
+        # Device was already approved via the connection-level dialog
+        if self._address_upper in self._allowed_macs:
+            return True
 
-        def resolve(approved: bool, remember: bool) -> None:
-            self._remember_map[self._address] = remember
-            if not future.done():
-                loop.call_soon_threadsafe(future.set_result, approved)
+        # A dialog is currently open for this device – wait for its result
+        pending = self._pending_approvals.get(self._address_upper)
+        if pending is not None:
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(pending), timeout=self.TIMEOUT
+                )
+                return result[0] if isinstance(result, tuple) else bool(result)
+            except Exception:
+                return False
 
-        self._on_request(self._name, self._address, resolve)
-        try:
-            return await asyncio.wait_for(future, timeout=self.TIMEOUT)
-        except asyncio.TimeoutError:
+        # No dialog open and device not approved – reject if pairing is blocked
+        if not self._pairing_allowed_fn():
             return False
+
+        # Pairing allowed but no dialog was initiated (rare race where accept()
+        # fires before on_connection); reject conservatively.
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -798,9 +812,18 @@ class SinkBackend:
             device.keystore = _load_keystore(self._keystore_path, self._bt_address)
             log.debug("Keystore loaded: %s", self._keystore_path)
 
-        # Connection-level access control is handled in on_connection.
-        # The pairing factory only needs to allow the BT handshake to proceed.
-        device.pairing_config_factory = lambda conn: PairingConfig(mitm=False)
+        # Gate BT key exchange to match the connection-level approval dialog.
+        # ConfirmingPairingDelegate waits for (or reads) the on_connection
+        # decision so key exchange only completes when the user clicks Allow.
+        device.pairing_config_factory = lambda conn: PairingConfig(
+            mitm=False,
+            delegate=ConfirmingPairingDelegate(
+                address_upper=str(conn.peer_address).upper(),
+                allowed_macs_ref=self._allowed_macs,
+                pending_approvals_ref=self._pending_approvals,
+                pairing_allowed_fn=lambda: self._pairing_allowed,
+            ),
+        )
 
         return device
 
@@ -860,6 +883,10 @@ class SinkBackend:
                         approved, remember = await asyncio.wait_for(future, timeout=30.0)
                     except asyncio.TimeoutError:
                         approved, remember = False, False
+
+                    # Persist the remember choice so on_disconnection knows
+                    # whether to save the BT key to disk (Case 1: yes / Case 2: no).
+                    self._remember_map[addr] = remember
 
                     # Release the AVDTP gate regardless of outcome
                     self._pending_approvals.pop(addr_upper, None)
