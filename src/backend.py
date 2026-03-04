@@ -54,7 +54,7 @@ try:
         A2DP_SBC_CODEC_TYPE as SBC_CODEC_TYPE,
         make_audio_sink_service_sdp_records,
     )
-    from bumble.pairing import PairingConfig
+    from bumble.pairing import PairingConfig, PairingDelegate
     from bumble.keys import JsonKeyStore
 except ImportError as e:
     raise ImportError(
@@ -132,6 +132,60 @@ def _save_keystore(keystore: "JsonKeyStore", path: Path) -> None:
             _json.dump(data, f, indent=2)
     except Exception as e:
         log.debug("Save keystore: %s", e)
+
+
+def _is_in_keystore(keystore, addr_str: str) -> bool:
+    """Returns True if the given BT address already has a stored bonding key."""
+    if keystore is None or not hasattr(keystore, "store"):
+        return False
+    return any(str(a).upper() == addr_str.upper() for a in keystore.store)
+
+
+# ---------------------------------------------------------------------------
+# Pairing confirmation delegate
+# ---------------------------------------------------------------------------
+
+class ConfirmingPairingDelegate(PairingDelegate):
+    """
+    Pairing delegate that calls an on_request callback to ask the user
+    whether to accept or reject a new pairing.
+
+    The callback signature is: on_request(name, address, resolve)
+    where resolve(approved: bool, remember: bool) can be called from any thread.
+
+    If the user does not respond within TIMEOUT seconds the pairing is
+    automatically rejected.
+    """
+
+    TIMEOUT = 30.0
+
+    def __init__(
+        self,
+        name: str,
+        address: str,
+        on_request: Callable,
+        remember_map: dict,
+    ):
+        super().__init__(PairingDelegate.IoCapability.NO_OUTPUT_NO_INPUT)
+        self._name = name
+        self._address = address
+        self._on_request = on_request
+        self._remember_map = remember_map
+
+    async def accept(self) -> bool:
+        loop = asyncio.get_running_loop()
+        future: "asyncio.Future[bool]" = loop.create_future()
+
+        def resolve(approved: bool, remember: bool) -> None:
+            self._remember_map[self._address] = remember
+            if not future.done():
+                loop.call_soon_threadsafe(future.set_result, approved)
+
+        self._on_request(self._name, self._address, resolve)
+        try:
+            return await asyncio.wait_for(future, timeout=self.TIMEOUT)
+        except asyncio.TimeoutError:
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +513,7 @@ class SinkBackend:
         on_device_disconnected: Optional[Callable[[str], None]] = None,
         on_audio_level: Optional[Callable[[float], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
+        on_pairing_request: Optional[Callable] = None,
     ):
         # BT / USB parameters
         self._device_name = device_name
@@ -482,6 +537,11 @@ class SinkBackend:
         self._cb_disconnected = on_device_disconnected
         self._cb_level = on_audio_level
         self._cb_log = on_log
+        self._cb_pairing_request = on_pairing_request
+
+        # Pairing control
+        self._pairing_allowed = True           # Allow new (unknown) device pairings
+        self._remember_map: dict[str, bool] = {}  # addr -> should persist key to disk
 
         # Runtime state – all set during start()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -507,6 +567,10 @@ class SinkBackend:
         self._volume = max(0.0, min(2.0, volume))
         if self._pipeline:
             self._pipeline.set_volume(self._volume)
+
+    def set_pairing_mode(self, allowed: bool) -> None:
+        """Allow (True) or block (False) pairing requests from unknown devices."""
+        self._pairing_allowed = allowed
 
     def start(self) -> None:
         """
@@ -689,8 +753,31 @@ class SinkBackend:
             device.keystore = _load_keystore(self._keystore_path, self._bt_address)
             log.debug("Keystore loaded: %s", self._keystore_path)
 
-        # Accept pairing without MITM protection (PIN/passkey not needed for audio)
-        device.pairing_config_factory = lambda conn: PairingConfig(mitm=False)
+        # Pairing policy: auto-accept known devices, ask user for unknown ones,
+        # or silently reject unknown ones when pairing mode is disabled.
+        def _pairing_config_factory(connection) -> PairingConfig:
+            addr = str(connection.peer_address)
+            name = str(getattr(connection, "peer_name", None) or connection.peer_address)
+            is_known = _is_in_keystore(device.keystore, addr)
+
+            if not self._pairing_allowed and not is_known:
+                # Silently reject – user disabled new pairings
+                class _Reject(PairingDelegate):
+                    async def accept(self) -> bool:
+                        return False
+                return PairingConfig(mitm=False, delegate=_Reject())
+
+            if self._cb_pairing_request and not is_known:
+                # Ask the user via GUI dialog
+                delegate = ConfirmingPairingDelegate(
+                    name, addr, self._cb_pairing_request, self._remember_map
+                )
+                return PairingConfig(mitm=False, delegate=delegate)
+
+            # Known device or no pairing callback – auto-accept
+            return PairingConfig(mitm=False)
+
+        device.pairing_config_factory = _pairing_config_factory
 
         return device
 
@@ -723,11 +810,15 @@ class SinkBackend:
 
         @device.on("disconnection")
         def on_disconnection(connection, reason):
+            addr = str(connection.peer_address)
             name = str(getattr(connection, "peer_name", None) or connection.peer_address)
             self._log(f"BT disconnected: {name}")
 
-            # Persist updated bonding keys so the next reconnect is seamless
-            if self._keystore_path and device.keystore:
+            # Persist bonding keys unless the user explicitly chose not to remember
+            # the device (remember_map entry False = "allow once, don't save").
+            # Unknown devices that bypassed the dialog default to True (save).
+            should_remember = self._remember_map.pop(addr, True)
+            if should_remember and self._keystore_path and device.keystore:
                 _save_keystore(device.keystore, self._keystore_path)
 
             if self._pipeline:
