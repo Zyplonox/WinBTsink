@@ -115,6 +115,7 @@ powershell -ExecutionPolicy Bypass -File setup\install.ps1
 | **Settings** | Device name, latency, audio device, autostart |
 | **USB Dongle** | Dropdown + Scan button: select the WinUSB dongle |
 | **Volume** | Output volume slider (0–200%) |
+| **Allow new pairings** | Toggle: allow unknown devices to pair (see Security) |
 | **Install WinUSB…** | Download & launch Zadig |
 | Status dot | grey=idle · amber=starting · blue=ready · green=connected · red=error |
 | Audio Level | Real-time RMS meter |
@@ -123,9 +124,11 @@ powershell -ExecutionPolicy Bypass -File setup\install.ps1
 ### Pairing from a Bluetooth device (e.g. Nintendo Switch)
 
 1. Click **Start** and wait until status shows "Waiting for device…" (blue)
-2. Switch: **System Settings → Bluetooth Audio → Pair Device**
-3. Select `PC-AudioSink` from the list
-4. Play audio → it comes out of your PC speakers
+2. Make sure **Allow new pairings** is enabled (default: on)
+3. Switch: **System Settings → Bluetooth Audio → Pair Device**
+4. Select `PC-AudioSink` from the list
+5. Confirm the pairing request in the dialog that appears on your PC
+6. Play audio → it comes out of your PC speakers
 
 ---
 
@@ -144,9 +147,41 @@ Settings are saved at: `%APPDATA%\BT-AudioSink\config.json`
 
 ---
 
+## Security
+
+### Pairing confirmation
+
+When an unknown device tries to pair, a dialog appears showing the device name and
+MAC address. You can:
+
+- **Allow** – accept for this session only (key is not saved; device must re-pair next time)
+- **Allow** + **Remember this device** – accept and save the key permanently
+- **Deny** – reject the pairing request
+
+If the dialog is not answered within 30 seconds it auto-denies.
+
+### Allow new pairings toggle
+
+The **Allow new pairings** switch in the main window controls whether unknown devices
+can initiate a pairing at all:
+
+- **On** (default) – unknown devices trigger the confirmation dialog
+- **Off** – only previously bonded devices can connect; all others are silently rejected
+
+Recommended workflow: enable the toggle when adding a new device, then disable it
+again for day-to-day use.
+
+### Notes on Bluetooth security
+
+- Already known devices (saved in `keys.json`) reconnect automatically without a dialog.
+- MITM protection is not available because Secure Connections must be disabled for
+  Nintendo Switch compatibility. This is a Bluetooth protocol limitation.
+- A2DP audio streams are not encrypted by the protocol.
+
 ## Bonding / Device pairing
 
-Paired devices (iPhone, Android, Switch) are **remembered automatically**.
+Paired devices (iPhone, Android, Switch) are remembered when you choose
+**Remember this device** in the pairing dialog.
 On the next session the device reconnects without re-pairing as long as the app is running.
 
 Bonding keys are stored at: `%APPDATA%\BT-AudioSink\keys.json`
@@ -174,9 +209,8 @@ When **Autostart** is enabled the app launches directly minimized to the tray on
 
 ### Device has to re-pair every time
 
-Pairing is normally saved automatically. If not:
-- Check that `%APPDATA%\BT-AudioSink\keys.json` exists and is writable
-- Old EXE versions without a keystore: pair once, then it is saved
+- Did you check **Remember this device** in the pairing dialog? Without it the key is not saved.
+- Check that `%APPDATA%\BT-AudioSink\keys.json` exists and is writable.
 
 ### No audio / device not found
 
