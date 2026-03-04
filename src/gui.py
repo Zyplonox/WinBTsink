@@ -765,6 +765,8 @@ class App(ctk.CTk):
         self._available_dongles: list[tuple[int, str]] = []
         self._tray_icon: Optional[object] = None
         self._in_tray = False  # Guards against recursive tray transitions
+        self._connected_devices: dict[str, str] = {}  # name -> address
+        self._autostart_bt = start_minimized  # Start BT after dongle scan on autostart
 
         self._build_ui()
         self._log("Ready – scanning USB dongles…")
@@ -1026,6 +1028,10 @@ class App(ctk.CTk):
         self._start_btn.configure(state="normal")
         self._log(f"Dongle found: {labels[0]}")
 
+        if self._autostart_bt:
+            self._autostart_bt = False
+            self._start_backend()
+
     def _on_dongle_selected(self, label: str) -> None:
         """Updates settings.transport when the user picks a different dongle."""
         for idx, lbl in self._available_dongles:
@@ -1104,6 +1110,7 @@ class App(ctk.CTk):
             # Stop on a daemon thread so the UI stays responsive during cleanup
             threading.Thread(target=self._backend.stop, daemon=True).start()
             self._backend = None
+        self._connected_devices.clear()
         self._device_label.configure(text="—")
         self._level_bar.set(0)
         self._on_state_change(SinkState.STOPPED)
@@ -1119,11 +1126,21 @@ class App(ctk.CTk):
         )
 
     def _on_device_connected(self, name: str, address: str) -> None:
-        self._device_label.configure(text=f"{name}  ({address})")
+        self._connected_devices[name] = address
+        self._update_device_label()
 
     def _on_device_disconnected(self, name: str) -> None:
-        self._device_label.configure(text="—")
-        self._level_bar.set(0)
+        self._connected_devices.pop(name, None)
+        self._update_device_label()
+        if not self._connected_devices:
+            self._level_bar.set(0)
+
+    def _update_device_label(self) -> None:
+        if not self._connected_devices:
+            self._device_label.configure(text="—")
+        else:
+            text = "\n".join(f"{n}  ({a})" for n, a in self._connected_devices.items())
+            self._device_label.configure(text=text)
 
     def _on_audio_level(self, level: float) -> None:
         """

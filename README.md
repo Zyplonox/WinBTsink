@@ -10,8 +10,15 @@ Devices such as the Nintendo Switch, a phone, or tablet pair with your PC and st
 
 ## How it works
 
-Windows 11 does **not** support Bluetooth A2DP Sink mode natively (it can only *send* audio, not receive it).
-This program works around that by:
+Windows supports Bluetooth A2DP Sink mode natively on recent builds
+(via [AudioPlaybackConnector](https://github.com/ysc3839/AudioPlaybackConnector)).
+WinBTsink takes a different approach by bypassing the Windows Bluetooth stack entirely,
+which has its own advantages:
+
+- **Multi-device support** – multiple sources can stream simultaneously
+- **Full control** over codec parameters, latency, and audio routing
+
+This program works by:
 
 1. Installing the **WinUSB driver** for your dongle (via Zadig https://github.com/pbatard/libwdi)
 2. Using **Bumble** (a Python Bluetooth stack) to access the dongle directly via USB – bypassing Windows entirely
