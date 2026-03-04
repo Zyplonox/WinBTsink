@@ -54,7 +54,7 @@ try:
         A2DP_SBC_CODEC_TYPE as SBC_CODEC_TYPE,
         make_audio_sink_service_sdp_records,
     )
-    from bumble.pairing import PairingConfig
+    from bumble.pairing import PairingConfig, PairingDelegate
     from bumble.keys import JsonKeyStore
 except ImportError as e:
     raise ImportError(
@@ -132,6 +132,83 @@ def _save_keystore(keystore: "JsonKeyStore", path: Path) -> None:
             _json.dump(data, f, indent=2)
     except Exception as e:
         log.debug("Save keystore: %s", e)
+
+
+def _is_in_keystore(keystore, addr_str: str) -> bool:
+    """Returns True if the given BT address already has a stored bonding key."""
+    if keystore is None or not hasattr(keystore, "store"):
+        return False
+    return any(str(a).upper() == addr_str.upper() for a in keystore.store)
+
+
+def _load_allowed_macs(path: Path) -> set:
+    """Loads the set of previously allowed MAC addresses from disk."""
+    try:
+        if path.exists():
+            with open(path, encoding="utf-8") as f:
+                data = _json.load(f)
+            if isinstance(data, list):
+                return {str(m).upper() for m in data}
+    except Exception as e:
+        log.debug("Load allowed_macs: %s", e)
+    return set()
+
+
+def _save_allowed_macs(macs: set, path: Path) -> None:
+    """Persists the allowed MAC set to disk."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(sorted(macs), f, indent=2)
+    except Exception as e:
+        log.debug("Save allowed_macs: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Pairing confirmation delegate
+# ---------------------------------------------------------------------------
+
+class ConfirmingPairingDelegate(PairingDelegate):
+    """
+    Pairing delegate that calls an on_request callback to ask the user
+    whether to accept or reject a new pairing.
+
+    The callback signature is: on_request(name, address, resolve)
+    where resolve(approved: bool, remember: bool) can be called from any thread.
+
+    If the user does not respond within TIMEOUT seconds the pairing is
+    automatically rejected.
+    """
+
+    TIMEOUT = 30.0
+
+    def __init__(
+        self,
+        name: str,
+        address: str,
+        on_request: Callable,
+        remember_map: dict,
+    ):
+        super().__init__(PairingDelegate.IoCapability.NO_OUTPUT_NO_INPUT)
+        self._name = name
+        self._address = address
+        self._on_request = on_request
+        self._remember_map = remember_map
+
+    async def accept(self) -> bool:
+        loop = asyncio.get_running_loop()
+        future: "asyncio.Future[bool]" = loop.create_future()
+
+        def resolve(approved: bool, remember: bool) -> None:
+            self._remember_map[self._address] = remember
+            if not future.done():
+                loop.call_soon_threadsafe(future.set_result, approved)
+
+        self._on_request(self._name, self._address, resolve)
+        try:
+            return await asyncio.wait_for(future, timeout=self.TIMEOUT)
+        except asyncio.TimeoutError:
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -453,12 +530,14 @@ class SinkBackend:
         ffmpeg_exe: str = "ffmpeg",
         debug: bool = False,
         keystore_path: Optional[str] = None,
+        allowed_macs_path: Optional[str] = None,
         # Callbacks
         on_state_change: Optional[Callable[[SinkState], None]] = None,
         on_device_connected: Optional[Callable[[str, str], None]] = None,
         on_device_disconnected: Optional[Callable[[str], None]] = None,
         on_audio_level: Optional[Callable[[float], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
+        on_pairing_request: Optional[Callable] = None,
     ):
         # BT / USB parameters
         self._device_name = device_name
@@ -475,6 +554,11 @@ class SinkBackend:
         # Feature flags
         self._debug = debug
         self._keystore_path = Path(keystore_path) if keystore_path else None
+        self._allowed_macs_path = Path(allowed_macs_path) if allowed_macs_path else None
+        self._allowed_macs: set = (
+            _load_allowed_macs(self._allowed_macs_path)
+            if self._allowed_macs_path else set()
+        )
 
         # GUI callbacks
         self._cb_state = on_state_change
@@ -482,6 +566,12 @@ class SinkBackend:
         self._cb_disconnected = on_device_disconnected
         self._cb_level = on_audio_level
         self._cb_log = on_log
+        self._cb_pairing_request = on_pairing_request
+
+        # Pairing control
+        self._pairing_allowed = True           # Allow new (unknown) device pairings
+        self._remember_map: dict[str, bool] = {}  # addr -> should persist key to disk
+        self._pending_approvals: dict[str, "asyncio.Future"] = {}  # addr_upper -> approval future (gates AVDTP)
 
         # Runtime state – all set during start()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -489,6 +579,7 @@ class SinkBackend:
         self._pipeline: Optional[SbcAudioPipeline] = None
         self._stop_event: Optional[asyncio.Event] = None
         self._state = SinkState.IDLE
+        self._bt_device: Optional[Device] = None  # Set while BT stack is running
 
     # ------------------------------------------------------------------
     # Public API
@@ -507,6 +598,22 @@ class SinkBackend:
         self._volume = max(0.0, min(2.0, volume))
         if self._pipeline:
             self._pipeline.set_volume(self._volume)
+
+    def clear_allowed_macs(self) -> None:
+        """Wipes the in-memory allowed-MAC set (file already deleted by the GUI)."""
+        self._allowed_macs.clear()
+
+    def set_pairing_mode(self, allowed: bool) -> None:
+        """Allow (True) or block (False) pairing requests from unknown devices.
+
+        Also toggles BT discoverability so that unknown devices can no longer
+        discover the sink when pairing is disabled.
+        """
+        self._pairing_allowed = allowed
+        if self._loop and self._loop.is_running() and self._bt_device:
+            asyncio.run_coroutine_threadsafe(
+                self._bt_device.set_discoverable(allowed), self._loop
+            )
 
     def start(self) -> None:
         """
@@ -557,6 +664,7 @@ class SinkBackend:
             self._loop.close()
             self._loop = None
             self._stop_event = None
+            self._bt_device = None
 
     def _build_logger_config(self) -> dict[str, int]:
         """
@@ -639,6 +747,7 @@ class SinkBackend:
         'advertise and wait for connection' loop.  Exits when the stop event fires.
         """
         device = self._create_device(hci_source, hci_sink)
+        self._bt_device = device
         self._configure_sdp_records(device)
         self._attach_connection_handlers(device)
 
@@ -689,7 +798,8 @@ class SinkBackend:
             device.keystore = _load_keystore(self._keystore_path, self._bt_address)
             log.debug("Keystore loaded: %s", self._keystore_path)
 
-        # Accept pairing without MITM protection (PIN/passkey not needed for audio)
+        # Connection-level access control is handled in on_connection.
+        # The pairing factory only needs to allow the BT handshake to proceed.
         device.pairing_config_factory = lambda conn: PairingConfig(mitm=False)
 
         return device
@@ -716,6 +826,67 @@ class SinkBackend:
         def on_connection(connection):
             name = str(connection.peer_name or connection.peer_address)
             addr = str(connection.peer_address)
+            addr_upper = addr.upper()
+
+            is_known = (
+                addr_upper in self._allowed_macs
+                or _is_in_keystore(device.keystore, addr)
+            )
+
+            # Unknown device, pairing blocked → reject immediately
+            if not is_known and not self._pairing_allowed:
+                self._log(f"Rejected unknown device: {name} ({addr})")
+                asyncio.ensure_future(connection.disconnect())
+                return
+
+            # Unknown device, pairing allowed, dialog callback set → ask user
+            if not is_known and self._cb_pairing_request:
+                loop = asyncio.get_event_loop()
+                future: "asyncio.Future[tuple]" = loop.create_future()
+
+                # Gate the AVDTP handler: it will wait on this future before
+                # registering the audio sink, so audio cannot start until the
+                # user explicitly approves.
+                self._pending_approvals[addr_upper] = future
+
+                def resolve(approved: bool, remember: bool) -> None:
+                    if not future.done():
+                        loop.call_soon_threadsafe(future.set_result, (approved, remember))
+
+                self._cb_pairing_request(name, addr, resolve)
+
+                async def _handle_result() -> None:
+                    try:
+                        approved, remember = await asyncio.wait_for(future, timeout=30.0)
+                    except asyncio.TimeoutError:
+                        approved, remember = False, False
+
+                    # Release the AVDTP gate regardless of outcome
+                    self._pending_approvals.pop(addr_upper, None)
+
+                    if not approved:
+                        self._log(f"Pairing denied: {name} ({addr})")
+                        await connection.disconnect()
+                        return
+
+                    self._allowed_macs.add(addr_upper)
+                    if remember and self._allowed_macs_path:
+                        _save_allowed_macs(self._allowed_macs, self._allowed_macs_path)
+
+                    self._log(f"BT connected: {name} ({addr})")
+                    self._set_state(SinkState.CONNECTED)
+                    if self._cb_connected:
+                        self._cb_connected(name, addr)
+
+                asyncio.ensure_future(_handle_result())
+                return
+
+            # Known device or no dialog callback → proceed directly
+            if addr_upper not in self._allowed_macs:
+                self._allowed_macs.add(addr_upper)
+                if self._allowed_macs_path:
+                    _save_allowed_macs(self._allowed_macs, self._allowed_macs_path)
+
             self._log(f"BT connected: {name} ({addr})")
             self._set_state(SinkState.CONNECTED)
             if self._cb_connected:
@@ -723,11 +894,15 @@ class SinkBackend:
 
         @device.on("disconnection")
         def on_disconnection(connection, reason):
+            addr = str(connection.peer_address)
             name = str(getattr(connection, "peer_name", None) or connection.peer_address)
             self._log(f"BT disconnected: {name}")
 
-            # Persist updated bonding keys so the next reconnect is seamless
-            if self._keystore_path and device.keystore:
+            # Persist bonding keys unless the user explicitly chose not to remember
+            # the device (remember_map entry False = "allow once, don't save").
+            # Unknown devices that bypassed the dialog default to True (save).
+            should_remember = self._remember_map.pop(addr, True)
+            if should_remember and self._keystore_path and device.keystore:
                 _save_keystore(device.keystore, self._keystore_path)
 
             if self._pipeline:
@@ -744,6 +919,28 @@ class SinkBackend:
 
     def _on_avdtp_connection(self, server, device: Device) -> None:
         """Called by the AVDTP Listener when a new AVDTP session is established."""
+        # If a pairing dialog is open for any device, defer AVDTP sink
+        # registration until the user approves or denies.  We take the first
+        # (and in practice only) pending future; the connection is single at
+        # this point because Classic BT is serial.
+        if self._pending_approvals:
+            pending = next(iter(self._pending_approvals.values()))
+            self._log("AVDTP: waiting for pairing approval…")
+
+            async def _deferred_connect() -> None:
+                try:
+                    result = await asyncio.shield(pending)
+                    approved = result[0] if isinstance(result, tuple) else bool(result)
+                except Exception:
+                    approved = False
+                if approved:
+                    self._log("AVDTP connection established")
+                    self._register_sbc_sink(server)
+                # If denied, _handle_result disconnects the ACL which also
+                # closes this AVDTP channel automatically.
+            asyncio.ensure_future(_deferred_connect())
+            return
+
         self._log("AVDTP connection established")
         self._register_sbc_sink(server)
 

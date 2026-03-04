@@ -1,8 +1,8 @@
-# Bluetooth A2DP Sink – Windows 11 Setup Script
+# Bluetooth A2DP Sink - Windows Setup Script
 # ================================================
 # Installs Python dependencies & FFmpeg.
 #
-# Run: Right-Click → "Run with PowerShell"
+# Run: Right-Click -> "Run with PowerShell"
 # Or:  powershell -ExecutionPolicy Bypass -File setup\install.ps1
 
 $ErrorActionPreference = "Stop"
@@ -16,7 +16,7 @@ function Write-Err($msg)  { Write-Host "[ERROR] $msg" -ForegroundColor Red }
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Magenta
-Write-Host "  Bluetooth A2DP Sink – Setup" -ForegroundColor Magenta
+Write-Host "  Bluetooth A2DP Sink - Setup" -ForegroundColor Magenta
 Write-Host "============================================" -ForegroundColor Magenta
 
 # ---------------------------------------------------------------------------
@@ -71,7 +71,7 @@ try {
 } catch { }
 
 if (-not $ffmpegOk) {
-    Write-Warn "FFmpeg not found – attempting installation via winget..."
+    Write-Warn "FFmpeg not found - attempting installation via winget..."
     try {
         winget install --id Gyan.FFmpeg --accept-package-agreements --accept-source-agreements
         Write-OK "FFmpeg installed"
@@ -80,10 +80,10 @@ if (-not $ffmpegOk) {
         Write-Err "winget installation failed."
         Write-Host ""
         Write-Host "Install FFmpeg manually:" -ForegroundColor Yellow
-        Write-Host "  1. https://www.gyan.dev/ffmpeg/builds/ → ffmpeg-release-essentials.zip"
+        Write-Host "  1. https://www.gyan.dev/ffmpeg/builds/ -> ffmpeg-release-essentials.zip"
         Write-Host "  2. Extract to e.g. C:\ffmpeg\"
         Write-Host "  3. Add C:\ffmpeg\bin\ to the system PATH"
-        Write-Host "     (Control Panel → Environment Variables → PATH)"
+        Write-Host "     (Control Panel -> Environment Variables -> PATH)"
     }
 }
 
@@ -111,11 +111,11 @@ Next steps:
   2. Double-click 'start.bat'  OR
      run 'python src\gui.py'
   3. On your BT device (Switch, phone) pair with 'PC-AudioSink'
-  4. Play audio → sound comes from your PC speakers
+  4. Play audio -> sound comes from your PC speakers
 
 Troubleshooting:
-  – Wrong USB index: Settings → USB Dongle → try usb:1, usb:2
-  – Reset driver: Device Manager → device → Update driver
+  - Wrong USB index: Settings -> USB Dongle -> try usb:1, usb:2
+  - Reset driver: Device Manager -> device -> Update driver
 
 "@
 Read-Host "Press Enter to close"

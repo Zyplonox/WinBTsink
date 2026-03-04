@@ -55,6 +55,9 @@ def _config_file() -> str:
 def _keys_file() -> str:
     return os.path.join(_appdata_dir(), "keys.json")
 
+def _allowed_macs_file() -> str:
+    return os.path.join(_appdata_dir(), "allowed_macs.json")
+
 
 # ---------------------------------------------------------------------------
 # USB dongle enumeration
@@ -355,7 +358,7 @@ class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, parent: "App"):
         super().__init__(parent)
         self.title("Settings")
-        self.geometry("420x620")
+        self.geometry("420x670")
         self.resizable(False, False)
         self.grab_set()  # Block interaction with the main window
 
@@ -367,6 +370,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self._add_bitpool_row()
         self._add_audio_device_row()
         self._add_checkboxes()
+        self._add_clear_keys_row()
         self._add_buttons()
 
     # ------------------------------------------------------------------
@@ -463,6 +467,40 @@ class SettingsDialog(ctk.CTkToplevel):
             text="Start with Windows (autostart, minimized to tray)",
             variable=self._autostart_var,
         ).pack(anchor="w", padx=20, pady=(8, 0))
+
+    def _add_clear_keys_row(self) -> None:
+        """Button to wipe all saved bonding keys."""
+        ctk.CTkButton(
+            self,
+            text="Clear saved devices (delete keys.json)",
+            fg_color="#374151", hover_color="#6B7280",
+            command=self._clear_keys,
+        ).pack(fill="x", padx=20, pady=(20, 0))
+
+    def _clear_keys(self) -> None:
+        deleted = []
+        errors = []
+        for path in (_keys_file(), _allowed_macs_file()):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    deleted.append(os.path.basename(path))
+            except Exception as exc:
+                errors.append(f"{os.path.basename(path)}: {exc}")
+
+        # Also wipe the in-memory allowed-MACs set in the running backend
+        if hasattr(self.master, "_backend") and self.master._backend:
+            self.master._backend.clear_allowed_macs()
+
+        if errors:
+            msg = "Error clearing devices: " + ", ".join(errors)
+        elif deleted:
+            msg = f"Saved devices cleared ({', '.join(deleted)}) – all devices must re-pair."
+        else:
+            msg = "No saved devices found (nothing to delete)."
+
+        if hasattr(self.master, "_log"):
+            self.master._log(msg)
 
     def _add_buttons(self) -> None:
         """Cancel / Save button row at the bottom of the dialog."""
@@ -735,6 +773,99 @@ class WinUSBDialog(ctk.CTkToplevel):
 
 
 # ---------------------------------------------------------------------------
+# Pairing Request Dialog
+# ---------------------------------------------------------------------------
+
+class PairingDialog(ctk.CTkToplevel):
+    """
+    Modal dialog shown when an unknown device requests to pair.
+
+    Calls resolve(approved, remember) exactly once:
+      - approved: True = allow, False = deny
+      - remember: True = persist bonding key to disk
+    Auto-denies after TIMEOUT seconds if the user does not respond.
+    """
+
+    TIMEOUT = 30
+
+    def __init__(self, parent, name: str, address: str, resolve):
+        super().__init__(parent)
+        self._resolve = resolve
+        self._answered = False
+
+        self.title("Pairing Request")
+        self.geometry("380x290")
+        self.resizable(False, False)
+        self.grab_set()
+        self.lift()
+        self.focus_force()
+        self.protocol("WM_DELETE_WINDOW", self._deny)
+
+        ctk.CTkLabel(
+            self, text="Pairing Request",
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).pack(pady=(22, 6))
+
+        ctk.CTkLabel(self, text=name, font=ctk.CTkFont(size=13)).pack()
+        ctk.CTkLabel(
+            self, text=address,
+            font=ctk.CTkFont(size=11), text_color="#9CA3AF",
+        ).pack(pady=(2, 18))
+
+        self._remember_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            self, text="Remember this device",
+            variable=self._remember_var,
+        ).pack(pady=(0, 12))
+
+        self._countdown_var = ctk.StringVar()
+        ctk.CTkLabel(
+            self, textvariable=self._countdown_var,
+            font=ctk.CTkFont(size=11), text_color="#9CA3AF",
+        ).pack(pady=(0, 16))
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(fill="x", padx=24, pady=(0, 16))
+        ctk.CTkButton(
+            btn_row, text="Deny",
+            fg_color="#EF4444", hover_color="#DC2626",
+            command=self._deny,
+        ).pack(side="left", expand=True, padx=(0, 8))
+        ctk.CTkButton(
+            btn_row, text="Allow",
+            command=self._allow,
+        ).pack(side="left", expand=True)
+
+        self._remaining = self.TIMEOUT
+        self._tick()
+
+    def _tick(self) -> None:
+        if self._answered:
+            return
+        if self._remaining <= 0:
+            self._deny()
+            return
+        self._countdown_var.set(f"Auto-deny in {self._remaining}s")
+        self._remaining -= 1
+        self.after(1000, self._tick)
+
+    def _allow(self) -> None:
+        if self._answered:
+            return
+        self._answered = True
+        remember = bool(self._remember_var.get())
+        self.destroy()
+        self._resolve(True, remember)
+
+    def _deny(self) -> None:
+        if self._answered:
+            return
+        self._answered = True
+        self.destroy()
+        self._resolve(False, False)
+
+
+# ---------------------------------------------------------------------------
 # Main Application Window
 # ---------------------------------------------------------------------------
 
@@ -767,6 +898,7 @@ class App(ctk.CTk):
         self._in_tray = False  # Guards against recursive tray transitions
         self._connected_devices: dict[str, str] = {}  # name -> address
         self._autostart_bt = start_minimized  # Start BT after dongle scan on autostart
+        self._pairing_switch: Optional[ctk.CTkSwitch] = None
 
         self._build_ui()
         self._log("Ready – scanning USB dongles…")
@@ -791,6 +923,7 @@ class App(ctk.CTk):
         self._build_level_section()
         self._build_volume_section()
         self._build_action_buttons()
+        self._build_pairing_row()
         self._build_log_section()
 
     def _build_header(self) -> None:
@@ -927,6 +1060,23 @@ class App(ctk.CTk):
             fg_color="#374151", hover_color="#4B5563",
             command=self._open_settings,
         ).pack(side="left", expand=True, padx=(6, 0))
+
+    def _build_pairing_row(self) -> None:
+        """Toggle to allow or block pairing requests from unknown devices."""
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=(0, 4))
+
+        ctk.CTkLabel(
+            row, text="Allow new pairings:",
+            font=ctk.CTkFont(size=12), text_color="#9CA3AF",
+        ).pack(side="left")
+
+        self._pairing_switch = ctk.CTkSwitch(
+            row, text="", width=46,
+            command=self._on_pairing_toggle,
+        )
+        self._pairing_switch.select()  # Default: new pairings allowed
+        self._pairing_switch.pack(side="left", padx=10)
 
     def _build_log_section(self) -> None:
         """Scrolling monospace log output at the bottom of the window."""
@@ -1087,12 +1237,14 @@ class App(ctk.CTk):
             ffmpeg_exe=_get_ffmpeg(),
             debug=settings.debug_mode,
             keystore_path=_keys_file(),
+            allowed_macs_path=_allowed_macs_file(),
             # Route all callbacks through after() to stay on the mainloop thread
             on_state_change=lambda s: self.after(0, self._on_state_change, s),
             on_device_connected=lambda n, a: self.after(0, self._on_device_connected, n, a),
             on_device_disconnected=lambda n: self.after(0, self._on_device_disconnected, n),
             on_audio_level=lambda l: self.after(0, self._on_audio_level, l),
             on_log=lambda m: self.after(0, self._log, m),
+            on_pairing_request=lambda n, a, r: self.after(0, self._on_pairing_request, n, a, r),
         )
         self._backend.start()
         self._title_label.configure(text=settings.device_name)
@@ -1107,6 +1259,7 @@ class App(ctk.CTk):
         )
         self._scan_dongle_btn.configure(state="normal")
         if self._backend:
+            self._log("BT stack stopped.")
             # Stop on a daemon thread so the UI stays responsive during cleanup
             threading.Thread(target=self._backend.stop, daemon=True).start()
             self._backend = None
@@ -1128,6 +1281,12 @@ class App(ctk.CTk):
     def _on_device_connected(self, name: str, address: str) -> None:
         self._connected_devices[name] = address
         self._update_device_label()
+        # Automatically lock out new pairings once any device is connected
+        if self._pairing_switch and self._pairing_switch.get():
+            self._pairing_switch.deselect()
+            if self._backend:
+                self._backend.set_pairing_mode(False)
+            self._log("New pairings: blocked (auto)")
 
     def _on_device_disconnected(self, name: str) -> None:
         self._connected_devices.pop(name, None)
@@ -1149,6 +1308,18 @@ class App(ctk.CTk):
         """
         self._level_smooth = 0.7 * self._level_smooth + 0.3 * min(level * 4, 1.0)
         self._level_bar.set(self._level_smooth)
+
+    def _on_pairing_request(self, name: str, address: str, resolve) -> None:
+        """Shows a confirmation dialog when an unknown device wants to pair."""
+        self._log(f"Pairing request from: {name} ({address})")
+        PairingDialog(self, name, address, resolve)
+
+    def _on_pairing_toggle(self) -> None:
+        """Relays the pairing mode switch state to the backend."""
+        allowed = bool(self._pairing_switch.get())
+        if self._backend:
+            self._backend.set_pairing_mode(allowed)
+        self._log(f"New pairings: {'allowed' if allowed else 'blocked'}")
 
     def _log(self, msg: str) -> None:
         """Appends a timestamped line to the log textbox."""
@@ -1271,8 +1442,8 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _on_close(self) -> None:
-        """Intercepts the window close event and sends the app to the tray instead."""
-        self._minimize_to_tray()
+        """Closes the app when the window is visible; quits cleanly."""
+        self._tray_quit()
 
 
 # ---------------------------------------------------------------------------
