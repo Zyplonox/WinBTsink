@@ -941,15 +941,20 @@ class SinkBackend:
     ) -> None:
         """Authenticates the connection, then registers the SBC sink.
 
-        For a brand-new device this triggers BT pairing:
-          1. device.authenticate() sends HCI_Authentication_Requested.
-          2. The controller has no stored key → calls pairing_config_factory.
-          3. ConfirmingPairingDelegate.accept() shows the GUI dialog.
-          4. User clicks Allow/Deny → accept() returns True/False.
-          5. On True: auth succeeds, we continue here; on False: exception raised.
+        Three possible paths after device.authenticate() returns:
 
-        For a previously paired device the stored link key is used and step 3-4
-        are skipped (accept() auto-approves via the allowed_macs check).
+        (A) addr in _allowed_macs (loaded from disk or set this session)
+            → previously remembered device, proceed silently.
+
+        (B) addr not in _allowed_macs, but _remember_map has an entry
+            → brand-new device, full BT pairing flow ran, ConfirmingPairingDelegate
+              showed the GUI dialog and stored the user's choice.  Collect result.
+
+        (C) addr not in _allowed_macs, no _remember_map entry
+            → device had previously paired (iPhone + dongle both have link keys in
+              hardware NVM), so the controller authenticated silently at the HCI
+              level before device.authenticate() was called – it was a no-op.
+              ConfirmingPairingDelegate was never invoked.  Show the dialog now.
         """
         addr = str(connection.peer_address)
         addr_upper = addr.upper()
@@ -966,17 +971,60 @@ class SinkBackend:
                 pass
             return
 
-        # Authentication succeeded.  For brand-new devices the delegate stored
-        # the remember choice in _remember_map; update state and allowed_macs now.
-        if addr_upper not in self._allowed_macs:
-            remember = self._remember_map.get(addr_upper, True)
-            self._allowed_macs.add(addr_upper)
-            if remember and self._allowed_macs_path:
-                _save_allowed_macs(self._allowed_macs, self._allowed_macs_path)
-            self._log(f"BT connected: {name} ({addr})")
-            self._set_state(SinkState.CONNECTED)
-            if self._cb_connected:
-                self._cb_connected(name, addr)
+        # ── Path A ────────────────────────────────────────────────────────────
+        # Known + remembered device: nothing else to do before registering sink.
+        if addr_upper in self._allowed_macs:
+            self._log("AVDTP: connection authenticated – registering SBC sink")
+            self._register_sbc_sink(server)
+            return
+
+        # ── Path C ────────────────────────────────────────────────────────────
+        # Controller authenticated silently via NVM key; delegate was never
+        # invoked (no _remember_map entry).  Show the approval dialog now.
+        if addr_upper not in self._remember_map:
+            if not self._cb_pairing_request:
+                self._log(f"Connection rejected (no dialog callback): {name}")
+                try:
+                    await connection.disconnect()
+                except Exception:
+                    pass
+                return
+
+            loop = asyncio.get_event_loop()
+            future: "asyncio.Future[tuple]" = loop.create_future()
+
+            def resolve(approved: bool, remember: bool) -> None:
+                if not future.done():
+                    loop.call_soon_threadsafe(future.set_result, (approved, remember))
+
+            self._cb_pairing_request(name, addr, resolve)
+
+            try:
+                approved, remember = await asyncio.wait_for(future, timeout=30.0)
+            except asyncio.TimeoutError:
+                approved, remember = False, False
+
+            self._remember_map[addr_upper] = remember
+
+            if not approved:
+                self._log(f"Connection denied by user: {name} ({addr})")
+                try:
+                    await connection.disconnect()
+                except Exception:
+                    pass
+                return
+
+        # ── Path B + C (approved) ─────────────────────────────────────────────
+        # Either the delegate showed the dialog (B) or we just did (C).
+        # Either way the remember choice is now in _remember_map.
+        remember = self._remember_map.get(addr_upper, True)
+        self._allowed_macs.add(addr_upper)
+        if remember and self._allowed_macs_path:
+            _save_allowed_macs(self._allowed_macs, self._allowed_macs_path)
+        self._log(f"BT connected: {name} ({addr})")
+        self._set_state(SinkState.CONNECTED)
+        if self._cb_connected:
+            self._cb_connected(name, addr)
 
         self._log("AVDTP: connection authenticated – registering SBC sink")
         self._register_sbc_sink(server)
