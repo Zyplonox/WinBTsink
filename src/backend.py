@@ -549,6 +549,7 @@ class SinkBackend:
         self._pipeline: Optional[SbcAudioPipeline] = None
         self._stop_event: Optional[asyncio.Event] = None
         self._state = SinkState.IDLE
+        self._bt_device: Optional[Device] = None  # Set while BT stack is running
 
     # ------------------------------------------------------------------
     # Public API
@@ -569,8 +570,16 @@ class SinkBackend:
             self._pipeline.set_volume(self._volume)
 
     def set_pairing_mode(self, allowed: bool) -> None:
-        """Allow (True) or block (False) pairing requests from unknown devices."""
+        """Allow (True) or block (False) pairing requests from unknown devices.
+
+        Also toggles BT discoverability so that unknown devices can no longer
+        discover the sink when pairing is disabled.
+        """
         self._pairing_allowed = allowed
+        if self._loop and self._loop.is_running() and self._bt_device:
+            asyncio.run_coroutine_threadsafe(
+                self._bt_device.set_discoverable(allowed), self._loop
+            )
 
     def start(self) -> None:
         """
@@ -621,6 +630,7 @@ class SinkBackend:
             self._loop.close()
             self._loop = None
             self._stop_event = None
+            self._bt_device = None
 
     def _build_logger_config(self) -> dict[str, int]:
         """
@@ -703,6 +713,7 @@ class SinkBackend:
         'advertise and wait for connection' loop.  Exits when the stop event fires.
         """
         device = self._create_device(hci_source, hci_sink)
+        self._bt_device = device
         self._configure_sdp_records(device)
         self._attach_connection_handlers(device)
 
@@ -803,6 +814,12 @@ class SinkBackend:
         def on_connection(connection):
             name = str(connection.peer_name or connection.peer_address)
             addr = str(connection.peer_address)
+
+            if not self._pairing_allowed and not _is_in_keystore(device.keystore, addr):
+                self._log(f"Rejected unknown device: {name} ({addr})")
+                asyncio.ensure_future(connection.disconnect())
+                return
+
             self._log(f"BT connected: {name} ({addr})")
             self._set_state(SinkState.CONNECTED)
             if self._cb_connected:

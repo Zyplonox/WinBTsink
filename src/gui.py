@@ -1241,6 +1241,12 @@ class App(ctk.CTk):
     def _on_device_connected(self, name: str, address: str) -> None:
         self._connected_devices[name] = address
         self._update_device_label()
+        # Automatically lock out new pairings once any device is connected
+        if self._pairing_switch and self._pairing_switch.get():
+            self._pairing_switch.deselect()
+            if self._backend:
+                self._backend.set_pairing_mode(False)
+            self._log("New pairings: blocked (auto)")
 
     def _on_device_disconnected(self, name: str) -> None:
         self._connected_devices.pop(name, None)
