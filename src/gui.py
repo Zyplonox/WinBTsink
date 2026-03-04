@@ -1426,8 +1426,8 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _on_close(self) -> None:
-        """Intercepts the window close event and sends the app to the tray instead."""
-        self._minimize_to_tray()
+        """Closes the app when the window is visible; quits cleanly."""
+        self._tray_quit()
 
 
 # ---------------------------------------------------------------------------
