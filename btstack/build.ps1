@@ -147,7 +147,7 @@ Invoke-Native $Bash @("-lc", "cmake --build '$buildUnix' --target btstack_sink -
 # ── Done ─────────────────────────────────────────────────────────────────────
 if (Test-Path $ExePath) {
     $size = (Get-Item $ExePath).Length / 1KB
-    Write-Host "`n✔  Built: $ExePath ($([int]$size) KB)" -ForegroundColor Green
+    Write-Host "`nBuilt: $ExePath ($([int]$size) KB)" -ForegroundColor Green
 } else {
     throw "Build succeeded but $ExePath not found."
 }
