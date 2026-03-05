@@ -629,8 +629,27 @@ class SinkBackend:
             self._pipeline.set_volume(self._volume)
 
     def clear_allowed_macs(self) -> None:
-        """Wipes the in-memory allowed-MAC set (file already deleted by the GUI)."""
+        """Wipes the in-memory allowed-MAC set, keystore, and keystore file.
+
+        The GUI deletes allowed_macs.json before calling this.  We also clear
+        the in-memory keystore and its JSON file so that previously paired
+        devices are not re-admitted via _is_in_keystore() on reconnect.
+        """
         self._allowed_macs.clear()
+
+        # Clear the in-memory keystore so _is_in_keystore() returns False
+        if self._bt_device is not None:
+            ks = getattr(self._bt_device, "keystore", None)
+            if ks is not None and hasattr(ks, "store"):
+                ks.store.clear()
+
+        # Delete the keystore file so the next session starts clean too
+        if self._keystore_path and self._keystore_path.exists():
+            try:
+                self._keystore_path.unlink()
+                log.debug("Keystore file deleted: %s", self._keystore_path)
+            except Exception as exc:
+                log.debug("Could not delete keystore: %s", exc)
 
     def set_pairing_mode(self, allowed: bool) -> None:
         """Allow (True) or block (False) pairing requests from unknown devices.
@@ -790,7 +809,7 @@ class SinkBackend:
         listener.on("connection", lambda server: self._on_avdtp_connection(server, device))
 
         await device.power_on()
-        await device.set_discoverable(True)
+        await device.set_discoverable(self._pairing_allowed)
         await device.set_connectable(True)
 
         self._log(f"Ready! Device name: {self._device_name}")
@@ -927,24 +946,42 @@ class SinkBackend:
     def _on_avdtp_connection(self, server, device: Device) -> None:
         """Called by the AVDTP Listener when a new AVDTP session is established.
 
-        Schedules _authenticate_and_register as a coroutine so that the
-        synchronous AVDTP callback can return immediately while we await the
-        (potentially user-interactive) authentication step.
+        The AVDTP source (iPhone, etc.) sends DISCOVER fractions of a second
+        after the L2CAP channel opens.  We must have a sink endpoint registered
+        before that happens, otherwise it sees 0 endpoints and gives up.
+
+        Strategy:
+          1. Create an approval_future that will be resolved to True/False later.
+          2. Register the SBC sink endpoint immediately (DISCOVER can now succeed).
+             on_start will wait on approval_future before starting the pipeline.
+          3. Run _authenticate_and_register concurrently; it shows the dialog
+             (if needed) and resolves approval_future once the user decides.
         """
         connection = server.l2cap_channel.connection
+        loop = asyncio.get_event_loop()
+        approval_future: "asyncio.Future[bool]" = loop.create_future()
+        # Register endpoint immediately so AVDTP DISCOVER/SET_CONFIG/OPEN succeed
+        self._register_sbc_sink(server, approval_future)
+        # Authenticate (and show dialog if needed) concurrently
         asyncio.ensure_future(
-            self._authenticate_and_register(server, device, connection)
+            self._authenticate_and_register(device, connection, approval_future)
         )
 
     async def _authenticate_and_register(
-        self, server, device: Device, connection
+        self, device: Device, connection, approval_future: "asyncio.Future[bool]"
     ) -> None:
-        """Authenticates the connection, then registers the SBC sink.
+        """Authenticates the connection and resolves approval_future.
+
+        The SBC sink endpoint is already registered (done in _on_avdtp_connection
+        before this coroutine runs) so AVDTP DISCOVER/SET_CONFIG/OPEN can proceed
+        immediately.  This coroutine runs concurrently; it resolves approval_future
+        to True or False so that the on_start handler knows whether to start the
+        audio pipeline.
 
         Three possible paths after device.authenticate() returns:
 
         (A) addr in _allowed_macs (loaded from disk or set this session)
-            → previously remembered device, proceed silently.
+            → previously remembered device, resolve future True silently.
 
         (B) addr not in _allowed_macs, but _remember_map has an entry
             → brand-new device, full BT pairing flow ran, ConfirmingPairingDelegate
@@ -960,11 +997,17 @@ class SinkBackend:
         addr_upper = addr.upper()
         name = str(connection.peer_name or connection.peer_address)
 
+        def _resolve(result: bool) -> None:
+            """Resolve approval_future exactly once."""
+            if not approval_future.done():
+                approval_future.set_result(result)
+
         self._log(f"AVDTP: authenticating {name}…")
         try:
             await device.authenticate(connection)
         except Exception as exc:
             self._log(f"AVDTP: authentication failed for {name}: {exc}")
+            _resolve(False)
             try:
                 await connection.disconnect()
             except Exception:
@@ -972,10 +1015,10 @@ class SinkBackend:
             return
 
         # ── Path A ────────────────────────────────────────────────────────────
-        # Known + remembered device: nothing else to do before registering sink.
+        # Known + remembered device: approve immediately.
         if addr_upper in self._allowed_macs:
-            self._log("AVDTP: connection authenticated – registering SBC sink")
-            self._register_sbc_sink(server)
+            self._log("AVDTP: connection authenticated")
+            _resolve(True)
             return
 
         # ── Path C ────────────────────────────────────────────────────────────
@@ -984,6 +1027,7 @@ class SinkBackend:
         if addr_upper not in self._remember_map:
             if not self._cb_pairing_request:
                 self._log(f"Connection rejected (no dialog callback): {name}")
+                _resolve(False)
                 try:
                     await connection.disconnect()
                 except Exception:
@@ -1008,6 +1052,7 @@ class SinkBackend:
 
             if not approved:
                 self._log(f"Connection denied by user: {name} ({addr})")
+                _resolve(False)
                 try:
                     await connection.disconnect()
                 except Exception:
@@ -1026,13 +1071,20 @@ class SinkBackend:
         if self._cb_connected:
             self._cb_connected(name, addr)
 
-        self._log("AVDTP: connection authenticated – registering SBC sink")
-        self._register_sbc_sink(server)
+        self._log("AVDTP: connection approved – audio pipeline will start on START command")
+        _resolve(True)
 
-    def _register_sbc_sink(self, server) -> None:
+    def _register_sbc_sink(
+        self, server, approval_future: "asyncio.Future[bool]"
+    ) -> None:
         """
         Advertises SBC codec capabilities to the AVDTP server and wires up
         the stream lifecycle handlers (start/stop/rtp_packet).
+
+        approval_future is resolved by _authenticate_and_register once the user
+        approves (True) or denies (False) the connection.  The on_start handler
+        awaits this future so that the audio pipeline only starts after approval,
+        regardless of when the AVDTP START command arrives relative to the dialog.
 
         pipeline_ref is a one-element list so the closures can rebind the
         pipeline reference without needing nonlocal (Python 2 compatibility
@@ -1058,7 +1110,7 @@ class SinkBackend:
 
         @sink.on("start")
         def on_start():
-            """Source sent AVDTP START – create and start the audio pipeline."""
+            """Source sent AVDTP START – wait for user approval, then start pipeline."""
             sample_rate, channels = _extract_codec_params(sink)
             self._log(f"Stream START → {sample_rate} Hz, {channels} ch")
 
@@ -1088,10 +1140,22 @@ class SinkBackend:
                 self._pipeline = pipeline
                 pipeline_ref[0] = pipeline
 
-            # Authentication completed before _register_sbc_sink was called, so
-            # by the time on_start fires the user has already approved.  Launch
-            # the pipeline immediately.
-            _launch_pipeline()
+            async def _await_approval_and_launch() -> None:
+                """Waits for user approval then launches (or skips) the pipeline."""
+                try:
+                    # shield() so that cancelling this task doesn't cancel the future
+                    approved = await asyncio.wait_for(
+                        asyncio.shield(approval_future), timeout=35.0
+                    )
+                except asyncio.TimeoutError:
+                    self._log("AVDTP: approval timed out – audio pipeline not started")
+                    return
+                if approved:
+                    _launch_pipeline()
+                else:
+                    self._log("AVDTP: connection not approved – audio pipeline not started")
+
+            asyncio.ensure_future(_await_approval_and_launch())
 
         @sink.on("stop")
         def on_stop():
