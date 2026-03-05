@@ -24,6 +24,10 @@ zadig.exe
 config.json
 keys.json
 
+# BTstack downloaded source and compiled output (fetched by do_build.sh / build.ps1)
+btstack/btstack-src/
+btstack/build/
+
 # IDE / OS
 .vscode/
 .idea/

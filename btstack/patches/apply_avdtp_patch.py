@@ -145,8 +145,8 @@ def patch_avdtp_h(path: Path) -> bool:
         print(f"  {path.name}: already patched — skipping.")
         return True
 
-    # Insert before the final #endif
-    endif_pattern = re.compile(r'\n#endif\s*(?:/\*[^*]*\*/\s*)?$')
+    # Insert before the final #endif (handles both /* */ and // style comments)
+    endif_pattern = re.compile(r'\n#endif\s*(?:(?:/\*[^*]*\*/)|(?://[^\n]*))?[ \t]*$')
     match = endif_pattern.search(text)
     if not match:
         print(f"  ERROR: could not find closing #endif in {path.name}")
