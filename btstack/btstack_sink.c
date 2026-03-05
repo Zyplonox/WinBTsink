@@ -44,7 +44,7 @@
 /* BTstack headers */
 #include "btstack.h"
 #include "btstack_run_loop_windows.h"
-#include "hci_transport_h2_winusb.h"
+#include "hci_transport_usb.h"
 #include "classic/a2dp_sink.h"
 #include "classic/avdtp.h"
 #include "classic/avrcp.h"
@@ -53,6 +53,14 @@
 #include "classic/a2dp.h"
 #include "classic/avdtp_util.h"
 #include "bluetooth_sdp.h"
+#include "hci_cmd.h"
+
+/* btstack_crypto.c references hci_le_rand (an LE HCI command descriptor)
+ * even in Classic-only builds. Provide the stub so the linker is satisfied.
+ * In a Classic-only build this command is never actually sent. */
+#ifndef ENABLE_BLE
+const hci_cmd_t hci_le_rand = { 0x2018u, "" };
+#endif
 
 /* -------------------------------------------------------------------------
  * Configuration
@@ -243,14 +251,12 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
 
     switch (subevent) {
 
-    case A2DP_SUBEVENT_INCOMING_CONNECTION_ESTABLISHED:
-        /* Connection fully established (L2CAP + AVDTP both open) */
-        g_a2dp_cid = a2dp_subevent_incoming_connection_established_get_a2dp_cid(packet);
-        a2dp_subevent_incoming_connection_established_get_bd_addr(packet,
-            (bd_addr_t)(void *)g_peer_addr_str);  /* reuse string slot */
+    case A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED:
+        /* Signaling connection established (L2CAP + AVDTP signaling open) */
+        g_a2dp_cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
         {
             bd_addr_t bd;
-            a2dp_subevent_incoming_connection_established_get_bd_addr(packet, bd);
+            a2dp_subevent_signaling_connection_established_get_bd_addr(packet, bd);
             addr_to_str(bd, g_peer_addr_str);
         }
         snprintf(evt, sizeof(evt),
@@ -260,17 +266,11 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
         break;
 
     case A2DP_SUBEVENT_STREAM_STARTED:
-        /* Codec configuration is available here */
-        {
-            uint8_t seid = a2dp_subevent_stream_started_get_local_seid(packet);
-            avdtp_media_codec_configuration_sbc_t sbc_cfg;
-            (void)seid;
-            /* Use the sample rate/channels stored during SET_CONFIG */
-            snprintf(evt, sizeof(evt),
-                     "{\"event\":\"audio_start\",\"sample_rate\":%d,\"channels\":%d}",
-                     g_sample_rate, g_channels);
-            emit_event(evt);
-        }
+        /* Use sample rate/channels stored during CODEC_CONFIGURATION */
+        snprintf(evt, sizeof(evt),
+                 "{\"event\":\"audio_start\",\"sample_rate\":%d,\"channels\":%d}",
+                 g_sample_rate, g_channels);
+        emit_event(evt);
         break;
 
     case A2DP_SUBEVENT_STREAM_SUSPENDED:
@@ -278,7 +278,7 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
         emit_event("{\"event\":\"audio_stop\"}");
         break;
 
-    case A2DP_SUBEVENT_CONNECTION_RELEASED:
+    case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
         snprintf(evt, sizeof(evt),
                  "{\"event\":\"disconnected\",\"addr\":\"%s\"}",
                  g_peer_addr_str);
@@ -287,23 +287,10 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
         g_peer_addr_str[0] = '\0';
         break;
 
-    case A2DP_SUBEVENT_CODEC_CONFIGURED:
-        /* Extract sample rate and channel mode from SBC config */
-        {
-            uint8_t seid        = a2dp_subevent_codec_configured_get_local_seid(packet);
-            uint8_t sf_flags    = a2dp_subevent_codec_configured_get_sampling_frequency(packet);
-            uint8_t ch_flags    = a2dp_subevent_codec_configured_get_channel_mode(packet);
-            (void)seid;
-
-            /* sampling_frequency bitmask: bit3=16k, bit2=32k, bit1=44.1k, bit0=48k */
-            if      (sf_flags & 0x01) g_sample_rate = 48000;
-            else if (sf_flags & 0x02) g_sample_rate = 44100;
-            else if (sf_flags & 0x04) g_sample_rate = 32000;
-            else                      g_sample_rate = 16000;
-
-            /* channel_mode: bit1=stereo/joint-stereo, bit0=mono/dual */
-            g_channels = (ch_flags & 0x03) ? 2 : 1;
-        }
+    case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION:
+        /* Extract sample rate and channel count from SBC config */
+        g_sample_rate = a2dp_subevent_signaling_media_codec_sbc_configuration_get_sampling_frequency(packet);
+        g_channels    = a2dp_subevent_signaling_media_codec_sbc_configuration_get_num_channels(packet);
         break;
 
     default:
@@ -365,14 +352,20 @@ static void on_hci_event(uint8_t packet_type, uint16_t channel,
 
     case HCI_EVENT_PIN_CODE_REQUEST:
         /* Legacy PIN: accept with empty PIN (no MITM for audio devices) */
-        hci_event_pin_code_request_get_bd_addr(packet, (bd_addr_t)(void *)evt);
-        gap_pin_code_response((bd_addr_t)(void *)evt, "0000");
+        {
+            bd_addr_t bd;
+            hci_event_pin_code_request_get_bd_addr(packet, bd);
+            gap_pin_code_response(bd, "0000");
+        }
         break;
 
     case HCI_EVENT_USER_CONFIRMATION_REQUEST:
         /* SSP numeric comparison: auto-confirm */
-        hci_event_user_confirmation_request_get_bd_addr(packet, (bd_addr_t)(void *)evt);
-        gap_ssp_confirmation_response((bd_addr_t)(void *)evt);
+        {
+            bd_addr_t bd;
+            hci_event_user_confirmation_request_get_bd_addr(packet, bd);
+            gap_ssp_confirmation_response(bd);
+        }
         break;
 
     default:
@@ -578,12 +571,8 @@ int main(int argc, char *argv[]) {
     btstack_memory_init();
     btstack_run_loop_init(btstack_run_loop_windows_get_instance());
 
-    /* HCI transport: WinUSB */
-    hci_transport_config_usb_t usb_cfg;
-    usb_cfg.type        = HCI_TRANSPORT_CONFIG_USB;
-    usb_cfg.path_source = g_usb_path;
-
-    hci_init(hci_transport_h2_winusb_instance(), &usb_cfg);
+    /* HCI transport: WinUSB (no config struct needed for USB) */
+    hci_init(hci_transport_usb_instance(), NULL);
 
     /* Register HCI event handler (GAP events, power-on, etc.) */
     g_hci_event_cb.callback = &on_hci_event;
@@ -612,30 +601,29 @@ int main(int argc, char *argv[]) {
     a2dp_sink_register_packet_handler(&on_a2dp_sink_event);
     a2dp_sink_register_media_handler(&on_a2dp_media_packet);
 
-    /* Register a local SBC sink stream endpoint */
+    /* Register a local SBC sink stream endpoint.
+     * SBC capabilities: 2 raw bytes in A2DP/AVDTP wire format:
+     *   byte 0: sampling_freq (bits 7-4) | channel_mode (bits 3-0)
+     *   byte 1: block_length  (bits 7-4) | subbands (bits 3-2) | alloc (bits 1-0)
+     * 0xFF 0xFF = accept all combinations. */
     {
-        avdtp_media_codec_configuration_sbc_t sbc_caps;
-        memset(&sbc_caps, 0, sizeof(sbc_caps));
-        sbc_caps.sampling_frequency =
-            AVDTP_SBC_44100 | AVDTP_SBC_48000;
-        sbc_caps.channel_mode =
-            AVDTP_SBC_JOINT_STEREO | AVDTP_SBC_STEREO |
-            AVDTP_SBC_DUAL_CHANNEL | AVDTP_SBC_MONO;
-        sbc_caps.block_length =
-            AVDTP_SBC_BLOCK_LENGTH_16 | AVDTP_SBC_BLOCK_LENGTH_12 |
-            AVDTP_SBC_BLOCK_LENGTH_8  | AVDTP_SBC_BLOCK_LENGTH_4;
-        sbc_caps.subbands =
-            AVDTP_SBC_SUBBANDS_8 | AVDTP_SBC_SUBBANDS_4;
-        sbc_caps.allocation_method =
-            AVDTP_SBC_ALLOCATION_METHOD_LOUDNESS |
-            AVDTP_SBC_ALLOCATION_METHOD_SNR;
-        sbc_caps.min_bitpool_value = 2;
-        sbc_caps.max_bitpool_value = (uint8_t)g_max_bitpool;
+        static uint8_t sbc_caps[4] = {
+            0xFF,  /* all sample rates + all channel modes */
+            0xFF,  /* all block lengths + subbands + alloc methods */
+            2,     /* min bitpool */
+            53     /* max bitpool — overwritten below */
+        };
+        sbc_caps[3] = (uint8_t)g_max_bitpool;
 
-        g_a2dp_local_seid = a2dp_sink_create_stream_endpoint(
+        static uint8_t sbc_cfg[4] = { 0 };  /* filled in by remote during SET_CONFIG */
+
+        avdtp_stream_endpoint_t *sep = a2dp_sink_create_stream_endpoint(
             AVDTP_AUDIO, AVDTP_CODEC_SBC,
-            (uint8_t *)&sbc_caps, sizeof(sbc_caps),
-            NULL, 0);
+            sbc_caps, sizeof(sbc_caps),
+            sbc_cfg, sizeof(sbc_cfg));
+        if (sep) {
+            g_a2dp_local_seid = avdtp_local_seid(sep);
+        }
     }
 
     /* ---- stdin command reader (Windows thread) ---- */
@@ -645,9 +633,11 @@ int main(int argc, char *argv[]) {
     g_stdin_thread = (HANDLE)_beginthreadex(
         NULL, 0, stdin_reader_thread, NULL, 0, NULL);
 
-    /* Register stdin as a BTstack data source using the Win32 HANDLE */
-    btstack_run_loop_windows_add_handle_callback(
-        &g_stdin_ds, g_stdin_event, &stdin_ds_callback);
+    /* Register stdin event as a BTstack data source (Windows HANDLE in source.handle) */
+    g_stdin_ds.source.handle = g_stdin_event;
+    btstack_run_loop_set_data_source_handler(&g_stdin_ds, &stdin_ds_callback);
+    btstack_run_loop_enable_data_source_callbacks(&g_stdin_ds, DATA_SOURCE_CALLBACK_READ);
+    btstack_run_loop_add_data_source(&g_stdin_ds);
 
     /* ---- Power on and run ---- */
     hci_power_control(HCI_POWER_ON);
