@@ -4,8 +4,9 @@
 #   pip install -r requirements.txt
 
 # ── Bluetooth stack ───────────────────────────────────────────────────────────
-# Replaces the Windows BT stack entirely via WinUSB / libusb
-bumble>=0.0.180
+# BTstack (C) handles Bluetooth via btstack_sink.exe subprocess.
+# Run btstack/build.ps1 to build it (requires MSYS2/MinGW, auto-installed).
+# pyusb is kept for USB dongle enumeration in the UI (winusb_installer.py).
 
 # ── Audio ─────────────────────────────────────────────────────────────────────
 sounddevice>=0.4.6

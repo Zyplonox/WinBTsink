@@ -1,13 +1,17 @@
 # BT-AudioSink.spec – PyInstaller configuration
 # ================================================
-# Builds a standalone Windows .exe with a bundled FFmpeg binary.
+# Builds a standalone Windows .exe with a bundled FFmpeg binary
+# and btstack_sink.exe (the C BTstack subprocess).
 #
 # Usage:
 #   pyinstaller BT-AudioSink.spec
+#
+# Prerequisites:
+#   Run btstack/build.ps1 first to produce btstack/build/btstack_sink.exe.
 
 import os
 import sys
-from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 # Locate the FFmpeg binary provided by imageio-ffmpeg
 try:
@@ -16,63 +20,46 @@ try:
 except Exception:
     ffmpeg_exe = None
 
+# Locate btstack_sink.exe built by btstack/build.ps1
+btstack_exe = os.path.join(os.path.dirname(os.path.abspath(SPEC)),
+                           'btstack', 'build', 'btstack_sink.exe')
+if not os.path.exists(btstack_exe):
+    raise FileNotFoundError(
+        f"btstack_sink.exe not found at {btstack_exe}\n"
+        "Run btstack/build.ps1 first."
+    )
+
 # ---------------------------------------------------------------------------
 # CustomTkinter: needs everything (themes, images, font data)
 # ---------------------------------------------------------------------------
 ctk_datas, ctk_binaries, ctk_hiddenimports = collect_all('customtkinter')
 
 # ---------------------------------------------------------------------------
-# Bumble: collect_all() would pull in all gRPC / Android-netsim protobuf
-# files that we never use.  Instead:
-#   - collect_data_files()   gets only the non-Python data bumble needs
-#   - list explicit submodules for the BT profiles we actually import
+# Bundled binaries
 # ---------------------------------------------------------------------------
-bumble_datas = collect_data_files('bumble')
-
-BUMBLE_MODULES = [
-    # Core BT stack
-    'bumble.core', 'bumble.hci', 'bumble.device',
-    'bumble.l2cap', 'bumble.sdp', 'bumble.smp',
-    'bumble.att', 'bumble.gatt', 'bumble.gap',
-    'bumble.rfcomm', 'bumble.keys', 'bumble.pairing',
-    # Profiles used by the app
-    'bumble.avdtp', 'bumble.avrcp', 'bumble.a2dp',
-    'bumble.profiles',
-    # Transport layer (USB only)
-    'bumble.transport', 'bumble.transport.usb',
-]
+bundled_binaries = ctk_binaries + [(btstack_exe, '.')]
+if ffmpeg_exe and os.path.exists(ffmpeg_exe):
+    bundled_binaries.append((ffmpeg_exe, '.'))
 
 a = Analysis(
     ['src/gui.py'],
     pathex=['.'],
-    binaries=(
-        [(ffmpeg_exe, '.')] if ffmpeg_exe and os.path.exists(ffmpeg_exe) else []
-    ) + ctk_binaries,
-    datas=bumble_datas + ctk_datas,
+    binaries=bundled_binaries,
+    datas=ctk_datas,
     hiddenimports=[
         # App dependencies
         'sounddevice', 'numpy', 'PIL', 'PIL._tkinter_finder',
         'customtkinter', 'pystray', 'backend', 'winusb_installer',
-        # Bumble modules that may be imported at runtime
-    ] + BUMBLE_MODULES + ctk_hiddenimports,
+    ] + ctk_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # Exclude transports and optional backends we never use
     excludes=[
-        'grpc', 'grpcio',
-        'bumble.transport.grpc_transport',
-        'bumble.transport.grpc_protobuf',
-        'bumble.transport.android_netsim',
-        'bumble.transport.serial',
-        'bumble.transport.hci_socket',
-        'bumble.transport.tcp_client',
-        'bumble.transport.tcp_server',
-        'bumble.transport.vhci',
-        'bumble.transport.udp',
-        'bumble.apps',
+        # Bumble is no longer used
+        'bumble',
         # Unused stdlib
         'sqlite3', 'unittest',
+        'grpc', 'grpcio',
     ],
     noarchive=False,
 )

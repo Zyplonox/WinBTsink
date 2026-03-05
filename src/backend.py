@@ -8,12 +8,12 @@ Architecture overview
 ---------------------
 ┌─ SinkBackend ──────────────────────────────────────────────────────────┐
 │  start()  → daemon thread → asyncio loop → _async_main()              │
-│                                              ├─ open USB transport     │
-│                                              ├─ configure BT Device    │
-│                                              ├─ register A2DP sink     │
+│                                              ├─ launch btstack_sink.exe│
+│                                              ├─ read stderr (events)   │
+│                                              ├─ read stdout (SBC audio)│
 │                                              └─ wait for stop event    │
 │                                                                        │
-│  stop()   → sets asyncio stop event → joins pipeline                  │
+│  stop()   → sends {"cmd":"stop"} → joins pipeline                     │
 │                                                                        │
 │  Callbacks (always called from the BT thread):                        │
 │    on_state_change, on_device_connected, on_device_disconnected,       │
@@ -23,8 +23,9 @@ Architecture overview
 
 Audio pipeline
 --------------
-RTP payload (SBC frames)
-  → FFmpeg subprocess (SBC → s16le PCM, via stdin/stdout pipes)
+btstack_sink.exe stdout (length-prefixed SBC frames)
+  → _stdout_audio_thread reads frames
+  → SbcAudioPipeline.write_sbc() feeds FFmpeg subprocess
   → background reader thread fills a PCM queue
   → sounddevice OutputStream callback drains the queue in real time
 """
@@ -45,101 +46,15 @@ from typing import Callable, Optional
 import numpy as np
 import sounddevice as sd
 
-try:
-    from bumble.device import Device
-    from bumble.transport import open_transport
-    from bumble import avdtp, avrcp
-    from bumble.a2dp import (
-        SbcMediaCodecInformation,
-        A2DP_SBC_CODEC_TYPE as SBC_CODEC_TYPE,
-        make_audio_sink_service_sdp_records,
-    )
-    from bumble.pairing import PairingConfig, PairingDelegate
-    from bumble.keys import JsonKeyStore
-except ImportError as e:
-    raise ImportError(
-        "Package 'bumble' is missing. Please run: pip install bumble"
-    ) from e
-
 log = logging.getLogger("bt-sink.backend")
-
-#: Bluetooth device class: Rendering + Audio service | Audio/Video major | Headphones minor.
-DEVICE_CLASS = 0x240418
 
 #: Suppress the FFmpeg/subprocess console window on Windows.
 _POPEN_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-#: Maps SBC SamplingFrequency enum members to integer sample-rate values.
-_SBC_SAMPLE_RATE_MAP: dict = {}  # populated lazily after bumble imports succeed
-
-
-def _build_sample_rate_map() -> dict:
-    """
-    Builds the SamplingFrequency → Hz mapping from bumble's enum.
-    Called once on first use so that the module-level constant doesn't fail
-    when bumble isn't installed.
-    """
-    SF = SbcMediaCodecInformation.SamplingFrequency
-    return {
-        SF.SF_48000: 48000,
-        SF.SF_44100: 44100,
-        SF.SF_32000: 32000,
-        SF.SF_16000: 16000,
-    }
-
 
 # ---------------------------------------------------------------------------
-# Keystore persistence
+# Allowed-MAC persistence  (no BT stack dependency)
 # ---------------------------------------------------------------------------
-
-def _load_keystore(path: Path, namespace: str) -> "JsonKeyStore":
-    """
-    Loads bonding keys from a JSON file and returns a JsonKeyStore.
-
-    The namespace (typically the local BT address) scopes the keys so that
-    multiple devices with different addresses don't share the same key store.
-    Returns an empty store when the file doesn't exist or is malformed.
-    """
-    try:
-        if path.exists():
-            with open(path, encoding="utf-8") as f:
-                data = _json.load(f)
-            return JsonKeyStore(namespace, data)
-    except Exception as e:
-        log.debug("Load keystore: %s", e)
-    return JsonKeyStore(namespace)
-
-
-def _save_keystore(keystore: "JsonKeyStore", path: Path) -> None:
-    """
-    Persists bonding keys to a JSON file so paired devices reconnect
-    automatically on the next session without requiring re-pairing.
-
-    Handles both the as_dict() API (newer bumble) and the raw .store
-    attribute (older builds) for forward/backward compatibility.
-    """
-    try:
-        if hasattr(keystore, "as_dict"):
-            data = keystore.as_dict()
-        elif hasattr(keystore, "store"):
-            ns = getattr(keystore, "namespace", "__DEFAULT__")
-            data = {ns: {str(a): k.to_dict() for a, k in keystore.store.items()}}
-        else:
-            return  # Unknown keystore format – give up silently
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            _json.dump(data, f, indent=2)
-    except Exception as e:
-        log.debug("Save keystore: %s", e)
-
-
-def _is_in_keystore(keystore, addr_str: str) -> bool:
-    """Returns True if the given BT address already has a stored bonding key."""
-    if keystore is None or not hasattr(keystore, "store"):
-        return False
-    return any(str(a).upper() == addr_str.upper() for a in keystore.store)
-
 
 def _load_allowed_macs(path: Path) -> set:
     """Loads the set of previously allowed MAC addresses from disk."""
@@ -165,53 +80,14 @@ def _save_allowed_macs(macs: set, path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pairing confirmation delegate
-# ---------------------------------------------------------------------------
-
-class ConfirmingPairingDelegate(PairingDelegate):
-    """
-    BT Classic pairing delegate that gates key exchange on the global pairing flag.
-
-    User-visible approval (the GUI dialog) is handled by on_connection /
-    _handle_new_connection after the BT link is established.  This delegate
-    only intervenes at the BT protocol level:
-
-      - Device already in allowed_macs (previous Allow + Remember) → auto-approve
-      - Pairing globally enabled                                    → approve
-            (user dialog will be shown in on_connection)
-      - Pairing globally blocked                                    → reject at
-            protocol level so the phone never completes key exchange
-    """
-
-    def __init__(
-        self,
-        address_upper: str,
-        allowed_macs_ref: set,
-        pairing_allowed_fn: Callable[[], bool],
-    ):
-        super().__init__(PairingDelegate.IoCapability.NO_OUTPUT_NO_INPUT)
-        self._address_upper = address_upper
-        self._allowed_macs = allowed_macs_ref
-        self._pairing_allowed_fn = pairing_allowed_fn
-
-    async def accept(self) -> bool:
-        # Previously approved (Allow + Remember) device → always let through
-        if self._address_upper in self._allowed_macs:
-            return True
-        # Otherwise gate purely on the global pairing flag.  The user-visible
-        # dialog is shown in on_connection, not here.
-        return self._pairing_allowed_fn()
-
-
-# ---------------------------------------------------------------------------
 # State machine
 # ---------------------------------------------------------------------------
 
 class SinkState(Enum):
     """Lifecycle states of the SinkBackend."""
     IDLE = auto()       # Not started yet
-    STARTING = auto()   # Thread launched, USB transport opening
-    READY = auto()      # Device powered on, discoverable, waiting for a source
+    STARTING = auto()   # Thread launched, launching btstack_sink.exe
+    READY = auto()      # BTstack powered on, discoverable, waiting for a source
     CONNECTED = auto()  # A Bluetooth source is connected and streaming
     ERROR = auto()      # Unrecoverable error (transport failure, etc.)
     STOPPED = auto()    # Cleanly stopped by the user
@@ -227,7 +103,7 @@ class SbcAudioPipeline:
 
     Thread model
     ------------
-    write_sbc()  is called from the asyncio/bumble thread.
+    write_sbc()  is called from the btstack-audio reader thread.
     _pcm_reader_loop() runs in its own daemon thread.
     _audio_callback() is called by the sounddevice WASAPI thread.
     A bounded queue decouples the reader from the callback.
@@ -455,53 +331,12 @@ class SbcAudioPipeline:
 
 
 # ---------------------------------------------------------------------------
-# Codec parameter extraction
-# ---------------------------------------------------------------------------
-
-def _extract_codec_params(sink) -> tuple[int, int]:
-    """
-    Reads the negotiated SBC codec parameters from the AVDTP sink's
-    configuration and returns (sample_rate_hz, num_channels).
-
-    Falls back to 44100 Hz stereo if the configuration is unreadable,
-    which matches the mandatory SBC baseline in the A2DP specification.
-    """
-    global _SBC_SAMPLE_RATE_MAP
-    if not _SBC_SAMPLE_RATE_MAP:
-        _SBC_SAMPLE_RATE_MAP = _build_sample_rate_map()
-
-    sample_rate = 44100  # A2DP mandatory baseline
-    channels = 2
-
-    try:
-        for cap in sink.configuration:
-            if not isinstance(cap, avdtp.MediaCodecCapabilities):
-                continue
-            info = cap.media_codec_information
-            SF = SbcMediaCodecInformation.SamplingFrequency
-            CM = SbcMediaCodecInformation.ChannelMode
-
-            # Dict lookup replaces the previous if/elif chain
-            for sf_flag, hz in _SBC_SAMPLE_RATE_MAP.items():
-                if sf_flag in info.sampling_frequency:
-                    sample_rate = hz
-                    break
-
-            channels = 1 if CM.MONO in info.channel_mode else 2
-            break  # Only the first MediaCodecCapabilities entry is relevant
-    except Exception as e:
-        log.debug("Could not read codec parameters: %s", e)
-
-    return sample_rate, channels
-
-
-# ---------------------------------------------------------------------------
 # SinkBackend – public API consumed by the GUI
 # ---------------------------------------------------------------------------
 
 class SinkBackend:
     """
-    Manages the full Bluetooth + audio lifecycle.
+    Manages the full Bluetooth + audio lifecycle using btstack_sink.exe.
 
     Usage
     -----
@@ -545,8 +380,11 @@ class SinkBackend:
 
         # Feature flags
         self._debug = debug
-        self._keystore_path = Path(keystore_path) if keystore_path else None
         self._allowed_macs_path = Path(allowed_macs_path) if allowed_macs_path else None
+        # keystore_path kept for API compatibility; BTstack manages its own bonding
+        self._keystore_path = Path(keystore_path) if keystore_path else None
+
+        # Allowed MACs: devices the user has previously approved with "Remember"
         self._allowed_macs: set = (
             _load_allowed_macs(self._allowed_macs_path)
             if self._allowed_macs_path else set()
@@ -561,19 +399,16 @@ class SinkBackend:
         self._cb_pairing_request = on_pairing_request
 
         # Pairing control
-        self._pairing_allowed = True           # Allow new (unknown) device pairings
-        self._remember_map: dict[str, bool] = {}  # addr_upper -> should persist key to disk
-        # Per-connection approval futures: created in on_connection, consumed by
-        # _on_avdtp_connection so the on_start handler waits for user approval.
-        self._connection_approvals: dict[str, "asyncio.Future[bool]"] = {}
+        self._pairing_allowed = True
+        self._remember_map: dict[str, bool] = {}  # addr_upper → persist key to disk
 
-        # Runtime state – all set during start()
+        # Runtime state – set during start()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._pipeline: Optional[SbcAudioPipeline] = None
         self._stop_event: Optional[asyncio.Event] = None
         self._state = SinkState.IDLE
-        self._bt_device: Optional[Device] = None  # Set while BT stack is running
+        self._btstack_proc: Optional[subprocess.Popen] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -585,54 +420,30 @@ class SinkBackend:
         return self._state
 
     def set_volume(self, volume: float) -> None:
-        """
-        Updates the output volume (linear multiplier, 0.0–2.0).
-        Takes effect immediately if a pipeline is already running.
-        """
+        """Updates the output volume (linear multiplier, 0.0–2.0)."""
         self._volume = max(0.0, min(2.0, volume))
         if self._pipeline:
             self._pipeline.set_volume(self._volume)
 
     def clear_allowed_macs(self) -> None:
-        """Wipes the in-memory allowed-MAC set, keystore, and keystore file.
-
-        The GUI deletes allowed_macs.json before calling this.  We also clear
-        the in-memory keystore and its JSON file so that previously paired
-        devices are not re-admitted via _is_in_keystore() on reconnect.
-        """
+        """Wipes the in-memory allowed-MAC set and its JSON file on disk."""
         self._allowed_macs.clear()
-
-        # Clear the in-memory keystore so _is_in_keystore() returns False
-        if self._bt_device is not None:
-            ks = getattr(self._bt_device, "keystore", None)
-            if ks is not None and hasattr(ks, "store"):
-                ks.store.clear()
-
-        # Delete the keystore file so the next session starts clean too
-        if self._keystore_path and self._keystore_path.exists():
+        if self._allowed_macs_path and self._allowed_macs_path.exists():
             try:
-                self._keystore_path.unlink()
-                log.debug("Keystore file deleted: %s", self._keystore_path)
+                self._allowed_macs_path.unlink()
+                log.debug("allowed_macs.json deleted")
             except Exception as exc:
-                log.debug("Could not delete keystore: %s", exc)
+                log.debug("Could not delete allowed_macs: %s", exc)
+        # BTstack bonding keys (TLV file) are managed inside btstack_sink.exe.
+        # A future "clear_bonding_keys" command can be added to btstack_sink.exe.
 
     def set_pairing_mode(self, allowed: bool) -> None:
-        """Allow (True) or block (False) pairing requests from unknown devices.
-
-        Also toggles BT discoverability so that unknown devices can no longer
-        discover the sink when pairing is disabled.
-        """
+        """Allow (True) or block (False) pairing requests from unknown devices."""
         self._pairing_allowed = allowed
-        if self._loop and self._loop.is_running() and self._bt_device:
-            asyncio.run_coroutine_threadsafe(
-                self._bt_device.set_discoverable(allowed), self._loop
-            )
+        self._send_btstack_cmd({"cmd": "set_discoverable", "enabled": allowed})
 
     def start(self) -> None:
-        """
-        Transitions to STARTING and launches the background daemon thread.
-        No-op if the backend is already running.
-        """
+        """Transitions to STARTING and launches the background daemon thread."""
         if self._state not in (SinkState.IDLE, SinkState.STOPPED, SinkState.ERROR):
             return
         self._set_state(SinkState.STARTING)
@@ -642,10 +453,7 @@ class SinkBackend:
         self._thread.start()
 
     def stop(self) -> None:
-        """
-        Signals the asyncio loop to exit and stops the audio pipeline.
-        Safe to call from any thread.
-        """
+        """Signals the asyncio loop to exit and stops the audio pipeline."""
         if self._loop and self._loop.is_running() and self._stop_event is not None:
             self._loop.call_soon_threadsafe(self._stop_event.set)
         if self._pipeline:
@@ -658,297 +466,277 @@ class SinkBackend:
     # ------------------------------------------------------------------
 
     def _run_loop(self) -> None:
-        """
-        Entry point for the daemon thread.  Creates a fresh asyncio event loop,
-        installs bumble log forwarding, runs the main coroutine, then cleans up.
-        """
+        """Entry point for the daemon thread."""
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         self._stop_event = asyncio.Event()
-
-        handlers = self._install_log_handlers()
         try:
             self._loop.run_until_complete(self._async_main())
         except Exception as exc:
             self._log(f"Fatal error: {exc}")
             self._set_state(SinkState.ERROR)
         finally:
-            self._remove_log_handlers(handlers)
             self._loop.close()
             self._loop = None
             self._stop_event = None
-            self._bt_device = None
-
-    def _build_logger_config(self) -> dict[str, int]:
-        """
-        Returns a mapping of bumble logger names to the desired log level,
-        depending on whether debug mode is active.
-        """
-        if self._debug:
-            return {
-                "bumble.avdtp": logging.DEBUG,
-                "bumble.l2cap": logging.DEBUG,
-                "bumble.device": logging.WARNING,
-                "bumble.hci": logging.WARNING,
-            }
-        return {
-            "bumble.avdtp": logging.WARNING,
-            "bumble.l2cap": logging.WARNING,
-            "bumble.device": logging.WARNING,
-            "bumble.hci": logging.WARNING,
-        }
-
-    def _install_log_handlers(self) -> dict[str, logging.Handler]:
-        """
-        Attaches a custom log handler to the relevant bumble loggers so their
-        output is forwarded to the GUI log panel.
-
-        Returns the {logger_name: handler} dict so they can be removed later.
-        """
-        log_fn = self._log
-
-        class _GuiHandler(logging.Handler):
-            """Forwards bumble log records to the GUI callback."""
-            def emit(self, record: logging.LogRecord) -> None:
-                try:
-                    # Strip the 'bumble.' prefix for compactness
-                    tag = record.name.split(".")[-1]
-                    log_fn(f"[{tag}] {record.getMessage()}")
-                except Exception:
-                    pass
-
-        config = self._build_logger_config()
-        installed: dict[str, logging.Handler] = {}
-        for name, level in config.items():
-            handler = _GuiHandler()
-            handler.setLevel(level)
-            lg = logging.getLogger(name)
-            lg.addHandler(handler)
-            lg.setLevel(level)
-            installed[name] = handler
-        return installed
-
-    def _remove_log_handlers(self, handlers: dict[str, logging.Handler]) -> None:
-        """Detaches the GUI log handlers installed by _install_log_handlers()."""
-        for name, handler in handlers.items():
-            logging.getLogger(name).removeHandler(handler)
 
     # ------------------------------------------------------------------
-    # Async main
+    # BTstack subprocess management
     # ------------------------------------------------------------------
+
+    def _find_btstack_exe(self) -> Optional[str]:
+        """Locates btstack_sink.exe relative to this script or in a PyInstaller bundle."""
+        candidates = []
+
+        # Development: btstack/build/btstack_sink.exe next to project root
+        here = Path(__file__).resolve().parent.parent
+        candidates.append(here / "btstack" / "build" / "btstack_sink.exe")
+
+        # PyInstaller bundle: next to the running .exe
+        if getattr(sys, "frozen", False):
+            candidates.append(Path(sys.executable).parent / "btstack_sink.exe")
+
+        # Same directory as this script (alternative bundle layout)
+        candidates.append(Path(__file__).parent / "btstack_sink.exe")
+
+        for p in candidates:
+            if p.exists():
+                return str(p)
+        return None
 
     async def _async_main(self) -> None:
-        """
-        Opens the USB HCI transport and hands off to _setup_device().
-        Reports transport errors (missing dongle, wrong WinUSB config, …) to the GUI.
-        """
-        self._log(f"Opening USB transport: {self._transport_str}")
-        try:
-            async with await open_transport(self._transport_str) as transport:
-                await self._setup_device(transport.source, transport.sink)
-        except Exception as exc:
-            self._log(f"Transport error: {exc}")
-            self._log("Possible causes:")
-            self._log("  • No Bluetooth dongle connected")
-            self._log("  • WinUSB driver (Zadig) not installed")
-            self._log(f"  • Wrong transport index (try usb:0 … usb:3)")
+        """Launches btstack_sink.exe and drives the event loop until stop()."""
+        exe = self._find_btstack_exe()
+        if not exe:
+            self._log("Error: btstack_sink.exe not found.")
+            self._log("Build it first: cd btstack && .\\build.ps1")
             self._set_state(SinkState.ERROR)
+            return
 
-    async def _setup_device(self, hci_source, hci_sink) -> None:
-        """
-        Configures the bumble Device, registers AVDTP/AVRCP, and enters the
-        'advertise and wait for connection' loop.  Exits when the stop event fires.
-        """
-        device = self._create_device(hci_source, hci_sink)
-        self._bt_device = device
-        self._configure_sdp_records(device)
-        self._attach_connection_handlers(device)
+        # Parse USB index from "usb:N"
+        usb_index = 0
+        if self._transport_str.startswith("usb:"):
+            try:
+                usb_index = int(self._transport_str.split(":")[1])
+            except (IndexError, ValueError):
+                pass
 
-        # AVRCP Target is required by many sources (Switch, phones)
-        # even if we don't use the remote control commands
-        avrcp_protocol = avrcp.Protocol()
-        avrcp_protocol.listen(device)
+        cmd = [
+            exe,
+            str(usb_index),
+            self._device_name,
+            self._bt_address,
+            str(self._max_bitpool),
+        ]
+        self._log(f"Launching BTstack: {Path(exe).name} (usb:{usb_index})")
 
-        # AVDTP listener – handles stream negotiation and media delivery
-        listener = avdtp.Listener.for_device(device)
-        listener.on("connection", lambda server: self._on_avdtp_connection(server, device))
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=_POPEN_FLAGS,
+            )
+        except OSError as exc:
+            self._log(f"Failed to launch btstack_sink.exe: {exc}")
+            self._log("Possible causes:")
+            self._log("  • btstack_sink.exe not found or not built")
+            self._log("  • WinUSB driver (Zadig) not installed for the dongle")
+            self._set_state(SinkState.ERROR)
+            return
 
-        await device.power_on()
-        await device.set_discoverable(self._pairing_allowed)
-        await device.set_connectable(True)
+        self._btstack_proc = proc
+        loop = asyncio.get_event_loop()
 
-        self._log(f"Ready! Device name: {self._device_name}")
-        self._log("Open Bluetooth settings → pair with device → play audio")
-        self._set_state(SinkState.READY)
+        # Thread: read stderr events → dispatch to asyncio loop
+        t_events = threading.Thread(
+            target=self._stderr_reader_thread,
+            args=(proc.stderr, loop),
+            daemon=True,
+            name="btstack-events",
+        )
+        t_events.start()
+
+        # Thread: read stdout SBC frames → feed to audio pipeline
+        t_audio = threading.Thread(
+            target=self._stdout_audio_thread,
+            args=(proc.stdout,),
+            daemon=True,
+            name="btstack-audio",
+        )
+        t_audio.start()
 
         # Block until stop() signals the event
         assert self._stop_event is not None
         await self._stop_event.wait()
 
-    def _create_device(self, hci_source, hci_sink) -> Device:
+        # Graceful shutdown
+        self._send_btstack_cmd({"cmd": "stop"})
+        try:
+            proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+        self._btstack_proc = None
+
+    def _stderr_reader_thread(
+        self, stderr_pipe, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        """Reads JSON event lines from btstack_sink.exe stderr; dispatches to asyncio loop."""
+        for raw_line in stderr_pipe:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                event = _json.loads(line)
+            except _json.JSONDecodeError:
+                loop.call_soon_threadsafe(self._log, f"[btstack] {line}")
+                continue
+            loop.call_soon_threadsafe(self._on_btstack_event, event)
+
+    def _stdout_audio_thread(self, stdout_pipe) -> None:
         """
-        Instantiates and configures the bumble Device object.
-
-        Key settings:
-          - Classic BT only (LE disabled) – A2DP is a BR/EDR profile.
-          - Secure Connections disabled – many consoles (Switch) require
-            legacy pairing and cannot negotiate SC.
-          - Persistent bonding keys loaded from disk (if configured).
+        Reads length-prefixed SBC frames from btstack_sink.exe stdout.
+        Frame format: [uint32_le length][SBC payload bytes]
+        Feeds payload bytes to the active audio pipeline.
         """
-        device = Device.with_hci(
-            name=self._device_name,
-            address=self._bt_address,
-            hci_source=hci_source,
-            hci_sink=hci_sink,
-        )
-        device.classic_enabled = True
-        device.le_enabled = False
-        device.classic_sc_enabled = False  # Legacy pairing for console compatibility
-        device.class_of_device = DEVICE_CLASS
+        while True:
+            header = stdout_pipe.read(4)
+            if not header or len(header) < 4:
+                break
+            frame_len = int.from_bytes(header, "little")
+            if frame_len == 0 or frame_len > 65536:
+                continue  # Sanity check; skip malformed frames
+            data = b""
+            remaining = frame_len
+            while remaining > 0:
+                chunk = stdout_pipe.read(remaining)
+                if not chunk:
+                    return
+                data += chunk
+                remaining -= len(chunk)
+            if self._pipeline:
+                self._pipeline.write_sbc(data)
 
-        if self._keystore_path:
-            # Load previously saved bonding keys so peers reconnect without re-pairing
-            device.keystore = _load_keystore(self._keystore_path, self._bt_address)
-            log.debug("Keystore loaded: %s", self._keystore_path)
+    def _send_btstack_cmd(self, cmd: dict) -> None:
+        """Sends a JSON command line to btstack_sink.exe via stdin."""
+        proc = self._btstack_proc
+        if proc and proc.stdin and proc.poll() is None:
+            try:
+                line = (_json.dumps(cmd) + "\n").encode("utf-8")
+                proc.stdin.write(line)
+                proc.stdin.flush()
+            except (OSError, BrokenPipeError):
+                pass
 
-        # Gate BT key exchange on the global pairing flag.
-        # The GUI dialog is shown in on_connection (after the BT link is up),
-        # not inside accept().  This mirrors how bluetoothctl works: accept()
-        # gates the protocol-level key exchange, while on_connection handles
-        # user-visible approval.
-        device.pairing_config_factory = lambda conn: PairingConfig(
-            mitm=False,
-            delegate=ConfirmingPairingDelegate(
-                address_upper=str(conn.peer_address).upper(),
-                allowed_macs_ref=self._allowed_macs,
-                pairing_allowed_fn=lambda: self._pairing_allowed,
-            ),
-        )
+    # ------------------------------------------------------------------
+    # BTstack event handling  (always called from asyncio loop thread)
+    # ------------------------------------------------------------------
 
-        return device
+    def _on_btstack_event(self, event: dict) -> None:
+        """Routes events from btstack_sink.exe to the appropriate handler."""
+        evt = event.get("event", "")
 
-    def _configure_sdp_records(self, device: Device) -> None:
-        """
-        Registers the SDP service records required for A2DP Sink operation.
-        The AVRCP Target record is also needed: many Bluetooth sources (Nintendo
-        Switch, phones) will not initiate A2DP unless AVRCP is also advertised.
-        """
-        device.sdp_service_records = {
-            0x00010001: make_audio_sink_service_sdp_records(0x00010001),
-            0x00010002: avrcp.TargetServiceSdpRecord(0x00010002).to_service_attributes(),
-        }
+        if evt == "ready":
+            addr = event.get("address", "")
+            self._log(f"BTstack ready! Address: {addr}")
+            self._set_state(SinkState.READY)
+            # Apply current discoverability setting
+            self._send_btstack_cmd(
+                {"cmd": "set_discoverable", "enabled": self._pairing_allowed}
+            )
 
-    def _attach_connection_handlers(self, device: Device) -> None:
-        """
-        Registers bumble device-level event handlers for BT connections and
-        disconnections.  These fire for the Classic BT link, independent of
-        the AVDTP audio stream state.
+        elif evt == "l2cap_request":
+            # iPhone / Switch is requesting an AVDTP connection.
+            # This fires BEFORE L2CAP is accepted — the key BTstack advantage.
+            addr = event.get("addr", "").upper()
+            cid = event.get("cid", 0)
+            asyncio.ensure_future(self._handle_l2cap_request(addr, cid))
 
-        on_connection is the single place where user approval is managed:
-          - Device in _allowed_macs (Allow + Remember) → auto-approve, no dialog
-          - Unknown device + pairing disabled           → reject, disconnect
-          - Unknown device + pairing enabled            → show GUI dialog, wait
-        The resulting approval_future is stored in _connection_approvals so that
-        _on_avdtp_connection can gate the audio pipeline on the same decision.
-        """
+        elif evt == "connected":
+            addr = event.get("addr", "").upper()
+            name = event.get("name", addr)
+            self._log(f"A2DP connected: {name} ({addr})")
+            self._set_state(SinkState.CONNECTED)
+            if self._cb_connected:
+                self._cb_connected(name, addr)
 
-        @device.on("connection")
-        def on_connection(connection):
-            addr = str(connection.peer_address)
-            addr_upper = addr.upper()
-            name = str(connection.peer_name or connection.peer_address)
+        elif evt == "audio_start":
+            sample_rate = event.get("sample_rate", 44100)
+            channels = event.get("channels", 2)
+            self._log(f"Stream START → {sample_rate} Hz, {channels} ch")
+            self._start_audio_pipeline(sample_rate, channels)
 
-            loop = asyncio.get_event_loop()
-            approval_future: "asyncio.Future[bool]" = loop.create_future()
-            self._connection_approvals[addr_upper] = approval_future
-
-            if addr_upper in self._allowed_macs:
-                # Previously saved device: silent reconnect, no dialog needed
-                self._log(f"BT connected: {name} ({addr})")
-                self._set_state(SinkState.CONNECTED)
-                if self._cb_connected:
-                    self._cb_connected(name, addr)
-                approval_future.set_result(True)
-
-            elif not self._pairing_allowed:
-                # Unknown device + pairing globally blocked → reject at BT level
-                self._log(f"Rejected unknown device: {name} ({addr})")
-                approval_future.set_result(False)
-                asyncio.ensure_future(connection.disconnect())
-
-            else:
-                # Unknown device + pairing allowed → show dialog, resolve future
-                # once the user decides.  AVDTP may open concurrently; its
-                # on_start handler will wait on this same future.
-                self._log(f"BT connection from unknown device: {name} ({addr})")
-                asyncio.ensure_future(
-                    self._handle_new_connection(connection, approval_future)
-                )
-
-        @device.on("disconnection")
-        def on_disconnection(connection, reason):
-            addr = str(connection.peer_address)
-            addr_upper = addr.upper()
-            name = str(getattr(connection, "peer_name", None) or connection.peer_address)
-            self._log(f"BT disconnected: {name}")
-
-            # Clean up the approval future for this connection
-            self._connection_approvals.pop(addr_upper, None)
-
-            # Persist bonding keys unless the user explicitly chose not to remember
-            # the device (remember_map entry False = "allow once, don't save").
-            # For "allow once": also purge the link key so next session shows the
-            # dialog again instead of silently reconnecting.
-            should_remember = self._remember_map.pop(addr_upper, True)
-            if should_remember and self._keystore_path and device.keystore:
-                _save_keystore(device.keystore, self._keystore_path)
-            elif not should_remember:
-                self._remove_keystore_entry(addr_upper)
-                if self._keystore_path and device.keystore:
-                    _save_keystore(device.keystore, self._keystore_path)
-
+        elif evt == "audio_stop":
+            self._log("Stream STOP")
             if self._pipeline:
                 self._pipeline.stop()
                 self._pipeline = None
 
+        elif evt == "disconnected":
+            addr = event.get("addr", "").upper()
+            name = event.get("name", addr)
+            self._log(f"A2DP disconnected: {name}")
+            should_remember = self._remember_map.pop(addr, True)
+            if not should_remember:
+                # "Allow once" — remove from allowed set so dialog shows again
+                self._allowed_macs.discard(addr)
+                if self._allowed_macs_path:
+                    _save_allowed_macs(self._allowed_macs, self._allowed_macs_path)
+            if self._pipeline:
+                self._pipeline.stop()
+                self._pipeline = None
             self._set_state(SinkState.READY)
             if self._cb_disconnected:
                 self._cb_disconnected(name)
 
-    # ------------------------------------------------------------------
-    # AVDTP stream registration
-    # ------------------------------------------------------------------
+        elif evt == "log":
+            self._log(f"[btstack] {event.get('msg', '')}")
 
-    async def _handle_new_connection(
-        self, connection, approval_future: "asyncio.Future[bool]"
-    ) -> None:
-        """Shows the GUI dialog for an unrecognised device and resolves approval_future.
+        elif evt == "error":
+            self._log(f"[btstack error] {event.get('msg', '')}")
+            self._set_state(SinkState.ERROR)
 
-        Called from on_connection for devices not yet in _allowed_macs.
-        The AVDTP layer may open and register the sink concurrently; its
-        on_start handler will be waiting on the same approval_future.
+    async def _handle_l2cap_request(self, addr_upper: str, cid: int) -> None:
         """
-        addr = str(connection.peer_address)
-        addr_upper = addr.upper()
-        name = str(connection.peer_name or connection.peer_address)
+        Gate an incoming AVDTP L2CAP connection on user approval.
+
+        Known device (in _allowed_macs) → auto-approve, no dialog.
+        Unknown device + pairing disabled → auto-deny.
+        Unknown device + pairing enabled → show GUI dialog, wait for answer.
+        """
+        if addr_upper in self._allowed_macs:
+            self._log(f"AVDTP: auto-approving known device {addr_upper}")
+            self._send_btstack_cmd(
+                {"cmd": "approve", "addr": addr_upper, "cid": cid}
+            )
+            return
+
+        if not self._pairing_allowed:
+            self._log(f"AVDTP: rejecting unknown device (pairing off): {addr_upper}")
+            self._send_btstack_cmd(
+                {"cmd": "deny", "addr": addr_upper, "cid": cid}
+            )
+            return
+
+        # Unknown device + pairing allowed → show dialog
+        self._log(f"AVDTP connection from unknown device: {addr_upper}")
 
         if not self._cb_pairing_request:
-            self._log(f"Connection rejected (no dialog callback): {name}")
-            approval_future.set_result(False)
-            try:
-                await connection.disconnect()
-            except Exception:
-                pass
+            self._send_btstack_cmd(
+                {"cmd": "deny", "addr": addr_upper, "cid": cid}
+            )
             return
 
         loop = asyncio.get_event_loop()
-        future: "asyncio.Future[tuple]" = loop.create_future()
+        future: asyncio.Future = loop.create_future()
 
         def resolve(approved: bool, remember: bool) -> None:
             if not future.done():
                 loop.call_soon_threadsafe(future.set_result, (approved, remember))
 
-        self._cb_pairing_request(name, addr, resolve)
+        self._cb_pairing_request(addr_upper, addr_upper, resolve)
 
         try:
             approved, remember = await asyncio.wait_for(future, timeout=30.0)
@@ -960,189 +748,34 @@ class SinkBackend:
             self._allowed_macs.add(addr_upper)
             if remember and self._allowed_macs_path:
                 _save_allowed_macs(self._allowed_macs, self._allowed_macs_path)
-            self._log(f"BT connected: {name} ({addr})")
-            self._set_state(SinkState.CONNECTED)
-            if self._cb_connected:
-                self._cb_connected(name, addr)
-            approval_future.set_result(True)
+            self._send_btstack_cmd(
+                {"cmd": "approve", "addr": addr_upper, "cid": cid}
+            )
         else:
-            self._log(f"Connection denied by user: {name} ({addr})")
-            approval_future.set_result(False)
-            # Remove any link key that was generated during this session so the
-            # device has to go through the dialog again on the next connection.
-            self._remove_keystore_entry(addr_upper)
-            try:
-                await connection.disconnect()
-            except Exception:
-                pass
+            self._log(f"AVDTP connection denied: {addr_upper}")
+            self._send_btstack_cmd(
+                {"cmd": "deny", "addr": addr_upper, "cid": cid}
+            )
 
-    def _on_avdtp_connection(self, server, device: Device) -> None:
-        """Called by the AVDTP Listener when a new AVDTP session is established.
-
-        The BT connection is already established and (for unknown devices) the
-        user-approval dialog is already in progress via on_connection.  We look
-        up the approval_future created there and pass it to _register_sbc_sink
-        so that on_start waits for approval before starting the audio pipeline.
-
-        The sink endpoint is registered immediately so the AVDTP DISCOVER command
-        (sent within milliseconds of L2CAP open) finds our endpoint.
-        """
-        connection = server.l2cap_channel.connection
-        addr_upper = str(connection.peer_address).upper()
-
-        approval_future = self._connection_approvals.get(addr_upper)
-        if approval_future is None:
-            # on_connection hasn't fired (unexpected) – create a rejected future
-            loop = asyncio.get_event_loop()
-            approval_future = loop.create_future()
-            approval_future.set_result(False)
-            self._log("AVDTP: missing connection approval state – rejecting")
-
-        self._register_sbc_sink(server, approval_future)
-
-    def _remove_keystore_entry(self, addr_upper: str) -> None:
-        """Removes a single device's link key from the in-memory keystore."""
-        if self._bt_device is None:
-            return
-        ks = getattr(self._bt_device, "keystore", None)
-        if ks is None or not hasattr(ks, "store"):
-            return
-        key_obj = next(
-            (k for k in list(ks.store) if str(k).upper() == addr_upper), None
-        )
-        if key_obj is not None:
-            del ks.store[key_obj]
-
-    def _register_sbc_sink(
-        self, server, approval_future: "asyncio.Future[bool]"
-    ) -> None:
-        """
-        Advertises SBC codec capabilities to the AVDTP server and wires up
-        the stream lifecycle handlers (start/stop/rtp_packet).
-
-        approval_future is resolved by on_connection (immediately for known
-        devices) or by _handle_new_connection (after user dialog).  The on_start
-        handler awaits this future so that the audio pipeline only starts after
-        approval, regardless of when the AVDTP START command arrives.
-
-        pipeline_ref is a one-element list so the closures can rebind the
-        pipeline reference without needing nonlocal (Python 2 compatibility
-        pattern; also makes it easy to null out on stop).
-        """
-        sbc_capabilities = self._build_sbc_capabilities()
-        sink = server.add_sink(sbc_capabilities)
-
-        # One-element list shared by all closures so they can exchange the pipeline ref
-        pipeline_ref: list[Optional[SbcAudioPipeline]] = [None]
-
-        @sink.on("configuration")
-        def on_configuration():
-            self._log("AVDTP: codec configured")
-
-        @sink.on("open")
-        def on_open():
-            self._log("AVDTP: stream opened – waiting for RTP channel…")
-
-        @sink.on("rtp_channel_open")
-        def on_rtp_channel_open():
-            self._log("AVDTP: RTP channel open – waiting for START…")
-
-        @sink.on("start")
-        def on_start():
-            """Source sent AVDTP START – wait for user approval, then start pipeline."""
-            sample_rate, channels = _extract_codec_params(sink)
-            self._log(f"Stream START → {sample_rate} Hz, {channels} ch")
-
-            def _launch_pipeline() -> None:
-                # Stop any existing pipeline before creating a new one so we
-                # never accumulate multiple simultaneous pipelines.
-                if pipeline_ref[0] is not None:
-                    pipeline_ref[0].stop()
-                    pipeline_ref[0] = None
-                if self._pipeline is not None:
-                    self._pipeline.stop()
-                    self._pipeline = None
-
-                pipeline = SbcAudioPipeline(
-                    ffmpeg_exe=self._ffmpeg_exe,
-                    latency_ms=self._latency_ms,
-                    device_index=self._audio_device_index,
-                    on_level=self._cb_level,
-                )
-                pipeline.set_volume(self._volume)
-                try:
-                    pipeline.start(sample_rate, channels)
-                    self._log("Audio pipeline started")
-                except Exception as exc:
-                    self._log(f"Pipeline error: {exc}")
-                    return
-                self._pipeline = pipeline
-                pipeline_ref[0] = pipeline
-
-            async def _await_approval_and_launch() -> None:
-                """Waits for user approval then launches (or skips) the pipeline."""
-                try:
-                    # shield() so that cancelling this task doesn't cancel the future
-                    approved = await asyncio.wait_for(
-                        asyncio.shield(approval_future), timeout=35.0
-                    )
-                except asyncio.TimeoutError:
-                    self._log("AVDTP: approval timed out – audio pipeline not started")
-                    return
-                if approved:
-                    _launch_pipeline()
-                else:
-                    self._log("AVDTP: connection not approved – audio pipeline not started")
-
-            asyncio.ensure_future(_await_approval_and_launch())
-
-        @sink.on("stop")
-        def on_stop():
-            """Source sent AVDTP SUSPEND – tear down the audio pipeline."""
-            self._log("Stream STOP")
-            if pipeline_ref[0]:
-                pipeline_ref[0].stop()
-                pipeline_ref[0] = None
+    def _start_audio_pipeline(self, sample_rate: int, channels: int) -> None:
+        """Creates (or replaces) the SBC audio pipeline."""
+        if self._pipeline:
+            self._pipeline.stop()
             self._pipeline = None
-
-        @sink.on("rtp_packet")
-        def on_rtp_packet(packet):
-            """Receives RTP packets and strips the 1-byte SBC header before feeding FFmpeg."""
-            payload = bytes(packet.payload)
-            # The first byte is the SBC media header (fragment/RFA/frame count)
-            if len(payload) < 2:
-                return
-            if pipeline_ref[0]:
-                pipeline_ref[0].write_sbc(payload[1:])
-
-        self._log("SBC sink registered")
-
-    def _build_sbc_capabilities(self) -> avdtp.MediaCodecCapabilities:
-        """
-        Constructs the AVDTP MediaCodecCapabilities object advertising all
-        standard SBC parameter combinations.  The remote source picks the
-        best match from this set during capability negotiation.
-        """
-        SF = SbcMediaCodecInformation.SamplingFrequency
-        CM = SbcMediaCodecInformation.ChannelMode
-        BL = SbcMediaCodecInformation.BlockLength
-        SB = SbcMediaCodecInformation.Subbands
-        AM = SbcMediaCodecInformation.AllocationMethod
-
-        sbc_info = SbcMediaCodecInformation(
-            sampling_frequency=SF.SF_16000 | SF.SF_32000 | SF.SF_44100 | SF.SF_48000,
-            channel_mode=CM.MONO | CM.DUAL_CHANNEL | CM.STEREO | CM.JOINT_STEREO,
-            block_length=BL.BL_4 | BL.BL_8 | BL.BL_12 | BL.BL_16,
-            subbands=SB.S_4 | SB.S_8,
-            allocation_method=AM.SNR | AM.LOUDNESS,
-            minimum_bitpool_value=2,
-            maximum_bitpool_value=self._max_bitpool,  # Configurable quality ceiling
+        pipeline = SbcAudioPipeline(
+            ffmpeg_exe=self._ffmpeg_exe,
+            latency_ms=self._latency_ms,
+            device_index=self._audio_device_index,
+            on_level=self._cb_level,
         )
-        return avdtp.MediaCodecCapabilities(
-            media_type=avdtp.AVDTP_AUDIO_MEDIA_TYPE,
-            media_codec_type=SBC_CODEC_TYPE,
-            media_codec_information=sbc_info,
-        )
+        pipeline.set_volume(self._volume)
+        try:
+            pipeline.start(sample_rate, channels)
+            self._log("Audio pipeline started")
+        except Exception as exc:
+            self._log(f"Pipeline error: {exc}")
+            return
+        self._pipeline = pipeline
 
     # ------------------------------------------------------------------
     # Helpers
