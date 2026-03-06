@@ -125,8 +125,14 @@ if (-not (Test-Path $BuildDir)) {
 # cmake.exe, gcc.exe and mingw32-make.exe are native Windows executables —
 # call them directly from PowerShell to avoid bash PATH issues.
 $cmakeExe = "$MingwBin\cmake.exe"
-$makeExe  = "$MingwBin\mingw32-make.exe"
-$gccExe   = "$MingwBin\gcc.exe"
+
+# CMake parses its -D arguments as CMake code, so backslashes are escape
+# sequences. Use forward slashes for all paths passed as -D values.
+$makeSlash     = "$MingwBin\mingw32-make.exe" -replace '\\', '/'
+$gccSlash      = "$MingwBin\gcc.exe"          -replace '\\', '/'
+$scriptSlash   = $ScriptDir                   -replace '\\', '/'
+$buildSlash    = $BuildDir                    -replace '\\', '/'
+$btstackSlash  = $BtstackSrc                  -replace '\\', '/'
 
 # GCC needs a writable TEMP directory; the default C:\Windows\Temp is
 # inaccessible in some environments.
@@ -134,15 +140,15 @@ $env:TEMP = "$MSYS2Root\tmp"
 $env:TMP  = "$MSYS2Root\tmp"
 
 Invoke-Cmd $cmakeExe @(
-    "-S", $ScriptDir,
-    "-B", $BuildDir,
+    "-S", $scriptSlash,
+    "-B", $buildSlash,
     "-G", "MinGW Makefiles",
-    "-DCMAKE_MAKE_PROGRAM=$makeExe",
-    "-DCMAKE_C_COMPILER=$gccExe",
+    "-DCMAKE_MAKE_PROGRAM=$makeSlash",
+    "-DCMAKE_C_COMPILER=$gccSlash",
     "-DCMAKE_BUILD_TYPE=Release",
-    "-DBTSTACK_ROOT=$BtstackSrc"
+    "-DBTSTACK_ROOT=$btstackSlash"
 )
-Invoke-Cmd $cmakeExe @("--build", $BuildDir, "--target", "btstack_sink", "-j4")
+Invoke-Cmd $cmakeExe @("--build", $buildSlash, "--target", "btstack_sink", "-j4")
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 if (Test-Path $ExePath) {
