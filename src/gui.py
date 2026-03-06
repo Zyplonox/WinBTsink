@@ -64,121 +64,100 @@ def _allowed_macs_file() -> str:
 # ---------------------------------------------------------------------------
 
 #: USB class triple that identifies a Bluetooth HCI transport.
-_BT_HCI = (0xE0, 0x01, 0x01)
-
-
-def _is_bt_hci_class(cls: int, sub: int, proto: int) -> bool:
-    """Returns True when the USB class triple matches Bluetooth HCI."""
-    return (cls, sub, proto) == _BT_HCI
-
-
-def _device_has_bt_hci_interface(device) -> bool:
-    """
-    Walks the interface descriptors of a composite USB device looking for a
-    Bluetooth HCI alternate-setting.
-
-    Composite devices (e.g. BT + audio combo adapters) advertise device
-    class 0x00 ("defined per interface"), so the per-interface check is
-    necessary to correctly identify them as BT dongles.
-    """
-    try:
-        for cfg in device:
-            for intf in cfg:
-                for setting in intf:
-                    if _is_bt_hci_class(
-                        setting.getClass(),
-                        setting.getSubClass(),
-                        setting.getProtocol(),
-                    ):
-                        return True
-    except Exception:
-        pass
-    return False
-
-
-def _is_bt_dongle(device) -> bool:
-    """
-    Returns True if the USB device is a Bluetooth HCI adapter.
-
-    Checks the device-level class first (simple single-function dongles),
-    then falls back to per-interface inspection for composite devices.
-    """
-    if _is_bt_hci_class(
-        device.getDeviceClass(),
-        device.getDeviceSubClass(),
-        device.getDeviceProtocol(),
-    ):
-        return True
-
-    # Class 0x00: class is per-interface – must walk descriptors
-    if device.getDeviceClass() == 0x00:
-        return _device_has_bt_hci_interface(device)
-
-    return False
-
-
-def _winusb_accessible(device) -> bool:
-    """
-    Returns True when the device can be opened by libusb.
-
-    A successful open() proves WinUSB is the active driver.  The native
-    Windows HCI driver holds the device exclusively, so open() raises an
-    exception when WinUSB is not yet installed.
-    """
-    try:
-        handle = device.open()
-        handle.close()
-        return True
-    except Exception:
-        return False
-
-
-def _make_dongle_label(device, bumble_idx: int) -> str:
-    """Formats the human-readable label shown in the dongle dropdown."""
-    try:
-        name = device.getProduct() or ""
-    except Exception:
-        name = ""
-    vid = device.getVendorID()
-    pid = device.getProductID()
-    if name:
-        return f"usb:{bumble_idx}  {name}  [VID:{vid:04X} PID:{pid:04X}]"
-    return f"usb:{bumble_idx}  VID:{vid:04X} PID:{pid:04X}"
-
-
 def scan_bt_dongles() -> list[tuple[int, str]]:
     """
-    Enumerates USB devices and returns (bumble_index, label) pairs for each
-    Bluetooth HCI dongle that currently has WinUSB as its active driver.
+    Enumerate USB Bluetooth HCI dongles that have WinUSB as their active
+    driver. Returns (btstack_index, label) pairs for use as usb:N transport.
 
-    The bumble_index is the sequential ordinal of WinUSB-accessible BT
-    devices (usb:0, usb:1, …) as expected by bumble's USB transport.
-    Returns an empty list when libusb/usb1 is unavailable or no matching
-    device is found.
+    Uses Windows SetupAPI (ctypes) — no bumble or libusb required.
     """
+    import ctypes
+    import ctypes.wintypes as w
+    import re
+
     try:
-        from bumble.transport.usb import load_libusb
-        import usb1
-        load_libusb()
-    except ImportError:
+        setupapi = ctypes.WinDLL("setupapi")
+    except OSError:
+        return []
+
+    DIGCF_PRESENT    = 0x00000002
+    DIGCF_ALLCLASSES = 0x00000004
+    SPDRP_HARDWAREID   = 0x00000001
+    SPDRP_SERVICE      = 0x00000009
+    SPDRP_FRIENDLYNAME = 0x0000000C
+    ERROR_NO_MORE_ITEMS = 259
+
+    class SP_DEVINFO_DATA(ctypes.Structure):
+        _fields_ = [
+            ("cbSize",    w.DWORD),
+            ("ClassGuid", ctypes.c_byte * 16),
+            ("DevInst",   w.DWORD),
+            ("Reserved",  ctypes.c_ulong),
+        ]
+
+    dev_info = setupapi.SetupDiGetClassDevsW(
+        None, "USB", None, DIGCF_PRESENT | DIGCF_ALLCLASSES
+    )
+    if dev_info == w.HANDLE(-1).value:
         return []
 
     results: list[tuple[int, str]] = []
-    bumble_idx = 0
+    bt_idx = 0
+    member_index = 0
+
     try:
-        context = usb1.USBContext()
-        context.open()
-        for device in context.getDeviceIterator(skip_on_error=True):
-            if not _is_bt_dongle(device):
+        while True:
+            devinfo = SP_DEVINFO_DATA()
+            devinfo.cbSize = ctypes.sizeof(SP_DEVINFO_DATA)
+
+            if not setupapi.SetupDiEnumDeviceInfo(
+                dev_info, member_index, ctypes.byref(devinfo)
+            ):
+                if ctypes.GetLastError() == ERROR_NO_MORE_ITEMS:
+                    break
+                member_index += 1
                 continue
-            if not _winusb_accessible(device):
-                # BT dongle present but WinUSB not installed – skip
+            member_index += 1
+
+            # Read hardware IDs (multi-string REG_MULTI_SZ)
+            hw_buf = ctypes.create_unicode_buffer(4096)
+            if not setupapi.SetupDiGetDeviceRegistryPropertyW(
+                dev_info, ctypes.byref(devinfo), SPDRP_HARDWAREID,
+                None, hw_buf, ctypes.sizeof(hw_buf), None
+            ):
                 continue
-            results.append((bumble_idx, _make_dongle_label(device, bumble_idx)))
-            bumble_idx += 1
-        context.close()
-    except Exception:
-        pass
+            hw_ids = hw_buf.raw.decode("utf-16-le", errors="ignore").upper()
+
+            # Bluetooth HCI: USB\Class_E0&SubClass_01&Prot_01
+            if "CLASS_E0" not in hw_ids or "SUBCLASS_01" not in hw_ids:
+                continue
+
+            # Confirm WinUSB is the active driver (service name)
+            svc_buf = ctypes.create_unicode_buffer(256)
+            if not setupapi.SetupDiGetDeviceRegistryPropertyW(
+                dev_info, ctypes.byref(devinfo), SPDRP_SERVICE,
+                None, svc_buf, ctypes.sizeof(svc_buf), None
+            ):
+                continue
+            if "WINUSB" not in svc_buf.value.upper():
+                continue
+
+            # Friendly name for the dropdown label
+            fname_buf = ctypes.create_unicode_buffer(256)
+            setupapi.SetupDiGetDeviceRegistryPropertyW(
+                dev_info, ctypes.byref(devinfo), SPDRP_FRIENDLYNAME,
+                None, fname_buf, ctypes.sizeof(fname_buf), None
+            )
+            name = fname_buf.value or "Bluetooth HCI"
+
+            m = re.search(r"VID_([0-9A-F]{4})&PID_([0-9A-F]{4})", hw_ids)
+            vid_pid = f"  [VID:{m.group(1)} PID:{m.group(2)}]" if m else ""
+
+            results.append((bt_idx, f"usb:{bt_idx}  {name}{vid_pid}"))
+            bt_idx += 1
+    finally:
+        setupapi.SetupDiDestroyDeviceInfoList(dev_info)
+
     return results
 
 
