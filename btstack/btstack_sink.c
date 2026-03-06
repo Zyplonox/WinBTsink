@@ -282,8 +282,9 @@ static void on_hci_event(uint8_t packet_type, uint16_t channel,
     char evt[128];
 
     switch (type) {
-    case BTSTACK_EVENT_STATE:
-        if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
+    case BTSTACK_EVENT_STATE: {
+        uint8_t bt_state = btstack_event_state_get_state(packet);
+        if (bt_state == HCI_STATE_WORKING) {
             bd_addr_t local_addr;
             gap_local_bd_addr(local_addr);
             char addr_str[18];
@@ -292,14 +293,18 @@ static void on_hci_event(uint8_t packet_type, uint16_t channel,
             snprintf(evt, sizeof(evt),
                      "{\"event\":\"ready\",\"address\":\"%s\"}", addr_str);
             emit_event(evt);
-            emit_log("build: deferred-accept v4");
+            emit_log("build: deferred-accept v5");
 
             /* Apply initial discoverability (off by default, Python will
                send set_discoverable when the GUI toggle is set). */
             gap_discoverable_control(g_discoverable);
             gap_connectable_control(1);
+        } else if (bt_state == HCI_STATE_OFF) {
+            emit_event("{\"event\":\"error\",\"msg\":\"HCI powered off — USB dongle not accessible. Check WinUSB driver (Zadig) and kill any zombie btstack_sink.exe.\"}");
+            btstack_run_loop_trigger_exit();
         }
         break;
+    }
 
     case HCI_EVENT_PIN_CODE_REQUEST:
         /* Legacy PIN: accept with empty PIN (no MITM for audio devices) */
