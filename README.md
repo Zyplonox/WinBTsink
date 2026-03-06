@@ -47,11 +47,11 @@ USB dongle ──(WinUSB / libusb)──▶  btstack_sink.exe  (C, BTstack)
 
 ---
 
-## Quick start (recommended)
+## Quick start
 
 ### Option A – Pre-built EXE
 
-1. Download `BT-AudioSink.exe` from the [Releases](../../releases) page
+1. Download `WinBTsink.exe` from the [Releases](../../releases) page
 2. Run it
 3. Install the WinUSB driver once: **Settings → Install WinUSB…**
 4. Click **Start** → pair your device → done
@@ -75,7 +75,7 @@ python src\gui.py
 
 ```powershell
 .\build.ps1
-# → dist\BT-AudioSink.exe
+# → dist\WinBTsink.exe
 ```
 
 ---
@@ -159,7 +159,7 @@ The resulting binary lands at `btstack\build\btstack_sink.exe`.
 | Audio output device | Default | WASAPI output device |
 | Autostart | off | Launch with Windows, minimized to tray |
 
-Settings are saved at: `%APPDATA%\BT-AudioSink\config.json`
+Settings are saved at: `%APPDATA%\WinBTsink\config.json`
 
 ---
 
@@ -203,7 +203,7 @@ On the next session the device reconnects without re-pairing as long as the app 
 Bonding keys are managed by `btstack_sink.exe` and stored in:
 `btstack\build\btstack_keys.db` (next to the C binary)
 
-Remembered device list (MACs): `%APPDATA%\BT-AudioSink\allowed_macs.json`
+Remembered device list (MACs): `%APPDATA%\WinBTsink\allowed_macs.json`
 
 To reset all pairings: delete both files and restart the app.
 
@@ -270,9 +270,9 @@ Device Manager → `USB devices` → `Bluetooth USB Dongle (WinUSB)` → right-c
 
 ```
 WinBTsink/
-├── dist\BT-AudioSink.exe   ← Built Windows EXE (after running build.ps1)
+├── dist\WinBTsink.exe   ← Built Windows EXE (after running build.ps1)
 ├── build.ps1               ← Build script (one click)
-├── BT-AudioSink.spec       ← PyInstaller configuration
+├── WinBTsink.spec       ← PyInstaller configuration
 ├── requirements.txt        ← Python dependencies
 ├── start.bat               ← Launches the GUI via Python
 ├── src/
@@ -291,7 +291,7 @@ WinBTsink/
 └── setup/
     └── install.ps1         ← One-time setup script
 
-%APPDATA%\BT-AudioSink\     ← Created automatically on first launch
+%APPDATA%\WinBTsink\     ← Created automatically on first launch
 ├── config.json             ← Saved settings
 └── allowed_macs.json       ← Remembered device addresses
 ```
