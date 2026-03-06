@@ -272,6 +272,19 @@ static void on_avdtp_incoming_connection(uint16_t local_cid, bd_addr_t addr) {
     addr_to_str(addr, addr_str);
     emit_log("avdtp: incoming connection hook fired");
 
+    /* If this addr already has an established A2DP signaling connection, the
+     * new L2CAP connection is the MEDIA channel (opened after AVDTP OPEN).
+     * Auto-accept it immediately — no Python round-trip, avoids the timing
+     * gap that causes strict sources (e.g. Nintendo Switch 2) to time out. */
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (g_conns[i].active && memcmp(g_conns[i].addr, addr, 6) == 0) {
+            emit_log("avdtp: auto-accepting media channel for established connection");
+            avdtp_accept_incoming_connection(local_cid);
+            return;
+        }
+    }
+
+    /* First connection from this addr — signaling channel.  Gate via Python. */
     pending_conn_t *p = alloc_pending();
     if (!p) {
         /* No free pending slot — decline immediately */
@@ -456,7 +469,7 @@ static void on_hci_event(uint8_t packet_type, uint16_t channel,
             snprintf(evt, sizeof(evt),
                      "{\"event\":\"ready\",\"address\":\"%s\"}", addr_str);
             emit_event(evt);
-            emit_log(g_debug ? "build: bonding+debug v7" : "build: bonding v7");
+            emit_log(g_debug ? "build: media-auto-accept+debug v8" : "build: media-auto-accept v8");
 
             /* Apply initial discoverability (off by default, Python will
                send set_discoverable when the GUI toggle is set). */
