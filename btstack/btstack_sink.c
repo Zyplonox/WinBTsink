@@ -10,16 +10,18 @@
  *                  {"cmd":"set_discoverable","enabled":true}
  *                  {"cmd":"stop"}
  *
- * stdout (binary): SBC audio frames, each prefixed by uint32_le length
- *                  [4 bytes len][len bytes SBC payload]
+ * stdout (binary): SBC audio frames, each prefixed by a header:
+ *                  [uint32_le total_len = 6 + sbc_len]
+ *                  [6 bytes bd_addr (big-endian, MSB first)]
+ *                  [sbc_len bytes SBC payload]
  *
  * stderr (text):   JSON event lines to Python
  *                  {"event":"ready","address":"AA:BB:CC:DD:EE:FF"}
  *                  {"event":"l2cap_request","addr":"...","cid":64}
  *                  {"event":"connected","addr":"...","name":"iPhone"}
  *                  {"event":"disconnected","addr":"..."}
- *                  {"event":"audio_start","sample_rate":44100,"channels":2}
- *                  {"event":"audio_stop"}
+ *                  {"event":"audio_start","addr":"...","sample_rate":44100,"channels":2}
+ *                  {"event":"audio_stop","addr":"..."}
  *                  {"event":"log","msg":"..."}
  *                  {"event":"error","msg":"..."}
  *
@@ -68,6 +70,41 @@ const hci_cmd_t hci_le_rand = { 0x2018u, "" };
 
 #define STDIN_BUF_SIZE          512
 #define SBC_STORAGE_SIZE        1024
+#define MAX_CONNECTIONS         4       /* max simultaneous A2DP sources */
+
+/* -------------------------------------------------------------------------
+ * Per-connection state
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+    int      active;            /* slot in use */
+    uint16_t a2dp_cid;          /* BTstack A2DP connection identifier */
+    uint8_t  local_seid;        /* local stream endpoint ID used by this conn */
+    bd_addr_t addr;             /* remote device address */
+    char     addr_str[18];      /* "XX:XX:XX:XX:XX:XX" */
+    int      sample_rate;
+    int      channels;
+} a2dp_conn_t;
+
+static a2dp_conn_t g_conns[MAX_CONNECTIONS];
+
+/* Per-SEP SBC config buffers (one per registered endpoint) */
+static uint8_t g_sbc_cfg[MAX_CONNECTIONS][4];
+
+/* Local SEIDs assigned to our registered endpoints */
+static uint8_t g_local_seids[MAX_CONNECTIONS];
+
+/* -------------------------------------------------------------------------
+ * Pending L2CAP connections awaiting Python approve/deny
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+    int      valid;
+    uint16_t l2cap_cid;
+    bd_addr_t addr;
+} pending_conn_t;
+
+static pending_conn_t g_pending[MAX_CONNECTIONS];
 
 /* -------------------------------------------------------------------------
  * Global state
@@ -79,14 +116,6 @@ static int   g_usb_path         = 0;
 static int   g_max_bitpool      = 53;
 static int   g_discoverable     = 0;  /* set via cmd after ready */
 
-/* Current A2DP connection */
-static uint8_t  g_a2dp_local_seid  = 0;
-static uint16_t g_a2dp_cid         = 0;
-static char     g_peer_addr_str[18] = "";
-
-/* Pending L2CAP cid awaiting Python approve/deny (deferred-accept) */
-static uint16_t g_pending_l2cap_cid = 0;
-
 /* Set when we intentionally power off (stop command) — suppresses the
    HCI_STATE_OFF error that would otherwise fire during normal shutdown. */
 static int g_shutdown_requested = 0;
@@ -96,10 +125,6 @@ static uint8_t  g_sdp_a2dp_sink_service[150];
 static uint8_t  g_sdp_avrcp_service[200];
 static uint32_t g_sdp_handle_a2dp  = 0;
 static uint32_t g_sdp_handle_avrcp = 0;
-
-/* SBC codec params extracted from SET_CONFIG */
-static int g_sample_rate = 44100;
-static int g_channels    = 2;
 
 /* stdin reader thread */
 #ifdef _WIN32
@@ -144,19 +169,82 @@ static void addr_to_str(const bd_addr_t addr, char *buf) {
 }
 
 /* -------------------------------------------------------------------------
- * SBC audio output — writes length-prefixed frames to stdout
+ * Connection slot helpers
  * ---------------------------------------------------------------------- */
 
-static void write_sbc_to_stdout(const uint8_t *data, uint16_t len) {
-    uint32_t le_len = len;  /* little-endian on x86 already */
+static a2dp_conn_t *find_conn_by_cid(uint16_t cid) {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (g_conns[i].active && g_conns[i].a2dp_cid == cid)
+            return &g_conns[i];
+    }
+    return NULL;
+}
+
+static a2dp_conn_t *find_conn_by_seid(uint8_t seid) {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (g_conns[i].active && g_conns[i].local_seid == seid)
+            return &g_conns[i];
+    }
+    return NULL;
+}
+
+static a2dp_conn_t *alloc_conn(void) {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (!g_conns[i].active) {
+            memset(&g_conns[i], 0, sizeof(g_conns[i]));
+            g_conns[i].active = 1;
+            g_conns[i].sample_rate = 44100;
+            g_conns[i].channels    = 2;
+            return &g_conns[i];
+        }
+    }
+    return NULL;
+}
+
+static void free_conn(a2dp_conn_t *conn) {
+    if (conn) memset(conn, 0, sizeof(*conn));
+}
+
+/* -------------------------------------------------------------------------
+ * Pending connection helpers
+ * ---------------------------------------------------------------------- */
+
+static pending_conn_t *alloc_pending(void) {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (!g_pending[i].valid) return &g_pending[i];
+    }
+    return NULL;
+}
+
+static pending_conn_t *find_pending_by_cid(uint16_t cid) {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (g_pending[i].valid && g_pending[i].l2cap_cid == cid)
+            return &g_pending[i];
+    }
+    return NULL;
+}
+
+/* -------------------------------------------------------------------------
+ * SBC audio output — writes addr-tagged length-prefixed frames to stdout
+ *
+ * Frame format:
+ *   [uint32_le total_len = 6 + sbc_len]
+ *   [6 bytes bd_addr, byte[0]..byte[5]]
+ *   [sbc_len bytes SBC payload]
+ * ---------------------------------------------------------------------- */
+
+static void write_sbc_to_stdout(const bd_addr_t addr,
+                                 const uint8_t *data, uint16_t len) {
+    uint32_t total = 6u + len;
 #ifdef _WIN32
-    /* ensure stdout is binary mode */
-    fwrite(&le_len, 4, 1, stdout);
-    fwrite(data, 1, len, stdout);
+    fwrite(&total, 4, 1, stdout);
+    fwrite(addr,   1, 6, stdout);
+    fwrite(data,   1, len, stdout);
     fflush(stdout);
 #else
-    fwrite(&le_len, 4, 1, stdout);
-    fwrite(data, 1, len, stdout);
+    fwrite(&total, 4, 1, stdout);
+    fwrite(addr,   1, 6, stdout);
+    fwrite(data,   1, len, stdout);
     fflush(stdout);
 #endif
 }
@@ -175,9 +263,17 @@ static void on_avdtp_incoming_connection(uint16_t local_cid, bd_addr_t addr) {
     char addr_str[18];
     addr_to_str(addr, addr_str);
     emit_log("avdtp: incoming connection hook fired");
-    /* Remember the cid; store addr for connected/deny events */
-    g_pending_l2cap_cid = local_cid;
-    strncpy(g_peer_addr_str, addr_str, sizeof(g_peer_addr_str) - 1);
+
+    pending_conn_t *p = alloc_pending();
+    if (!p) {
+        /* No free pending slot — decline immediately */
+        emit_log("avdtp: too many pending connections, declining");
+        avdtp_decline_incoming_connection(local_cid);
+        return;
+    }
+    p->valid     = 1;
+    p->l2cap_cid = local_cid;
+    memcpy(p->addr, addr, 6);
 
     char evt[128];
     snprintf(evt, sizeof(evt),
@@ -199,53 +295,93 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
     if (hci_event_packet_get_type(packet) != HCI_EVENT_A2DP_META) return;
 
     uint8_t subevent = hci_event_a2dp_meta_get_subevent_code(packet);
-    char addr_str[18];
     char evt[256];
 
     switch (subevent) {
 
-    case A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED:
-        /* L2CAP was already accepted by Python via avdtp_accept_incoming_connection.
-         * Now the AVDTP signaling channel is open — notify Python. */
-        g_a2dp_cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
-        {
-            bd_addr_t bd;
-            a2dp_subevent_signaling_connection_established_get_bd_addr(packet, bd);
-            addr_to_str(bd, g_peer_addr_str);
+    case A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED: {
+        uint8_t status = a2dp_subevent_signaling_connection_established_get_status(packet);
+        if (status != ERROR_CODE_SUCCESS) break;
+
+        uint16_t cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
+        bd_addr_t bd;
+        a2dp_subevent_signaling_connection_established_get_bd_addr(packet, bd);
+
+        a2dp_conn_t *conn = alloc_conn();
+        if (!conn) {
+            emit_log("a2dp: too many connections, ignoring new one");
+            break;
         }
+        conn->a2dp_cid = cid;
+        memcpy(conn->addr, bd, 6);
+        addr_to_str(bd, conn->addr_str);
+
         snprintf(evt, sizeof(evt),
                  "{\"event\":\"connected\",\"addr\":\"%s\",\"name\":\"%s\"}",
-                 g_peer_addr_str, g_peer_addr_str);
+                 conn->addr_str, conn->addr_str);
         emit_event(evt);
         break;
+    }
 
-    case A2DP_SUBEVENT_STREAM_STARTED:
-        /* Use sample rate/channels stored during CODEC_CONFIGURATION */
-        snprintf(evt, sizeof(evt),
-                 "{\"event\":\"audio_start\",\"sample_rate\":%d,\"channels\":%d}",
-                 g_sample_rate, g_channels);
-        emit_event(evt);
+    case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION: {
+        uint16_t cid  = a2dp_subevent_signaling_media_codec_sbc_configuration_get_a2dp_cid(packet);
+        uint8_t  seid = a2dp_subevent_signaling_media_codec_sbc_configuration_get_local_seid(packet);
+        a2dp_conn_t *conn = find_conn_by_cid(cid);
+        if (conn) {
+            conn->local_seid  = seid;
+            conn->sample_rate = a2dp_subevent_signaling_media_codec_sbc_configuration_get_sampling_frequency(packet);
+            conn->channels    = a2dp_subevent_signaling_media_codec_sbc_configuration_get_num_channels(packet);
+        }
         break;
+    }
 
-    case A2DP_SUBEVENT_STREAM_SUSPENDED:
-    case A2DP_SUBEVENT_STREAM_STOPPED:
-        emit_event("{\"event\":\"audio_stop\"}");
+    case A2DP_SUBEVENT_STREAM_STARTED: {
+        uint16_t cid = a2dp_subevent_stream_started_get_a2dp_cid(packet);
+        a2dp_conn_t *conn = find_conn_by_cid(cid);
+        if (conn) {
+            snprintf(evt, sizeof(evt),
+                     "{\"event\":\"audio_start\",\"addr\":\"%s\","
+                     "\"sample_rate\":%d,\"channels\":%d}",
+                     conn->addr_str, conn->sample_rate, conn->channels);
+            emit_event(evt);
+        }
         break;
+    }
 
-    case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
-        snprintf(evt, sizeof(evt),
-                 "{\"event\":\"disconnected\",\"addr\":\"%s\"}",
-                 g_peer_addr_str);
-        emit_event(evt);
-        g_a2dp_cid = 0;
-        g_peer_addr_str[0] = '\0';
+    case A2DP_SUBEVENT_STREAM_SUSPENDED: {
+        uint16_t cid = a2dp_subevent_stream_suspended_get_a2dp_cid(packet);
+        a2dp_conn_t *conn = find_conn_by_cid(cid);
+        if (conn) {
+            snprintf(evt, sizeof(evt),
+                     "{\"event\":\"audio_stop\",\"addr\":\"%s\"}", conn->addr_str);
+            emit_event(evt);
+        }
         break;
+    }
 
-    case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION:
-        /* Extract sample rate and channel count from SBC config */
-        g_sample_rate = a2dp_subevent_signaling_media_codec_sbc_configuration_get_sampling_frequency(packet);
-        g_channels    = a2dp_subevent_signaling_media_codec_sbc_configuration_get_num_channels(packet);
+    case A2DP_SUBEVENT_STREAM_STOPPED: {
+        uint16_t cid = a2dp_subevent_stream_stopped_get_a2dp_cid(packet);
+        a2dp_conn_t *conn = find_conn_by_cid(cid);
+        if (conn) {
+            snprintf(evt, sizeof(evt),
+                     "{\"event\":\"audio_stop\",\"addr\":\"%s\"}", conn->addr_str);
+            emit_event(evt);
+        }
         break;
+    }
+
+    case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED: {
+        uint16_t cid = a2dp_subevent_signaling_connection_released_get_a2dp_cid(packet);
+        a2dp_conn_t *conn = find_conn_by_cid(cid);
+        if (conn) {
+            snprintf(evt, sizeof(evt),
+                     "{\"event\":\"disconnected\",\"addr\":\"%s\"}",
+                     conn->addr_str);
+            emit_event(evt);
+            free_conn(conn);
+        }
+        break;
+    }
 
     default:
         break;
@@ -257,8 +393,6 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
  * ---------------------------------------------------------------------- */
 
 static void on_a2dp_media_packet(uint8_t seid, uint8_t *packet, uint16_t size) {
-    UNUSED(seid);
-
     /*
      * BTstack does NOT strip the RTP header before calling this callback
      * (confirmed by a2dp_sink_demo.c which manually parses it).
@@ -270,7 +404,11 @@ static void on_a2dp_media_packet(uint8_t seid, uint8_t *packet, uint16_t size) {
      * We skip 13 bytes total to reach the raw SBC frames for FFmpeg.
      */
     if (size < 14) return;
-    write_sbc_to_stdout(packet + 13, size - 13);
+
+    a2dp_conn_t *conn = find_conn_by_seid(seid);
+    if (!conn) return;  /* unknown seid — skip */
+
+    write_sbc_to_stdout(conn->addr, packet + 13, size - 13);
 }
 
 /* -------------------------------------------------------------------------
@@ -301,7 +439,7 @@ static void on_hci_event(uint8_t packet_type, uint16_t channel,
             snprintf(evt, sizeof(evt),
                      "{\"event\":\"ready\",\"address\":\"%s\"}", addr_str);
             emit_event(evt);
-            emit_log("build: deferred-accept v5");
+            emit_log("build: multi-device v6");
 
             /* Apply initial discoverability (off by default, Python will
                send set_discoverable when the GUI toggle is set). */
@@ -349,6 +487,7 @@ static void process_command(const char *line) {
 
     char cmd[64] = "";
     int enabled  = -1;
+    uint16_t cid = 0;
 
     /* Extract "cmd" value */
     {
@@ -376,20 +515,30 @@ static void process_command(const char *line) {
         }
     }
 
+    /* Extract "cid" value */
+    {
+        const char *p = strstr(line, "\"cid\"");
+        if (p) {
+            p += 5;
+            while (*p && (*p == ':' || *p == ' ')) p++;
+            cid = (uint16_t)atoi(p);
+        }
+    }
+
     if (strcmp(cmd, "approve") == 0) {
-        /* Accept the deferred L2CAP connection */
-        if (g_pending_l2cap_cid != 0) {
+        pending_conn_t *p = find_pending_by_cid(cid);
+        if (p) {
             emit_log("avdtp: accepting incoming connection");
-            avdtp_accept_incoming_connection(g_pending_l2cap_cid);
-            g_pending_l2cap_cid = 0;
+            avdtp_accept_incoming_connection(p->l2cap_cid);
+            p->valid = 0;
         }
     }
     else if (strcmp(cmd, "deny") == 0) {
-        /* Decline before L2CAP is even established */
-        if (g_pending_l2cap_cid != 0) {
+        pending_conn_t *p = find_pending_by_cid(cid);
+        if (p) {
             emit_log("avdtp: declining incoming connection");
-            avdtp_decline_incoming_connection(g_pending_l2cap_cid);
-            g_pending_l2cap_cid = 0;
+            avdtp_decline_incoming_connection(p->l2cap_cid);
+            p->valid = 0;
         }
     }
     else if (strcmp(cmd, "set_discoverable") == 0) {
@@ -545,7 +694,8 @@ int main(int argc, char *argv[]) {
     a2dp_sink_register_packet_handler(&on_a2dp_sink_event);
     a2dp_sink_register_media_handler(&on_a2dp_media_packet);
 
-    /* Register a local SBC sink stream endpoint.
+    /* Register MAX_CONNECTIONS local SBC sink stream endpoints.
+     * Each endpoint can serve one simultaneous A2DP source.
      * SBC capabilities: 2 raw bytes in A2DP/AVDTP wire format:
      *   byte 0: sampling_freq (bits 7-4) | channel_mode (bits 3-0)
      *   byte 1: block_length  (bits 7-4) | subbands (bits 3-2) | alloc (bits 1-0)
@@ -559,14 +709,14 @@ int main(int argc, char *argv[]) {
         };
         sbc_caps[3] = (uint8_t)g_max_bitpool;
 
-        static uint8_t sbc_cfg[4] = { 0 };  /* filled in by remote during SET_CONFIG */
-
-        avdtp_stream_endpoint_t *sep = a2dp_sink_create_stream_endpoint(
-            AVDTP_AUDIO, AVDTP_CODEC_SBC,
-            sbc_caps, sizeof(sbc_caps),
-            sbc_cfg, sizeof(sbc_cfg));
-        if (sep) {
-            g_a2dp_local_seid = avdtp_local_seid(sep);
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            avdtp_stream_endpoint_t *sep = a2dp_sink_create_stream_endpoint(
+                AVDTP_AUDIO, AVDTP_CODEC_SBC,
+                sbc_caps, sizeof(sbc_caps),
+                g_sbc_cfg[i], sizeof(g_sbc_cfg[i]));
+            if (sep) {
+                g_local_seids[i] = avdtp_local_seid(sep);
+            }
         }
     }
 

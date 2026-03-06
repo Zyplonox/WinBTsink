@@ -405,7 +405,8 @@ class SinkBackend:
         # Runtime state – set during start()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
-        self._pipeline: Optional[SbcAudioPipeline] = None
+        self._pipelines: dict[str, SbcAudioPipeline] = {}  # addr_upper → pipeline
+        self._connected_addrs: set[str] = set()            # currently connected devices
         self._stop_event: Optional[asyncio.Event] = None
         self._state = SinkState.IDLE
         self._btstack_proc: Optional[subprocess.Popen] = None
@@ -422,8 +423,8 @@ class SinkBackend:
     def set_volume(self, volume: float) -> None:
         """Updates the output volume (linear multiplier, 0.0–2.0)."""
         self._volume = max(0.0, min(2.0, volume))
-        if self._pipeline:
-            self._pipeline.set_volume(self._volume)
+        for pipeline in self._pipelines.values():
+            pipeline.set_volume(self._volume)
 
     def clear_allowed_macs(self) -> None:
         """Wipes the in-memory allowed-MAC set and its JSON file on disk."""
@@ -453,12 +454,13 @@ class SinkBackend:
         self._thread.start()
 
     def stop(self) -> None:
-        """Signals the asyncio loop to exit and stops the audio pipeline."""
+        """Signals the asyncio loop to exit and stops all audio pipelines."""
         if self._loop and self._loop.is_running() and self._stop_event is not None:
             self._loop.call_soon_threadsafe(self._stop_event.set)
-        if self._pipeline:
-            self._pipeline.stop()
-            self._pipeline = None
+        for pipeline in list(self._pipelines.values()):
+            pipeline.stop()
+        self._pipelines.clear()
+        self._connected_addrs.clear()
         # Kill the subprocess immediately so rapid Start→Stop→Start cycles
         # don't leave zombie btstack_sink.exe processes holding the WinUSB handle.
         proc = self._btstack_proc
@@ -605,27 +607,43 @@ class SinkBackend:
 
     def _stdout_audio_thread(self, stdout_pipe) -> None:
         """
-        Reads length-prefixed SBC frames from btstack_sink.exe stdout.
-        Frame format: [uint32_le length][SBC payload bytes]
-        Feeds payload bytes to the active audio pipeline.
+        Reads addr-tagged length-prefixed SBC frames from btstack_sink.exe stdout.
+        Frame format:
+          [uint32_le total_len = 6 + sbc_len]
+          [6 bytes bd_addr, MSB first]
+          [sbc_len bytes SBC payload]
+        Routes each frame to the matching per-device audio pipeline.
         """
+        def read_exact(n: int) -> bytes:
+            buf = b""
+            while len(buf) < n:
+                chunk = stdout_pipe.read(n - len(buf))
+                if not chunk:
+                    return b""
+                buf += chunk
+            return buf
+
         while True:
             header = stdout_pipe.read(4)
             if not header or len(header) < 4:
                 break
-            frame_len = int.from_bytes(header, "little")
-            if frame_len == 0 or frame_len > 65536:
+            total_len = int.from_bytes(header, "little")
+            if total_len <= 6 or total_len > 65542:
                 continue  # Sanity check; skip malformed frames
-            data = b""
-            remaining = frame_len
-            while remaining > 0:
-                chunk = stdout_pipe.read(remaining)
-                if not chunk:
-                    return
-                data += chunk
-                remaining -= len(chunk)
-            if self._pipeline:
-                self._pipeline.write_sbc(data)
+
+            addr_bytes = read_exact(6)
+            if len(addr_bytes) < 6:
+                break
+            addr_str = ":".join(f"{b:02X}" for b in addr_bytes)
+
+            sbc_len = total_len - 6
+            sbc_data = read_exact(sbc_len)
+            if len(sbc_data) < sbc_len:
+                break
+
+            pipeline = self._pipelines.get(addr_str)
+            if pipeline:
+                pipeline.write_sbc(sbc_data)
 
     def _send_btstack_cmd(self, cmd: dict) -> None:
         """Sends a JSON command line to btstack_sink.exe via stdin."""
@@ -666,36 +684,41 @@ class SinkBackend:
             addr = event.get("addr", "").upper()
             name = event.get("name", addr)
             self._log(f"A2DP connected: {name} ({addr})")
+            self._connected_addrs.add(addr)
             self._set_state(SinkState.CONNECTED)
             if self._cb_connected:
                 self._cb_connected(name, addr)
 
         elif evt == "audio_start":
+            addr = event.get("addr", "").upper()
             sample_rate = event.get("sample_rate", 44100)
             channels = event.get("channels", 2)
-            self._log(f"Stream START → {sample_rate} Hz, {channels} ch")
-            self._start_audio_pipeline(sample_rate, channels)
+            self._log(f"Stream START [{addr}] → {sample_rate} Hz, {channels} ch")
+            self._start_audio_pipeline(addr, sample_rate, channels)
 
         elif evt == "audio_stop":
-            self._log("Stream STOP")
-            if self._pipeline:
-                self._pipeline.stop()
-                self._pipeline = None
+            addr = event.get("addr", "").upper()
+            self._log(f"Stream STOP [{addr}]")
+            pipeline = self._pipelines.pop(addr, None)
+            if pipeline:
+                pipeline.stop()
 
         elif evt == "disconnected":
             addr = event.get("addr", "").upper()
             name = event.get("name", addr)
             self._log(f"A2DP disconnected: {name}")
+            self._connected_addrs.discard(addr)
             should_remember = self._remember_map.pop(addr, True)
             if not should_remember:
                 # "Allow once" — remove from allowed set so dialog shows again
                 self._allowed_macs.discard(addr)
                 if self._allowed_macs_path:
                     _save_allowed_macs(self._allowed_macs, self._allowed_macs_path)
-            if self._pipeline:
-                self._pipeline.stop()
-                self._pipeline = None
-            self._set_state(SinkState.READY)
+            pipeline = self._pipelines.pop(addr, None)
+            if pipeline:
+                pipeline.stop()
+            if not self._connected_addrs:
+                self._set_state(SinkState.READY)
             if self._cb_disconnected:
                 self._cb_disconnected(name)
 
@@ -765,11 +788,11 @@ class SinkBackend:
                 {"cmd": "deny", "addr": addr_upper, "cid": cid}
             )
 
-    def _start_audio_pipeline(self, sample_rate: int, channels: int) -> None:
-        """Creates (or replaces) the SBC audio pipeline."""
-        if self._pipeline:
-            self._pipeline.stop()
-            self._pipeline = None
+    def _start_audio_pipeline(self, addr: str, sample_rate: int, channels: int) -> None:
+        """Creates (or replaces) the per-device SBC audio pipeline."""
+        existing = self._pipelines.pop(addr, None)
+        if existing:
+            existing.stop()
         pipeline = SbcAudioPipeline(
             ffmpeg_exe=self._ffmpeg_exe,
             latency_ms=self._latency_ms,
@@ -779,11 +802,11 @@ class SinkBackend:
         pipeline.set_volume(self._volume)
         try:
             pipeline.start(sample_rate, channels)
-            self._log("Audio pipeline started")
+            self._log(f"Audio pipeline started [{addr}]")
         except Exception as exc:
-            self._log(f"Pipeline error: {exc}")
+            self._log(f"Pipeline error [{addr}]: {exc}")
             return
-        self._pipeline = pipeline
+        self._pipelines[addr] = pipeline
 
     # ------------------------------------------------------------------
     # Helpers
