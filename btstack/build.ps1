@@ -122,13 +122,27 @@ if (-not (Test-Path $BuildDir)) {
     New-Item -ItemType Directory -Path $BuildDir | Out-Null
 }
 
-$scriptUnix = $ScriptDir -replace '\\', '/'
-$buildUnix  = $BuildDir  -replace '\\', '/'
+# cmake.exe, gcc.exe and mingw32-make.exe are native Windows executables —
+# call them directly from PowerShell to avoid bash PATH issues.
+$cmakeExe = "$MingwBin\cmake.exe"
+$makeExe  = "$MingwBin\mingw32-make.exe"
+$gccExe   = "$MingwBin\gcc.exe"
 
-$cmakeCmd = "cmake -S '$scriptUnix' -B '$buildUnix' -G 'MinGW Makefiles' -DCMAKE_BUILD_TYPE=Release -DBTSTACK_ROOT='$btstackUnix'"
+# GCC needs a writable TEMP directory; the default C:\Windows\Temp is
+# inaccessible in some environments.
+$env:TEMP = "$MSYS2Root\tmp"
+$env:TMP  = "$MSYS2Root\tmp"
 
-Invoke-Cmd $Bash @("-lc", $cmakeCmd)
-Invoke-Cmd $Bash @("-lc", "cmake --build '$buildUnix' --target btstack_sink -j4")
+Invoke-Cmd $cmakeExe @(
+    "-S", $ScriptDir,
+    "-B", $BuildDir,
+    "-G", "MinGW Makefiles",
+    "-DCMAKE_MAKE_PROGRAM=$makeExe",
+    "-DCMAKE_C_COMPILER=$gccExe",
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DBTSTACK_ROOT=$BtstackSrc"
+)
+Invoke-Cmd $cmakeExe @("--build", $BuildDir, "--target", "btstack_sink", "-j4")
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 if (Test-Path $ExePath) {
