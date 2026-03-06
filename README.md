@@ -6,6 +6,10 @@ Turns your USB Bluetooth dongle into a Bluetooth audio sink (like a speaker or h
 
 Devices such as a Nintendo Switch 2, phone, or tablet pair with your PC and stream their audio directly through your PC speakers. Up to 4 devices can stream simultaneously.
 
+<img width="480" height="750" alt="gui1" src="https://github.com/user-attachments/assets/803581cd-3f2a-4d14-8c22-3abd1a3f5112" />
+<img width="415" height="689" alt="gui2" src="https://github.com/user-attachments/assets/79230c87-235e-473f-889d-0b8a111baf97" />
+
+
 ---
 
 ## How it works
