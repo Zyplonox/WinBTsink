@@ -66,7 +66,6 @@ const hci_cmd_t hci_le_rand = { 0x2018u, "" };
  * Configuration
  * ---------------------------------------------------------------------- */
 
-#define MAX_PENDING_CONNECTIONS 4
 #define STDIN_BUF_SIZE          512
 #define SBC_STORAGE_SIZE        1024
 
@@ -90,15 +89,6 @@ static uint8_t  g_sdp_a2dp_sink_service[150];
 static uint8_t  g_sdp_avrcp_service[200];
 static uint32_t g_sdp_handle_a2dp  = 0;
 static uint32_t g_sdp_handle_avrcp = 0;
-
-/* Pending L2CAP connections awaiting Python approval */
-typedef struct {
-    uint16_t cid;
-    bd_addr_t addr;
-    int      in_use;
-} pending_conn_t;
-
-static pending_conn_t g_pending[MAX_PENDING_CONNECTIONS];
 
 /* SBC codec params extracted from SET_CONFIG */
 static int g_sample_rate = 44100;
@@ -164,74 +154,8 @@ static void write_sbc_to_stdout(const uint8_t *data, uint16_t len) {
 #endif
 }
 
-/* -------------------------------------------------------------------------
- * Pending connection management
- * ---------------------------------------------------------------------- */
-
-static pending_conn_t *pending_find_by_cid(uint16_t cid) {
-    for (int i = 0; i < MAX_PENDING_CONNECTIONS; i++) {
-        if (g_pending[i].in_use && g_pending[i].cid == cid) {
-            return &g_pending[i];
-        }
-    }
-    return NULL;
-}
-
-static pending_conn_t *pending_find_by_addr(const bd_addr_t addr) {
-    for (int i = 0; i < MAX_PENDING_CONNECTIONS; i++) {
-        if (g_pending[i].in_use &&
-            memcmp(g_pending[i].addr, addr, 6) == 0) {
-            return &g_pending[i];
-        }
-    }
-    return NULL;
-}
-
-static void pending_add(uint16_t cid, const bd_addr_t addr) {
-    for (int i = 0; i < MAX_PENDING_CONNECTIONS; i++) {
-        if (!g_pending[i].in_use) {
-            g_pending[i].in_use = 1;
-            g_pending[i].cid    = cid;
-            memcpy(g_pending[i].addr, addr, 6);
-            return;
-        }
-    }
-}
-
-static void pending_remove(uint16_t cid) {
-    for (int i = 0; i < MAX_PENDING_CONNECTIONS; i++) {
-        if (g_pending[i].in_use && g_pending[i].cid == cid) {
-            g_pending[i].in_use = 0;
-        }
-    }
-}
-
-/* -------------------------------------------------------------------------
- * AVDTP deferred-accept API
- * (declared extern — implemented in patched avdtp.c)
- * ---------------------------------------------------------------------- */
-
-extern void avdtp_register_incoming_connection_handler(
-    void (*handler)(uint16_t local_cid, bd_addr_t addr));
-extern void avdtp_accept_incoming_connection(uint16_t local_cid);
-extern void avdtp_decline_incoming_connection(uint16_t local_cid);
-
-/* -------------------------------------------------------------------------
- * Incoming L2CAP AVDTP connection handler (called from patched avdtp.c)
- * ---------------------------------------------------------------------- */
-
-static void on_avdtp_incoming_connection(uint16_t local_cid, bd_addr_t addr) {
-    char addr_str[18];
-    addr_to_str(addr, addr_str);
-
-    pending_add(local_cid, addr);
-
-    char evt[128];
-    snprintf(evt, sizeof(evt),
-             "{\"event\":\"l2cap_request\",\"addr\":\"%s\",\"cid\":%u}",
-             addr_str, (unsigned)local_cid);
-    emit_event(evt);
-}
+/* (Pending connection / deferred-accept removed — BTstack auto-accepts
+ *  incoming A2DP connections; no manual avdtp_accept step needed.) */
 
 /* -------------------------------------------------------------------------
  * A2DP / AVDTP event handler
@@ -381,10 +305,8 @@ static void process_command(const char *line) {
     /* Minimal JSON parser — looks for "cmd" and relevant fields.
      * We keep it dependency-free (no cJSON etc.) */
 
-    char cmd[64]  = "";
-    char addr[18] = "";
-    unsigned cid  = 0;
-    int enabled   = -1;
+    char cmd[64] = "";
+    int enabled  = -1;
 
     /* Extract "cmd" value */
     {
@@ -401,31 +323,6 @@ static void process_command(const char *line) {
         }
     }
 
-    /* Extract "addr" value */
-    {
-        const char *p = strstr(line, "\"addr\"");
-        if (p) {
-            p += 6;
-            while (*p && *p != '"') p++;
-            if (*p == '"') {
-                p++;
-                int i = 0;
-                while (*p && *p != '"' && i < 17) addr[i++] = *p++;
-                addr[i] = '\0';
-            }
-        }
-    }
-
-    /* Extract "cid" value */
-    {
-        const char *p = strstr(line, "\"cid\"");
-        if (p) {
-            p += 5;
-            while (*p && (*p == ':' || *p == ' ')) p++;
-            cid = (unsigned)atoi(p);
-        }
-    }
-
     /* Extract "enabled" value */
     {
         const char *p = strstr(line, "\"enabled\"");
@@ -437,21 +334,7 @@ static void process_command(const char *line) {
         }
     }
 
-    if (strcmp(cmd, "approve") == 0) {
-        if (cid != 0) {
-            emit_log("avdtp: accepting l2cap connection");
-            avdtp_accept_incoming_connection((uint16_t)cid);
-            pending_remove((uint16_t)cid);
-        }
-    }
-    else if (strcmp(cmd, "deny") == 0) {
-        if (cid != 0) {
-            emit_log("avdtp: declining l2cap connection");
-            avdtp_decline_incoming_connection((uint16_t)cid);
-            pending_remove((uint16_t)cid);
-        }
-    }
-    else if (strcmp(cmd, "set_discoverable") == 0) {
+    if (strcmp(cmd, "set_discoverable") == 0) {
         if (enabled >= 0) {
             g_discoverable = enabled;
             gap_discoverable_control(enabled);
@@ -592,10 +475,6 @@ int main(int argc, char *argv[]) {
     a2dp_sink_init();
     avrcp_init();
     avrcp_target_init();
-
-    /* Register the deferred-accept handler BEFORE a2dp_sink registers
-       its internal AVDTP listener (order matters in BTstack). */
-    avdtp_register_incoming_connection_handler(on_avdtp_incoming_connection);
 
     /* A2DP event + media callbacks */
     a2dp_sink_register_packet_handler(&on_a2dp_sink_event);
