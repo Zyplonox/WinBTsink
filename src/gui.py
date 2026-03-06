@@ -1230,6 +1230,10 @@ class App(ctk.CTk):
             on_log=lambda m: self.after(0, self._log, m),
             on_pairing_request=lambda n, a, r: self.after(0, self._on_pairing_request, n, a, r),
         )
+        # Sync the pairing switch state into the new backend before it starts,
+        # so the "ready" event sends the correct set_discoverable command.
+        if self._pairing_switch:
+            self._backend.set_pairing_mode(bool(self._pairing_switch.get()))
         self._backend.start()
         self._title_label.configure(text=settings.device_name)
 
