@@ -76,7 +76,7 @@ def scan_bt_dongles() -> list[tuple[int, str]]:
     import re
 
     try:
-        setupapi = ctypes.WinDLL("setupapi")
+        setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
     except OSError:
         return []
 
@@ -113,7 +113,7 @@ def scan_bt_dongles() -> list[tuple[int, str]]:
             if not setupapi.SetupDiEnumDeviceInfo(
                 dev_info, member_index, ctypes.byref(devinfo)
             ):
-                if ctypes.GetLastError() == ERROR_NO_MORE_ITEMS:
+                if ctypes.get_last_error() == ERROR_NO_MORE_ITEMS:
                     break
                 member_index += 1
                 continue
