@@ -69,94 +69,99 @@ def scan_bt_dongles() -> list[tuple[int, str]]:
     Enumerate USB Bluetooth HCI dongles that have WinUSB as their active
     driver. Returns (btstack_index, label) pairs for use as usb:N transport.
 
-    Uses Windows SetupAPI (ctypes) — no bumble or libusb required.
+    Reads HKLM\\SYSTEM\\CurrentControlSet\\Enum\\USB from the registry —
+    fast, no DLL calls that can block.
     """
-    import ctypes
-    import ctypes.wintypes as w
+    import winreg
     import re
 
-    try:
-        setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
-    except OSError:
-        return []
-
-    DIGCF_PRESENT    = 0x00000002
-    DIGCF_ALLCLASSES = 0x00000004
-    SPDRP_HARDWAREID   = 0x00000001
-    SPDRP_SERVICE      = 0x00000009
-    SPDRP_FRIENDLYNAME = 0x0000000C
-    ERROR_NO_MORE_ITEMS = 259
-
-    class SP_DEVINFO_DATA(ctypes.Structure):
-        _fields_ = [
-            ("cbSize",    w.DWORD),
-            ("ClassGuid", ctypes.c_byte * 16),
-            ("DevInst",   w.DWORD),
-            ("Reserved",  ctypes.c_ulong),
-        ]
-
-    dev_info = setupapi.SetupDiGetClassDevsW(
-        None, "USB", None, DIGCF_PRESENT | DIGCF_ALLCLASSES
-    )
-    if dev_info == w.HANDLE(-1).value:
-        return []
+    # Bluetooth device class GUID (standard Windows)
+    BT_CLASS_GUID = "{E0CBF06C-CD8B-4647-BB8A-263B43F0F974}"
 
     results: list[tuple[int, str]] = []
     bt_idx = 0
-    member_index = 0
 
     try:
+        usb_root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                  r"SYSTEM\CurrentControlSet\Enum\USB")
+    except OSError:
+        return []
+
+    with usb_root:
+        i = 0
         while True:
-            devinfo = SP_DEVINFO_DATA()
-            devinfo.cbSize = ctypes.sizeof(SP_DEVINFO_DATA)
+            try:
+                dev_id = winreg.EnumKey(usb_root, i)
+            except OSError:
+                break
+            i += 1
 
-            if not setupapi.SetupDiEnumDeviceInfo(
-                dev_info, member_index, ctypes.byref(devinfo)
-            ):
-                if ctypes.get_last_error() == ERROR_NO_MORE_ITEMS:
-                    break
-                member_index += 1
-                continue
-            member_index += 1
-
-            # Read hardware IDs (multi-string REG_MULTI_SZ)
-            hw_buf = ctypes.create_unicode_buffer(4096)
-            if not setupapi.SetupDiGetDeviceRegistryPropertyW(
-                dev_info, ctypes.byref(devinfo), SPDRP_HARDWAREID,
-                None, hw_buf, ctypes.sizeof(hw_buf), None
-            ):
-                continue
-            hw_ids = hw_buf.raw.decode("utf-16-le", errors="ignore").upper()
-
-            # Bluetooth HCI: USB\Class_E0&SubClass_01&Prot_01
-            if "CLASS_E0" not in hw_ids or "SUBCLASS_01" not in hw_ids:
+            try:
+                dev_key = winreg.OpenKey(usb_root, dev_id)
+            except OSError:
                 continue
 
-            # Confirm WinUSB is the active driver (service name)
-            svc_buf = ctypes.create_unicode_buffer(256)
-            if not setupapi.SetupDiGetDeviceRegistryPropertyW(
-                dev_info, ctypes.byref(devinfo), SPDRP_SERVICE,
-                None, svc_buf, ctypes.sizeof(svc_buf), None
-            ):
-                continue
-            if "WINUSB" not in svc_buf.value.upper():
-                continue
+            with dev_key:
+                j = 0
+                while True:
+                    try:
+                        instance = winreg.EnumKey(dev_key, j)
+                    except OSError:
+                        break
+                    j += 1
 
-            # Friendly name for the dropdown label
-            fname_buf = ctypes.create_unicode_buffer(256)
-            setupapi.SetupDiGetDeviceRegistryPropertyW(
-                dev_info, ctypes.byref(devinfo), SPDRP_FRIENDLYNAME,
-                None, fname_buf, ctypes.sizeof(fname_buf), None
-            )
-            name = fname_buf.value or "Bluetooth HCI"
+                    try:
+                        inst_key = winreg.OpenKey(dev_key, instance)
+                    except OSError:
+                        continue
 
-            m = re.search(r"VID_([0-9A-F]{4})&PID_([0-9A-F]{4})", hw_ids)
-            vid_pid = f"  [VID:{m.group(1)} PID:{m.group(2)}]" if m else ""
+                    with inst_key:
+                        # Must have WinUSB as service
+                        try:
+                            service = winreg.QueryValueEx(inst_key, "Service")[0]
+                        except OSError:
+                            continue
+                        if service.upper() != "WINUSB":
+                            continue
 
-            results.append((bt_idx, f"usb:{bt_idx}  {name}{vid_pid}"))
-            bt_idx += 1
-    finally:
-        setupapi.SetupDiDestroyDeviceInfoList(dev_info)
+                        # Identify as Bluetooth: class GUID, hardware ID, or friendly name
+                        is_bt = False
+                        try:
+                            cg = winreg.QueryValueEx(inst_key, "ClassGUID")[0].upper()
+                            is_bt = cg == BT_CLASS_GUID
+                        except OSError:
+                            pass
+
+                        if not is_bt:
+                            try:
+                                hw = winreg.QueryValueEx(inst_key, "HardwareID")[0]
+                                hw_str = (" ".join(hw) if isinstance(hw, list) else hw).upper()
+                                is_bt = "CLASS_E0" in hw_str or "SUBCLASS_01" in hw_str
+                            except OSError:
+                                pass
+
+                        if not is_bt:
+                            try:
+                                fn = winreg.QueryValueEx(inst_key, "FriendlyName")[0].upper()
+                                is_bt = "BLUETOOTH" in fn
+                            except OSError:
+                                pass
+
+                        if not is_bt:
+                            continue
+
+                        try:
+                            friendly = winreg.QueryValueEx(inst_key, "FriendlyName")[0]
+                        except OSError:
+                            friendly = "Bluetooth HCI"
+
+                        m = re.search(r"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})",
+                                      dev_id, re.I)
+                        vid_pid = (f"  [VID:{m.group(1).upper()} PID:{m.group(2).upper()}]"
+                                   if m else "")
+
+                        results.append((bt_idx, f"usb:{bt_idx}  {friendly}{vid_pid}"))
+                        bt_idx += 1
 
     return results
 
