@@ -211,7 +211,7 @@ To reset all pairings: delete both files and restart the app.
 
 ## System tray
 
-Clicking the **×** or **–** button hides the window to the system tray instead of closing the app.
+Clicking the **–** button hides the window to the system tray instead of closing the app.
 Right-click the tray icon for the menu: **Show Window / Start BT / Stop BT / Quit**.
 
 When **Autostart** is enabled the app launches directly minimized to the tray on login.
