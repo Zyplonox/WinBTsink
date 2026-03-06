@@ -84,6 +84,9 @@ static uint8_t  g_a2dp_local_seid  = 0;
 static uint16_t g_a2dp_cid         = 0;
 static char     g_peer_addr_str[18] = "";
 
+/* Pending L2CAP cid awaiting Python approve/deny (deferred-accept) */
+static uint16_t g_pending_l2cap_cid = 0;
+
 /* SDP records */
 static uint8_t  g_sdp_a2dp_sink_service[150];
 static uint8_t  g_sdp_avrcp_service[200];
@@ -154,8 +157,29 @@ static void write_sbc_to_stdout(const uint8_t *data, uint16_t len) {
 #endif
 }
 
-/* (Pending connection / deferred-accept removed — BTstack auto-accepts
- *  incoming A2DP connections; no manual avdtp_accept step needed.) */
+/* -------------------------------------------------------------------------
+ * AVDTP deferred-accept API  (patched into btstack-src/src/classic/avdtp.c)
+ * ---------------------------------------------------------------------- */
+
+extern void avdtp_register_incoming_connection_handler(
+    void (*handler)(uint16_t local_cid, bd_addr_t addr));
+extern void avdtp_accept_incoming_connection(uint16_t local_cid);
+extern void avdtp_decline_incoming_connection(uint16_t local_cid);
+
+/* Called by patched avdtp.c BEFORE L2CAP accept — true deferred accept */
+static void on_avdtp_incoming_connection(uint16_t local_cid, bd_addr_t addr) {
+    char addr_str[18];
+    addr_to_str(addr, addr_str);
+    /* Remember the cid; store addr for connected/deny events */
+    g_pending_l2cap_cid = local_cid;
+    strncpy(g_peer_addr_str, addr_str, sizeof(g_peer_addr_str) - 1);
+
+    char evt[128];
+    snprintf(evt, sizeof(evt),
+             "{\"event\":\"l2cap_request\",\"addr\":\"%s\",\"cid\":%u}",
+             addr_str, (unsigned)local_cid);
+    emit_event(evt);
+}
 
 /* -------------------------------------------------------------------------
  * A2DP / AVDTP event handler
@@ -176,9 +200,8 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
     switch (subevent) {
 
     case A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED:
-        /* Signaling connection open — ask Python to approve or deny.
-         * Python auto-approves known MACs; unknown ones show a dialog.
-         * On "approve" → emit "connected"; on "deny" → a2dp_sink_disconnect. */
+        /* L2CAP was already accepted by Python via avdtp_accept_incoming_connection.
+         * Now the AVDTP signaling channel is open — notify Python. */
         g_a2dp_cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
         {
             bd_addr_t bd;
@@ -186,8 +209,8 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
             addr_to_str(bd, g_peer_addr_str);
         }
         snprintf(evt, sizeof(evt),
-                 "{\"event\":\"l2cap_request\",\"addr\":\"%s\",\"cid\":%u}",
-                 g_peer_addr_str, (unsigned)g_a2dp_cid);
+                 "{\"event\":\"connected\",\"addr\":\"%s\",\"name\":\"%s\"}",
+                 g_peer_addr_str, g_peer_addr_str);
         emit_event(evt);
         break;
 
@@ -337,20 +360,19 @@ static void process_command(const char *line) {
     }
 
     if (strcmp(cmd, "approve") == 0) {
-        /* Connection already established by BTstack; tell Python it's live */
-        if (g_a2dp_cid != 0) {
-            char evt[256];
-            snprintf(evt, sizeof(evt),
-                     "{\"event\":\"connected\",\"addr\":\"%s\",\"name\":\"%s\"}",
-                     g_peer_addr_str, g_peer_addr_str);
-            emit_event(evt);
+        /* Accept the deferred L2CAP connection */
+        if (g_pending_l2cap_cid != 0) {
+            emit_log("avdtp: accepting incoming connection");
+            avdtp_accept_incoming_connection(g_pending_l2cap_cid);
+            g_pending_l2cap_cid = 0;
         }
     }
     else if (strcmp(cmd, "deny") == 0) {
-        /* Disconnect the device that just connected */
-        if (g_a2dp_cid != 0) {
-            emit_log("avdtp: disconnecting denied device");
-            a2dp_sink_disconnect(g_a2dp_cid);
+        /* Decline before L2CAP is even established */
+        if (g_pending_l2cap_cid != 0) {
+            emit_log("avdtp: declining incoming connection");
+            avdtp_decline_incoming_connection(g_pending_l2cap_cid);
+            g_pending_l2cap_cid = 0;
         }
     }
     else if (strcmp(cmd, "set_discoverable") == 0) {
@@ -494,6 +516,9 @@ int main(int argc, char *argv[]) {
     a2dp_sink_init();
     avrcp_init();
     avrcp_target_init();
+
+    /* Register deferred-accept hook BEFORE a2dp_sink registers its L2CAP service */
+    avdtp_register_incoming_connection_handler(on_avdtp_incoming_connection);
 
     /* A2DP event + media callbacks */
     a2dp_sink_register_packet_handler(&on_a2dp_sink_event);
