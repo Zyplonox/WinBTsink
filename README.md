@@ -22,7 +22,7 @@ which has its own advantages:
 This program works by:
 
 1. Installing the **WinUSB driver** for your dongle (via Zadig https://github.com/pbatard/libwdi)
-2. Using **BTstack** (a C Bluetooth stack compiled to `btstack_sink.exe`) to access the dongle directly via USB – bypassing Windows entirely
+2. Using **BTstack** (a C Bluetooth stack compiled to `WinBTsink.exe`) to access the dongle directly via USB – bypassing Windows entirely
 3. Advertising the PC as a Bluetooth speaker
 4. Decoding incoming SBC audio frames with **FFmpeg** (bundled)
 5. Playing the audio through your PC speakers via **sounddevice** (WASAPI)
@@ -31,7 +31,7 @@ This program works by:
 BT device (Switch / phone / tablet)
     │  Bluetooth A2DP / SBC
     ▼
-USB dongle ──(WinUSB / libusb)──▶  btstack_sink.exe  (C, BTstack)
+USB dongle ──(WinUSB / libusb)──▶  WinBTsink.exe  (C, BTstack)
                                          │  SBC frames (per-device, tagged)
                                          ▼
                                     FFmpeg (decoder, bundled)
@@ -41,7 +41,7 @@ USB dongle ──(WinUSB / libusb)──▶  btstack_sink.exe  (C, BTstack)
 ```
 
 > **Why WinUSB?**  Windows automatically installs its own HCI driver for the dongle.
-> `btstack_sink.exe` needs direct USB access – the Windows driver must be replaced with **WinUSB**.
+> `WinBTsink.exe` needs direct USB access – the Windows driver must be replaced with **WinUSB**.
 > WinUSB is a Microsoft inbox driver (included in Windows, signed by Microsoft) –
 > no third-party kernel drivers are involved.
 
@@ -69,7 +69,7 @@ powershell -ExecutionPolicy Bypass -File setup\install.ps1
 python src\gui.py
 ```
 
-> **Note:** Running from source also requires building `btstack_sink.exe` once — see [Building btstack_sink.exe](#building-btstack_sinkexe) below.
+> **Note:** Running from source also requires building `WinBTsink.exe` once — see [Building WinBTsink.exe](#building-WinBTsinkexe) below.
 
 ### Option C – Build the EXE yourself
 
@@ -106,9 +106,9 @@ powershell -ExecutionPolicy Bypass -File setup\install.ps1
 > (mouse, keyboard, Windows Settings). Use your built-in Bluetooth for that,
 > or a second dongle.
 
-### Building btstack_sink.exe
+### Building WinBTsink.exe
 
-`btstack_sink.exe` is the C-based Bluetooth engine. The pre-built EXE includes it automatically. When running from source you need to build it once:
+`WinBTsink.exe` is the C-based Bluetooth engine. The pre-built EXE includes it automatically. When running from source you need to build it once:
 
 ```powershell
 # Requires MSYS2/MinGW (installed automatically if missing)
@@ -116,7 +116,7 @@ cd btstack
 bash do_build.sh
 ```
 
-The resulting binary lands at `btstack\build\btstack_sink.exe`.
+The resulting binary lands at `btstack\build\WinBTsink.exe`.
 
 ---
 
@@ -200,7 +200,7 @@ Paired devices (iPhone, Android, Nintendo Switch 2) are remembered when you choo
 **Remember this device** in the pairing dialog.
 On the next session the device reconnects without re-pairing as long as the app is running.
 
-Bonding keys are managed by `btstack_sink.exe` and stored in:
+Bonding keys are managed by `WinBTsink.exe` and stored in:
 `btstack\build\btstack_keys.db` (next to the C binary)
 
 Remembered device list (MACs): `%APPDATA%\WinBTsink\allowed_macs.json`
@@ -252,7 +252,7 @@ Device Manager → `USB devices` → `Bluetooth USB Dongle (WinUSB)` → right-c
 
 | Component | Purpose |
 |-----------|---------|
-| [BTstack](https://github.com/bluekitchen/btstack) | C Bluetooth stack – implements HCI / L2CAP / AVDTP / A2DP; compiled to `btstack_sink.exe` |
+| [BTstack](https://github.com/bluekitchen/btstack) | C Bluetooth stack – implements HCI / L2CAP / AVDTP / A2DP; compiled to `WinBTsink.exe` |
 | [Zadig](https://github.com/pbatard/libwdi) | USB driver replacement for direct WinUSB access |
 | [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) | Bundles FFmpeg automatically |
 | [sounddevice](https://python-sounddevice.readthedocs.io/) | WASAPI audio output |
@@ -277,16 +277,16 @@ WinBTsink/
 ├── start.bat               ← Launches the GUI via Python
 ├── src/
 │   ├── gui.py              ← CustomTkinter GUI (entry point)
-│   ├── backend.py          ← Bluetooth + audio backend (launches btstack_sink.exe)
+│   ├── backend.py          ← Bluetooth + audio backend (launches WinBTsink.exe)
 │   └── winusb_installer.py ← Zadig helper
 ├── btstack/
-│   ├── btstack_sink.c      ← C Bluetooth engine (HCI / AVDTP / A2DP sink)
+│   ├── WinBTsink.c      ← C Bluetooth engine (HCI / AVDTP / A2DP sink)
 │   ├── CMakeLists.txt      ← Build configuration
 │   ├── btstack_config.h    ← BTstack feature flags
 │   ├── do_build.sh         ← Build script (MSYS2/MinGW)
 │   ├── btstack-src/        ← BTstack library source (submodule)
 │   └── build/
-│       ├── btstack_sink.exe ← Compiled BT engine
+│       ├── WinBTsink.exe ← Compiled BT engine
 │       └── btstack_keys.db  ← Bonding keys (auto-created)
 └── setup/
     └── install.ps1         ← One-time setup script
