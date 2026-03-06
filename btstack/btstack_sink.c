@@ -87,6 +87,10 @@ static char     g_peer_addr_str[18] = "";
 /* Pending L2CAP cid awaiting Python approve/deny (deferred-accept) */
 static uint16_t g_pending_l2cap_cid = 0;
 
+/* Set when we intentionally power off (stop command) — suppresses the
+   HCI_STATE_OFF error that would otherwise fire during normal shutdown. */
+static int g_shutdown_requested = 0;
+
 /* SDP records */
 static uint8_t  g_sdp_a2dp_sink_service[150];
 static uint8_t  g_sdp_avrcp_service[200];
@@ -256,13 +260,17 @@ static void on_a2dp_media_packet(uint8_t seid, uint8_t *packet, uint16_t size) {
     UNUSED(seid);
 
     /*
-     * RTP header is already stripped by BTstack; 'packet' starts with the
-     * SBC media payload header (1 byte: fragment/RFA/number_of_frames)
-     * followed by the raw SBC frames.
-     * We skip that 1-byte header to get raw SBC frames for FFmpeg.
+     * BTstack does NOT strip the RTP header before calling this callback
+     * (confirmed by a2dp_sink_demo.c which manually parses it).
+     * Packet layout:
+     *   [12 bytes RTP header (fixed, assuming CC=0, no extension)]
+     *   [ 1 byte  A2DP SBC media payload header (num_frames etc.)]
+     *   [ N bytes raw SBC frames, each starting with sync word 0x9C]
+     *
+     * We skip 13 bytes total to reach the raw SBC frames for FFmpeg.
      */
-    if (size < 2) return;
-    write_sbc_to_stdout(packet + 1, size - 1);
+    if (size < 14) return;
+    write_sbc_to_stdout(packet + 13, size - 13);
 }
 
 /* -------------------------------------------------------------------------
@@ -300,7 +308,9 @@ static void on_hci_event(uint8_t packet_type, uint16_t channel,
             gap_discoverable_control(g_discoverable);
             gap_connectable_control(1);
         } else if (bt_state == HCI_STATE_OFF) {
-            emit_event("{\"event\":\"error\",\"msg\":\"HCI powered off — USB dongle not accessible. Check WinUSB driver (Zadig) and kill any zombie btstack_sink.exe.\"}");
+            if (!g_shutdown_requested) {
+                emit_event("{\"event\":\"error\",\"msg\":\"HCI powered off unexpectedly — USB dongle not accessible. Check WinUSB driver (Zadig) and kill any zombie btstack_sink.exe.\"}");
+            }
             btstack_run_loop_trigger_exit();
         }
         break;
@@ -393,6 +403,7 @@ static void process_command(const char *line) {
     }
     else if (strcmp(cmd, "stop") == 0) {
         emit_log("stop command received");
+        g_shutdown_requested = 1;
         hci_power_control(HCI_POWER_OFF);
         /* Run loop will exit after HCI_STATE_OFF */
     }

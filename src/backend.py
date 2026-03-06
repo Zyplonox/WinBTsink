@@ -459,6 +459,14 @@ class SinkBackend:
         if self._pipeline:
             self._pipeline.stop()
             self._pipeline = None
+        # Kill the subprocess immediately so rapid Start→Stop→Start cycles
+        # don't leave zombie btstack_sink.exe processes holding the WinUSB handle.
+        proc = self._btstack_proc
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
         self._set_state(SinkState.STOPPED)
 
     # ------------------------------------------------------------------
