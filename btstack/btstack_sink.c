@@ -176,7 +176,9 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
     switch (subevent) {
 
     case A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED:
-        /* Signaling connection established (L2CAP + AVDTP signaling open) */
+        /* Signaling connection open — ask Python to approve or deny.
+         * Python auto-approves known MACs; unknown ones show a dialog.
+         * On "approve" → emit "connected"; on "deny" → a2dp_sink_disconnect. */
         g_a2dp_cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
         {
             bd_addr_t bd;
@@ -184,8 +186,8 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
             addr_to_str(bd, g_peer_addr_str);
         }
         snprintf(evt, sizeof(evt),
-                 "{\"event\":\"connected\",\"addr\":\"%s\",\"name\":\"%s\"}",
-                 g_peer_addr_str, g_peer_addr_str);
+                 "{\"event\":\"l2cap_request\",\"addr\":\"%s\",\"cid\":%u}",
+                 g_peer_addr_str, (unsigned)g_a2dp_cid);
         emit_event(evt);
         break;
 
@@ -334,7 +336,24 @@ static void process_command(const char *line) {
         }
     }
 
-    if (strcmp(cmd, "set_discoverable") == 0) {
+    if (strcmp(cmd, "approve") == 0) {
+        /* Connection already established by BTstack; tell Python it's live */
+        if (g_a2dp_cid != 0) {
+            char evt[256];
+            snprintf(evt, sizeof(evt),
+                     "{\"event\":\"connected\",\"addr\":\"%s\",\"name\":\"%s\"}",
+                     g_peer_addr_str, g_peer_addr_str);
+            emit_event(evt);
+        }
+    }
+    else if (strcmp(cmd, "deny") == 0) {
+        /* Disconnect the device that just connected */
+        if (g_a2dp_cid != 0) {
+            emit_log("avdtp: disconnecting denied device");
+            a2dp_sink_disconnect(g_a2dp_cid);
+        }
+    }
+    else if (strcmp(cmd, "set_discoverable") == 0) {
         if (enabled >= 0) {
             g_discoverable = enabled;
             gap_discoverable_control(enabled);
