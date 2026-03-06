@@ -134,10 +134,16 @@ $scriptSlash   = $ScriptDir                   -replace '\\', '/'
 $buildSlash    = $BuildDir                    -replace '\\', '/'
 $btstackSlash  = $BtstackSrc                  -replace '\\', '/'
 
-# GCC needs a writable TEMP directory; the default C:\Windows\Temp is
-# inaccessible in some environments.
-$env:TEMP = "$MSYS2Root\tmp"
-$env:TMP  = "$MSYS2Root\tmp"
+# MinGW gcc.exe depends on DLLs (libgcc, libwinpthread, etc.) that live in
+# the same bin directory. Add it to PATH so Windows can find them when cmake
+# invokes the compiler as a child process.
+$env:PATH = "$MingwBin;$env:PATH"
+
+# GCC needs a writable TEMP directory. Ensure C:\msys64\tmp exists and use it.
+$msysTmp = "$MSYS2Root\tmp"
+if (-not (Test-Path $msysTmp)) { New-Item -ItemType Directory -Path $msysTmp | Out-Null }
+$env:TEMP = $msysTmp
+$env:TMP  = $msysTmp
 
 Invoke-Cmd $cmakeExe @(
     "-S", $scriptSlash,
