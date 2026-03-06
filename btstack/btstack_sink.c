@@ -170,6 +170,7 @@ extern void avdtp_decline_incoming_connection(uint16_t local_cid);
 static void on_avdtp_incoming_connection(uint16_t local_cid, bd_addr_t addr) {
     char addr_str[18];
     addr_to_str(addr, addr_str);
+    emit_log("avdtp: incoming connection hook fired");
     /* Remember the cid; store addr for connected/deny events */
     g_pending_l2cap_cid = local_cid;
     strncpy(g_peer_addr_str, addr_str, sizeof(g_peer_addr_str) - 1);
@@ -291,6 +292,7 @@ static void on_hci_event(uint8_t packet_type, uint16_t channel,
             snprintf(evt, sizeof(evt),
                      "{\"event\":\"ready\",\"address\":\"%s\"}", addr_str);
             emit_event(evt);
+            emit_log("build: deferred-accept v4");
 
             /* Apply initial discoverability (off by default, Python will
                send set_discoverable when the GUI toggle is set). */
