@@ -56,6 +56,9 @@
 #include "classic/avdtp_util.h"
 #include "bluetooth_sdp.h"
 #include "hci_cmd.h"
+#include "btstack_tlv.h"
+#include "btstack_tlv_windows.h"
+#include "classic/btstack_link_key_db_tlv.h"
 
 /* btstack_crypto.c references hci_le_rand (an LE HCI command descriptor)
  * even in Classic-only builds. Provide the stub so the linker is satisfied.
@@ -115,6 +118,11 @@ static char  g_bt_address[18]   = "";
 static int   g_usb_path         = 0;
 static int   g_max_bitpool      = 53;
 static int   g_discoverable     = 0;  /* set via cmd after ready */
+static int   g_debug            = 0;  /* verbose protocol logging when 1 */
+
+/* Bonding / link key persistence via Windows TLV store */
+static btstack_tlv_windows_t    g_tlv_context;
+static const btstack_tlv_t     *g_tlv_impl = NULL;
 
 /* Set when we intentionally power off (stop command) — suppresses the
    HCI_STATE_OFF error that would otherwise fire during normal shutdown. */
@@ -331,6 +339,15 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
             conn->local_seid  = seid;
             conn->sample_rate = a2dp_subevent_signaling_media_codec_sbc_configuration_get_sampling_frequency(packet);
             conn->channels    = a2dp_subevent_signaling_media_codec_sbc_configuration_get_num_channels(packet);
+            if (g_debug) {
+                char dbg[128];
+                snprintf(dbg, sizeof(dbg),
+                         "SBC config: seid=%u rate=%d ch=%d bitpool=%u..%u",
+                         seid, conn->sample_rate, conn->channels,
+                         a2dp_subevent_signaling_media_codec_sbc_configuration_get_min_bitpool_value(packet),
+                         a2dp_subevent_signaling_media_codec_sbc_configuration_get_max_bitpool_value(packet));
+                emit_log(dbg);
+            }
         }
         break;
     }
@@ -439,7 +456,7 @@ static void on_hci_event(uint8_t packet_type, uint16_t channel,
             snprintf(evt, sizeof(evt),
                      "{\"event\":\"ready\",\"address\":\"%s\"}", addr_str);
             emit_event(evt);
-            emit_log("build: multi-device v6");
+            emit_log(g_debug ? "build: bonding+debug v7" : "build: bonding v7");
 
             /* Apply initial discoverability (off by default, Python will
                send set_discoverable when the GUI toggle is set). */
@@ -652,11 +669,25 @@ int main(int argc, char *argv[]) {
     _setmode(_fileno(stdin), _O_TEXT);
 #endif
 
-    /* Parse arguments: <usb_path_index> <device_name> <bt_address> <max_bitpool> */
+    /* Parse arguments: <usb_path_index> <device_name> <bt_address> <max_bitpool> [debug] */
     if (argc >= 2) g_usb_path    = atoi(argv[1]);
     if (argc >= 3) strncpy(g_device_name, argv[2], sizeof(g_device_name) - 1);
     if (argc >= 4) strncpy(g_bt_address,  argv[3], sizeof(g_bt_address) - 1);
     if (argc >= 5) g_max_bitpool = atoi(argv[4]);
+    if (argc >= 6) g_debug       = atoi(argv[5]);
+
+    /* Compute TLV key-store path next to this executable */
+    char tlv_path[MAX_PATH] = "btstack_keys.db";
+    {
+        char module_path[MAX_PATH];
+        if (GetModuleFileNameA(NULL, module_path, MAX_PATH)) {
+            char *last_sep = strrchr(module_path, '\\');
+            if (last_sep) {
+                *(last_sep + 1) = '\0';
+                snprintf(tlv_path, sizeof(tlv_path), "%sbtstack_keys.db", module_path);
+            }
+        }
+    }
 
     /* ---- BTstack init ---- */
     btstack_memory_init();
@@ -664,6 +695,11 @@ int main(int argc, char *argv[]) {
 
     /* HCI transport: WinUSB (no config struct needed for USB) */
     hci_init(hci_transport_usb_instance(), NULL);
+
+    /* Persistent link-key store — survives restarts so phones don't need to re-pair */
+    g_tlv_impl = btstack_tlv_windows_init_instance(&g_tlv_context, tlv_path);
+    btstack_tlv_set_instance(g_tlv_impl, &g_tlv_context);
+    hci_set_link_key_db(btstack_link_key_db_tlv_get_instance(g_tlv_impl, &g_tlv_context));
 
     /* Register HCI event handler (GAP events, power-on, etc.) */
     g_hci_event_cb.callback = &on_hci_event;

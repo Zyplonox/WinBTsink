@@ -43,6 +43,7 @@ set(BT_PLATFORM_SRCS
     "${BT_PLATFORM}/btstack_run_loop_windows.c"
     "${BT_PLATFORM}/hci_transport_h2_winusb.c"
     "${BT_PLATFORM}/btstack_stdin_windows.c"
+    "${BT_PLATFORM}/btstack_tlv_windows.c"
 )
 
 set(BT_3RDPARTY_SRCS
