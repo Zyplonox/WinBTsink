@@ -537,6 +537,7 @@ class SinkBackend:
             self._device_name,
             self._bt_address,
             str(self._max_bitpool),
+            "1" if self._debug else "0",
         ]
         self._log(f"Launching BTstack: {Path(exe).name} (usb:{usb_index})")
 
@@ -663,6 +664,9 @@ class SinkBackend:
     def _on_btstack_event(self, event: dict) -> None:
         """Routes events from btstack_sink.exe to the appropriate handler."""
         evt = event.get("event", "")
+
+        if self._debug and evt not in ("log", "error"):
+            self._log(f"[dbg] {event}")
 
         if evt == "ready":
             addr = event.get("address", "")
