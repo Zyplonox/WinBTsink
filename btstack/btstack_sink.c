@@ -509,6 +509,9 @@ int main(int argc, char *argv[]) {
     g_hci_event_cb.callback = &on_hci_event;
     hci_add_event_handler(&g_hci_event_cb);
 
+    /* L2CAP — must be initialised before any L2CAP service (AVDTP etc.) */
+    l2cap_init();
+
     /* GAP setup */
     gap_set_local_name(g_device_name);
     gap_set_class_of_device(0x240418);  /* Rendering|Audio svc | A/V major | Headphones */
