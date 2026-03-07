@@ -126,12 +126,16 @@ static pending_conn_t g_pending[MAX_CONNECTIONS];
  * Global state
  * ---------------------------------------------------------------------- */
 
-static char  g_device_name[64]  = "PC-AudioSink";
-static char  g_bt_address[18]   = "";
-static int   g_usb_path         = 0;
-static int   g_max_bitpool      = 53;
-static int   g_discoverable     = 0;  /* set via cmd after ready */
-static int   g_debug            = 0;  /* verbose protocol logging when 1 */
+static char     g_device_name[64]  = "PC-AudioSink";
+static char     g_bt_address[18]   = "";
+static int      g_usb_path         = 0;
+static int      g_max_bitpool      = 53;
+static int      g_discoverable     = 0;  /* set via cmd after ready */
+static int      g_debug            = 0;  /* verbose protocol logging when 1 */
+static uint32_t g_cod              = 0x240418; /* Class of Device: Headphones */
+static int      g_sbc_block_length = 16;       /* 4/8/12/16 */
+static int      g_sbc_subbands     = 8;        /* 4 or 8 */
+static int      g_sbc_alloc        = 1;        /* 0=SNR, 1=Loudness */
 
 /* Bonding / link key persistence via Windows TLV store */
 static btstack_tlv_windows_t    g_tlv_context;
@@ -913,11 +917,15 @@ int main(int argc, char *argv[]) {
     _setmode(_fileno(stdin),  _O_TEXT);
 #endif
 
-    if (argc >= 2) g_usb_path    = atoi(argv[1]);
-    if (argc >= 3) strncpy(g_device_name, argv[2], sizeof(g_device_name) - 1);
-    if (argc >= 4) strncpy(g_bt_address,  argv[3], sizeof(g_bt_address) - 1);
-    if (argc >= 5) g_max_bitpool = atoi(argv[4]);
-    if (argc >= 6) g_debug       = atoi(argv[5]);
+    if (argc >= 2)  g_usb_path         = atoi(argv[1]);
+    if (argc >= 3)  strncpy(g_device_name, argv[2], sizeof(g_device_name) - 1);
+    if (argc >= 4)  strncpy(g_bt_address,  argv[3], sizeof(g_bt_address) - 1);
+    if (argc >= 5)  g_max_bitpool       = atoi(argv[4]);
+    if (argc >= 6)  g_debug             = atoi(argv[5]);
+    if (argc >= 7)  g_cod               = (uint32_t)strtoul(argv[6], NULL, 16);
+    if (argc >= 8)  g_sbc_block_length  = atoi(argv[7]);
+    if (argc >= 9)  g_sbc_subbands      = atoi(argv[8]);
+    if (argc >= 10) g_sbc_alloc         = atoi(argv[9]);
 
     /* Compute TLV key-store path next to this executable */
     char tlv_path[MAX_PATH] = "btstack_keys.db";
@@ -949,7 +957,7 @@ int main(int argc, char *argv[]) {
     l2cap_init();
 
     gap_set_local_name(g_device_name);
-    gap_set_class_of_device(0x240418);
+    gap_set_class_of_device(g_cod);
     gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH |
                                          LM_LINK_POLICY_ENABLE_SNIFF_MODE);
 
@@ -972,12 +980,27 @@ int main(int argc, char *argv[]) {
 
     /* Register SBC sink stream endpoints (one per simultaneous source) */
     {
+        /* sbc_caps[1] bit layout (A2DP spec):
+         *   bits 7-4: block lengths (bit7=16, bit6=12, bit5=8, bit4=4)
+         *   bits 3-2: subbands     (bit3=8, bit2=4)
+         *   bits 1-0: alloc method (bit1=SNR, bit0=Loudness)
+         * Advertising a single bit forces the source to use that value. */
+        static const struct { int val; uint8_t bit; } blk_map[] =
+            {{4,0x10},{8,0x20},{12,0x40},{16,0x80}};
+        uint8_t block_bit = 0xF0; /* default: all */
+        for (int i = 0; i < 4; i++) {
+            if (blk_map[i].val == g_sbc_block_length) { block_bit = blk_map[i].bit; break; }
+        }
+        uint8_t sub_bit   = (g_sbc_subbands == 4) ? 0x04 : 0x08;
+        uint8_t alloc_bit = (g_sbc_alloc    == 0) ? 0x02 : 0x01; /* 0=SNR, 1=Loudness */
+
         static uint8_t sbc_caps[4] = {
             0xFF,  /* all sample rates + all channel modes */
-            0xFF,  /* all block lengths + subbands + alloc methods */
+            0xFF,  /* overwritten below */
             2,     /* min bitpool */
             53     /* max bitpool — overwritten below */
         };
+        sbc_caps[1] = block_bit | sub_bit | alloc_bit;
         sbc_caps[3] = (uint8_t)g_max_bitpool;
 
         for (int i = 0; i < MAX_CONNECTIONS; i++) {
