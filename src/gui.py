@@ -297,11 +297,18 @@ class Settings:
     debug_mode: bool = False
     autostart: bool = False
     volume: float = 1.0
+    discoverable_timeout_s: int = 0        # 0 = never auto-off
+    class_of_device: int = 0x240418        # Headphones by default
+    sbc_block_length: int = 16             # 4/8/12/16
+    sbc_subbands: int = 8                  # 4 or 8
+    sbc_allocation: str = "loudness"       # "loudness" or "snr"
 
     #: Keys written to / read from config.json.  'transport' is excluded.
     _PERSIST = (
         "device_name", "bt_address", "latency_ms", "max_bitpool",
         "audio_device_index", "debug_mode", "volume",
+        "discoverable_timeout_s", "class_of_device",
+        "sbc_block_length", "sbc_subbands", "sbc_allocation",
     )
 
     def load(self) -> None:
@@ -342,7 +349,7 @@ class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, parent: "App"):
         super().__init__(parent)
         self.title("Settings")
-        self.geometry("420x670")
+        self.geometry("420x870")
         self.resizable(False, False)
         self.grab_set()  # Block interaction with the main window
 
@@ -350,8 +357,11 @@ class SettingsDialog(ctk.CTkToplevel):
 
         self._add_device_name_row()
         self._add_bt_address_row()
+        self._add_cod_row()
+        self._add_discoverable_timeout_row()
         self._add_latency_row()
         self._add_bitpool_row()
+        self._add_sbc_advanced_row()
         self._add_audio_device_row()
         self._add_checkboxes()
         self._add_clear_keys_row()
@@ -385,6 +395,51 @@ class SettingsDialog(ctk.CTkToplevel):
             text="Format: AA:BB:CC:DD:EE:FF  (change if address conflicts with another device)",
             anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
         ).pack(fill="x", padx=20)
+
+    # CoD display names and their corresponding integer CoD values
+    _COD_OPTIONS: list[tuple[str, int]] = [
+        ("Headphones (0x240418)",      0x240418),
+        ("Speaker / Loudspeaker (0x240414)", 0x240414),
+        ("Car Audio (0x240420)",       0x240420),
+        ("Wearable Headset (0x240404)", 0x240404),
+    ]
+
+    def _add_cod_row(self) -> None:
+        """Dropdown for the Bluetooth Class of Device advertised to remote devices."""
+        ctk.CTkLabel(self, text="Class of Device", anchor="w").pack(
+            fill="x", padx=20, pady=(8, 0)
+        )
+        # Find currently selected label
+        current_label = self._COD_OPTIONS[0][0]
+        for label, val in self._COD_OPTIONS:
+            if val == settings.class_of_device:
+                current_label = label
+                break
+        self._cod_var = ctk.StringVar(value=current_label)
+        ctk.CTkOptionMenu(
+            self,
+            values=[lbl for lbl, _ in self._COD_OPTIONS],
+            variable=self._cod_var,
+        ).pack(fill="x", padx=20, pady=0)
+        ctk.CTkLabel(
+            self,
+            text="Affects how your PC appears to phones/headsets. Change if a device behaves oddly.",
+            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF", wraplength=380,
+        ).pack(fill="x", padx=20)
+
+    def _add_discoverable_timeout_row(self) -> None:
+        """Entry for how many seconds to stay discoverable before auto-off."""
+        ctk.CTkLabel(self, text="Discoverable timeout", anchor="w").pack(
+            fill="x", padx=20, pady=(8, 0)
+        )
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=0)
+        self._timeout_var = ctk.StringVar(value=str(settings.discoverable_timeout_s))
+        ctk.CTkEntry(row, textvariable=self._timeout_var, width=72).pack(side="left")
+        ctk.CTkLabel(
+            row, text="seconds  (0 = stay on until manually disabled)",
+            font=ctk.CTkFont(size=11), text_color="#9CA3AF",
+        ).pack(side="left", padx=(8, 0))
 
     def _add_latency_row(self) -> None:
         """Slider for the sounddevice output buffer size (in milliseconds)."""
@@ -421,6 +476,45 @@ class SettingsDialog(ctk.CTkToplevel):
             anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
         )
         self._bitpool_label.pack(fill="x", padx=20)
+
+    def _add_sbc_advanced_row(self) -> None:
+        """Dropdowns for fine-grained SBC encoder parameters."""
+        ctk.CTkLabel(self, text="SBC block length", anchor="w").pack(
+            fill="x", padx=20, pady=(8, 0)
+        )
+        self._sbc_block_var = ctk.StringVar(value=str(settings.sbc_block_length))
+        ctk.CTkOptionMenu(
+            self, values=["4", "8", "12", "16"], variable=self._sbc_block_var,
+        ).pack(fill="x", padx=20, pady=0)
+        ctk.CTkLabel(
+            self, text="4 = lowest latency (gaming)  ·  16 = best quality (music)",
+            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
+        ).pack(fill="x", padx=20)
+
+        ctk.CTkLabel(self, text="SBC subbands", anchor="w").pack(
+            fill="x", padx=20, pady=(8, 0)
+        )
+        self._sbc_sub_var = ctk.StringVar(value=str(settings.sbc_subbands))
+        ctk.CTkOptionMenu(
+            self, values=["4", "8"], variable=self._sbc_sub_var,
+        ).pack(fill="x", padx=20, pady=0)
+        ctk.CTkLabel(
+            self, text="4 = faster/lower latency  ·  8 = better frequency resolution",
+            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
+        ).pack(fill="x", padx=20)
+
+        ctk.CTkLabel(self, text="SBC allocation method", anchor="w").pack(
+            fill="x", padx=20, pady=(8, 0)
+        )
+        alloc_label = "Loudness" if settings.sbc_allocation == "loudness" else "SNR"
+        self._sbc_alloc_var = ctk.StringVar(value=alloc_label)
+        ctk.CTkOptionMenu(
+            self, values=["Loudness", "SNR"], variable=self._sbc_alloc_var,
+        ).pack(fill="x", padx=20, pady=0)
+        ctk.CTkLabel(
+            self, text="Loudness = perceptually optimised  ·  SNR = mathematically optimal",
+            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
+        ).pack(fill="x", padx=20)
 
     def _add_audio_device_row(self) -> None:
         """Dropdown listing all WASAPI output devices."""
@@ -564,8 +658,31 @@ class SettingsDialog(ctk.CTkToplevel):
         """Writes all dialog values back to the Settings object and persists them."""
         settings.device_name = self._name_var.get().strip() or "PC-AudioSink"
         settings.bt_address = self._btaddr_var.get().strip() or "F0:F1:F2:F3:F4:F5"
+        # CoD: map label back to int value
+        selected_cod_label = self._cod_var.get()
+        for label, val in self._COD_OPTIONS:
+            if label == selected_cod_label:
+                settings.class_of_device = val
+                break
+        # Discoverable timeout
+        try:
+            settings.discoverable_timeout_s = max(0, int(self._timeout_var.get()))
+        except ValueError:
+            settings.discoverable_timeout_s = 0
         settings.latency_ms = int(self._latency_var.get())
         settings.max_bitpool = int(self._bitpool_var.get())
+        # SBC advanced
+        try:
+            settings.sbc_block_length = int(self._sbc_block_var.get())
+        except ValueError:
+            settings.sbc_block_length = 16
+        try:
+            settings.sbc_subbands = int(self._sbc_sub_var.get())
+        except ValueError:
+            settings.sbc_subbands = 8
+        settings.sbc_allocation = (
+            "loudness" if self._sbc_alloc_var.get() == "Loudness" else "snr"
+        )
         settings.audio_device_index = self._resolve_audio_device_index(
             self._audio_var.get()
         )
@@ -1356,6 +1473,11 @@ class App(ctk.CTk):
             debug=settings.debug_mode,
             keystore_path=_keys_file(),
             allowed_macs_path=_allowed_macs_file(),
+            discoverable_timeout_s=settings.discoverable_timeout_s,
+            class_of_device=settings.class_of_device,
+            sbc_block_length=settings.sbc_block_length,
+            sbc_subbands=settings.sbc_subbands,
+            sbc_allocation=settings.sbc_allocation,
             # Route all callbacks through after() to stay on the mainloop thread
             on_state_change=lambda s: self.after(0, self._on_state_change, s),
             on_device_connected=lambda n, a: self.after(0, self._on_device_connected, n, a),
@@ -1366,6 +1488,7 @@ class App(ctk.CTk):
             on_volume_changed=lambda a, v: self.after(0, self._on_volume_changed_by_source, a, v),
             on_metadata=lambda a, m: self.after(0, self._on_metadata, a, m),
             on_audio_start=lambda a, c: self.after(0, self._on_audio_start, a, c),
+            on_pairing_timeout=lambda: self.after(0, self._on_pairing_timeout),
         )
         # Sync the pairing switch state into the new backend before it starts,
         # so the "ready" event sends the correct set_discoverable command.
@@ -1463,6 +1586,12 @@ class App(ctk.CTk):
         if self._backend:
             self._backend.set_pairing_mode(allowed)
         self._log(f"New pairings: {'allowed' if allowed else 'blocked'}")
+
+    def _on_pairing_timeout(self) -> None:
+        """Called when the auto-discoverable timer fires in the backend."""
+        if self._pairing_switch:
+            self._pairing_switch.deselect()
+        self._log("New pairings: auto-off (timeout)")
 
     def _log(self, msg: str) -> None:
         """Appends a timestamped line to the log textbox."""

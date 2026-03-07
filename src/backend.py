@@ -372,12 +372,22 @@ class SinkBackend:
         on_volume_changed: Optional[Callable[[str, int], None]] = None,   # addr, vol_0_127
         on_metadata: Optional[Callable[[str, dict], None]] = None,        # addr, {title,artist,album}
         on_audio_start: Optional[Callable[[str, str], None]] = None,      # addr, codec
+        on_pairing_timeout: Optional[Callable[[], None]] = None,
+        discoverable_timeout_s: int = 0,
+        class_of_device: int = 0x240418,
+        sbc_block_length: int = 16,
+        sbc_subbands: int = 8,
+        sbc_allocation: str = "loudness",
     ):
         # BT / USB parameters
         self._device_name = device_name
         self._bt_address = bt_address
         self._transport_str = transport
         self._max_bitpool = max_bitpool
+        self._class_of_device = class_of_device
+        self._sbc_block_length = sbc_block_length
+        self._sbc_subbands = sbc_subbands
+        self._sbc_allocation = sbc_allocation
 
         # Audio parameters
         self._latency_ms = latency_ms
@@ -407,9 +417,12 @@ class SinkBackend:
         self._cb_volume_changed = on_volume_changed
         self._cb_metadata = on_metadata
         self._cb_audio_start = on_audio_start
+        self._cb_pairing_timeout = on_pairing_timeout
 
-        # Pairing control
+        # Pairing / discoverability control
         self._pairing_allowed = True
+        self._discoverable_timeout_s = discoverable_timeout_s
+        self._discoverable_timer: Optional[threading.Timer] = None
         self._remember_map: dict[str, bool] = {}  # addr_upper → persist key to disk
 
         # Runtime state – set during start()
@@ -452,8 +465,27 @@ class SinkBackend:
 
     def set_pairing_mode(self, allowed: bool) -> None:
         """Allow (True) or block (False) pairing requests from unknown devices."""
+        # Cancel any pending auto-off timer first
+        if self._discoverable_timer is not None:
+            self._discoverable_timer.cancel()
+            self._discoverable_timer = None
         self._pairing_allowed = allowed
         self._send_btstack_cmd({"cmd": "set_discoverable", "enabled": allowed})
+        # Start auto-off timer when enabling discoverability
+        if allowed and self._discoverable_timeout_s > 0:
+            self._discoverable_timer = threading.Timer(
+                self._discoverable_timeout_s, self._on_discoverable_timeout
+            )
+            self._discoverable_timer.daemon = True
+            self._discoverable_timer.start()
+
+    def _on_discoverable_timeout(self) -> None:
+        """Fires when the auto-discoverable timer expires; disables discoverability."""
+        self._discoverable_timer = None
+        self._pairing_allowed = False
+        self._send_btstack_cmd({"cmd": "set_discoverable", "enabled": False})
+        if self._cb_pairing_timeout:
+            self._cb_pairing_timeout()
 
     def notify_volume_changed(self, vol_0_127: int) -> None:
         """Notify all connected sources of a volume change via AVRCP absolute volume."""
@@ -482,6 +514,10 @@ class SinkBackend:
 
     def stop(self) -> None:
         """Signals the asyncio loop to exit and stops all audio pipelines."""
+        # Cancel any pending auto-off timer
+        if self._discoverable_timer is not None:
+            self._discoverable_timer.cancel()
+            self._discoverable_timer = None
         if self._loop and self._loop.is_running() and self._stop_event is not None:
             self._loop.call_soon_threadsafe(self._stop_event.set)
         for pipeline in list(self._pipelines.values()):
@@ -562,11 +598,15 @@ class SinkBackend:
 
         cmd = [
             exe,
-            str(usb_index),
-            self._device_name,
-            self._bt_address,
-            str(self._max_bitpool),
-            "1" if self._debug else "0",
+            str(usb_index),                              # argv[1]
+            self._device_name,                           # argv[2]
+            self._bt_address,                            # argv[3]
+            str(self._max_bitpool),                      # argv[4]
+            "1" if self._debug else "0",                 # argv[5]
+            format(self._class_of_device, "X"),          # argv[6] CoD hex (e.g. "240418")
+            str(self._sbc_block_length),                 # argv[7] 4/8/12/16
+            str(self._sbc_subbands),                     # argv[8] 4 or 8
+            "0" if self._sbc_allocation == "snr" else "1",  # argv[9] 0=SNR,1=Loudness
         ]
         self._log(f"Launching BTstack: {Path(exe).name} (usb:{usb_index})")
 
