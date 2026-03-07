@@ -611,8 +611,8 @@ class WinUSBDialog(ctk.CTkToplevel):
         ctk.CTkLabel(
             self,
             text=(
-                "Windows requires the WinUSB driver so Bumble can access\n"
-                "the Bluetooth USB dongle directly."
+                "Windows requires the WinUSB driver so btstack_sink.exe\n"
+                "can access the Bluetooth USB dongle directly."
             ),
             wraplength=480, justify="left", anchor="w",
         ).pack(fill="x", padx=20, pady=(16, 4))
@@ -850,6 +850,101 @@ class PairingDialog(ctk.CTkToplevel):
 
 
 # ---------------------------------------------------------------------------
+# Per-device card widget
+# ---------------------------------------------------------------------------
+
+class DeviceCard(ctk.CTkFrame):
+    """
+    Compact card shown for each connected Bluetooth source.
+
+    Layout (inside a CTkScrollableFrame):
+      Row 1:  device name (bold) · codec badge (SBC/AAC) · audio output dropdown
+      Row 2:  Now-playing metadata line  (hidden when empty)
+      Row 3:  MAC address in small grey text
+    """
+
+    def __init__(
+        self,
+        parent,
+        name: str,
+        addr: str,
+        on_route_change,  # Callable[[addr: str, device_index: Optional[int]], None]
+        **kwargs,
+    ):
+        super().__init__(parent, corner_radius=8, **kwargs)
+        self._addr = addr
+        self._on_route_change = on_route_change
+
+        # ── Row 1: name + codec + audio route ──────────────────────────
+        row1 = ctk.CTkFrame(self, fg_color="transparent")
+        row1.pack(fill="x", padx=8, pady=(6, 0))
+
+        self._name_label = ctk.CTkLabel(
+            row1, text=name,
+            font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
+        )
+        self._name_label.pack(side="left", fill="x", expand=True)
+
+        self._codec_badge = ctk.CTkLabel(
+            row1, text="SBC", width=36,
+            font=ctk.CTkFont(size=10), text_color="#9CA3AF",
+        )
+        self._codec_badge.pack(side="left", padx=(4, 4))
+
+        names, self._out_indices = self._enum_outputs()
+        self._route_var = ctk.StringVar(value=names[0])
+        self._route_menu = ctk.CTkOptionMenu(
+            row1, values=names, variable=self._route_var,
+            width=140, height=24, font=ctk.CTkFont(size=11),
+            command=self._on_route_selected,
+        )
+        self._route_menu.pack(side="left")
+
+        # ── Row 2: metadata ────────────────────────────────────────────
+        self._meta_label = ctk.CTkLabel(
+            self, text="",
+            font=ctk.CTkFont(size=11), text_color="#9CA3AF", anchor="w",
+        )
+        self._meta_label.pack(fill="x", padx=8, pady=(2, 0))
+
+        # ── Row 3: MAC address ─────────────────────────────────────────
+        ctk.CTkLabel(
+            self, text=addr,
+            font=ctk.CTkFont(size=10), text_color="#6B7280", anchor="w",
+        ).pack(fill="x", padx=8, pady=(1, 6))
+
+    # ------------------------------------------------------------------
+
+    def set_codec(self, codec: str) -> None:
+        """Updates the codec badge (e.g. 'SBC', 'AAC')."""
+        self._codec_badge.configure(text=codec.upper())
+
+    def set_metadata(self, title: str, artist: str, album: str) -> None:
+        """Updates the now-playing line; hides it when all fields are empty."""
+        parts = [p.strip() for p in (title, artist, album) if p.strip()]
+        self._meta_label.configure(text="  ·  ".join(parts))
+
+    @staticmethod
+    def _enum_outputs() -> tuple[list[str], list]:
+        """Returns (display_names, device_indices) for all WASAPI output devices."""
+        names: list[str] = ["Default"]
+        indices: list = [None]
+        for i, dev in enumerate(sd.query_devices()):
+            if dev["max_output_channels"] > 0:  # type: ignore[index]
+                names.append(f"{i}: {dev['name']}")  # type: ignore[index]
+                indices.append(i)
+        return names, indices
+
+    def _on_route_selected(self, label: str) -> None:
+        names, indices = self._enum_outputs()
+        try:
+            idx = indices[names.index(label)]
+        except (ValueError, IndexError):
+            idx = None
+        self._on_route_change(self._addr, idx)
+
+
+# ---------------------------------------------------------------------------
 # Main Application Window
 # ---------------------------------------------------------------------------
 
@@ -880,9 +975,11 @@ class App(ctk.CTk):
         self._available_dongles: list[tuple[int, str]] = []
         self._tray_icon: Optional[object] = None
         self._in_tray = False  # Guards against recursive tray transitions
-        self._connected_devices: dict[str, str] = {}  # name -> address
+        self._connected_devices: dict[str, str] = {}  # addr_upper → display name
+        self._device_cards: dict[str, DeviceCard] = {}  # addr_upper → card widget
         self._autostart_bt = start_minimized  # Start BT after dongle scan on autostart
         self._pairing_switch: Optional[ctk.CTkSwitch] = None
+        self._volume_from_source = False  # Suppress feedback when syncing volume
 
         self._build_ui()
         self._log("Ready – scanning USB dongles…")
@@ -977,20 +1074,21 @@ class App(ctk.CTk):
         self._dongle_status.pack(fill="x", padx=20, pady=(0, 4))
 
     def _build_device_section(self) -> None:
-        """Single-line frame showing the currently connected BT source device."""
+        """Scrollable list of per-device cards (name, codec, metadata, audio route)."""
         ctk.CTkLabel(
-            self, text="Connected Device",
+            self, text="Connected Devices",
             font=ctk.CTkFont(size=12), text_color="#9CA3AF", anchor="w",
         ).pack(fill="x", padx=20, pady=(6, 2))
 
-        frame = ctk.CTkFrame(self, corner_radius=8, height=44)
-        frame.pack(fill="x", padx=16, pady=(0, 8))
-        frame.pack_propagate(False)
+        self._device_scroll = ctk.CTkScrollableFrame(self, corner_radius=8, height=110)
+        self._device_scroll.pack(fill="x", padx=16, pady=(0, 8))
 
-        self._device_label = ctk.CTkLabel(
-            frame, text="—", font=ctk.CTkFont(size=14), anchor="w",
+        # Placeholder shown when no device is connected
+        self._placeholder_lbl = ctk.CTkLabel(
+            self._device_scroll, text="—",
+            font=ctk.CTkFont(size=14), text_color="#9CA3AF",
         )
-        self._device_label.pack(fill="both", expand=True, padx=12)
+        self._placeholder_lbl.pack(pady=14)
 
     def _build_level_section(self) -> None:
         """Real-time VU meter progress bar."""
@@ -1183,8 +1281,44 @@ class App(ctk.CTk):
         self._vol_pct_label.configure(text=f"{pct}%")
         vol = value / 100.0
         settings.volume = vol
-        if self._backend:
+        if self._backend and not self._volume_from_source:
             self._backend.set_volume(vol)
+            # Sync AVRCP absolute volume to all connected sources (capped at 127)
+            vol_127 = min(127, round(pct * 127 / 100))
+            self._backend.notify_volume_changed(vol_127)
+
+    def _on_volume_changed_by_source(self, addr: str, vol_127: int) -> None:
+        """Called when a source device sets the absolute volume via AVRCP."""
+        vol_pct = min(100, round(vol_127 * 100 / 127))
+        # Update slider without triggering feedback to the source
+        self._volume_from_source = True
+        self._vol_var.set(float(vol_pct))
+        self._volume_from_source = False
+        self._vol_pct_label.configure(text=f"{vol_pct}%")
+        settings.volume = vol_pct / 100.0
+        if self._backend:
+            self._backend.set_volume(settings.volume)
+
+    def _on_metadata(self, addr: str, meta: dict) -> None:
+        """Called when AVRCP now-playing metadata arrives for a connected device."""
+        card = self._device_cards.get(addr.upper())
+        if card and card.winfo_exists():
+            card.set_metadata(
+                meta.get("title", ""),
+                meta.get("artist", ""),
+                meta.get("album", ""),
+            )
+
+    def _on_audio_start(self, addr: str, codec: str) -> None:
+        """Updates the codec badge on the device card when streaming starts."""
+        card = self._device_cards.get(addr.upper())
+        if card and card.winfo_exists():
+            card.set_codec(codec)
+
+    def _on_route_selected(self, addr: str, device_index) -> None:
+        """Called when the user picks a different audio output for a device."""
+        if self._backend:
+            self._backend.set_device_audio_route(addr, device_index)
 
     # ------------------------------------------------------------------
     # Backend lifecycle
@@ -1229,6 +1363,9 @@ class App(ctk.CTk):
             on_audio_level=lambda l: self.after(0, self._on_audio_level, l),
             on_log=lambda m: self.after(0, self._log, m),
             on_pairing_request=lambda n, a, r: self.after(0, self._on_pairing_request, n, a, r),
+            on_volume_changed=lambda a, v: self.after(0, self._on_volume_changed_by_source, a, v),
+            on_metadata=lambda a, m: self.after(0, self._on_metadata, a, m),
+            on_audio_start=lambda a, c: self.after(0, self._on_audio_start, a, c),
         )
         # Sync the pairing switch state into the new backend before it starts,
         # so the "ready" event sends the correct set_discoverable command.
@@ -1248,11 +1385,15 @@ class App(ctk.CTk):
         self._scan_dongle_btn.configure(state="normal")
         if self._backend:
             self._log("BT stack stopped.")
-            # Stop on a daemon thread so the UI stays responsive during cleanup
             threading.Thread(target=self._backend.stop, daemon=True).start()
             self._backend = None
+        # Destroy all device cards and show placeholder
+        for card in list(self._device_cards.values()):
+            if card.winfo_exists():
+                card.destroy()
+        self._device_cards.clear()
         self._connected_devices.clear()
-        self._device_label.configure(text="—")
+        self._placeholder_lbl.pack(pady=14)
         self._level_bar.set(0)
         self._on_state_change(SinkState.STOPPED)
 
@@ -1267,9 +1408,22 @@ class App(ctk.CTk):
         )
 
     def _on_device_connected(self, name: str, address: str) -> None:
-        self._connected_devices[name] = address
-        self._update_device_label()
-        # Automatically lock out new pairings once any device is connected
+        addr = address.upper()
+        self._connected_devices[addr] = name
+
+        # Hide placeholder
+        self._placeholder_lbl.pack_forget()
+
+        # Create card if not already present (avoid duplicates on reconnect)
+        if addr not in self._device_cards:
+            card = DeviceCard(
+                self._device_scroll, name, addr,
+                on_route_change=self._on_route_selected,
+            )
+            card.pack(fill="x", padx=4, pady=(0, 4))
+            self._device_cards[addr] = card
+
+        # Auto-lock new pairings once a device connects
         if self._pairing_switch and self._pairing_switch.get():
             self._pairing_switch.deselect()
             if self._backend:
@@ -1277,17 +1431,18 @@ class App(ctk.CTk):
             self._log("New pairings: blocked (auto)")
 
     def _on_device_disconnected(self, name: str) -> None:
-        self._connected_devices.pop(name, None)
-        self._update_device_label()
+        addr_to_remove = next(
+            (a for a, n in self._connected_devices.items() if n == name), None
+        )
+        if addr_to_remove:
+            self._connected_devices.pop(addr_to_remove, None)
+            card = self._device_cards.pop(addr_to_remove, None)
+            if card and card.winfo_exists():
+                card.destroy()
+
         if not self._connected_devices:
             self._level_bar.set(0)
-
-    def _update_device_label(self) -> None:
-        if not self._connected_devices:
-            self._device_label.configure(text="—")
-        else:
-            text = "\n".join(f"{n}  ({a})" for n, a in self._connected_devices.items())
-            self._device_label.configure(text=text)
+            self._placeholder_lbl.pack(pady=14)
 
     def _on_audio_level(self, level: float) -> None:
         """

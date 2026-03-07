@@ -23,9 +23,9 @@ Architecture overview
 
 Audio pipeline
 --------------
-btstack_sink.exe stdout (length-prefixed SBC frames)
+btstack_sink.exe stdout (length-prefixed audio frames, SBC or AAC-LATM)
   → _stdout_audio_thread reads frames
-  → SbcAudioPipeline.write_sbc() feeds FFmpeg subprocess
+  → AudioPipeline.write_audio() feeds FFmpeg subprocess
   → background reader thread fills a PCM queue
   → sounddevice OutputStream callback drains the queue in real time
 """
@@ -94,16 +94,17 @@ class SinkState(Enum):
 
 
 # ---------------------------------------------------------------------------
-# SBC Audio Pipeline  (FFmpeg → sounddevice)
+# Audio Pipeline  (FFmpeg → sounddevice)  supports SBC and AAC
 # ---------------------------------------------------------------------------
 
-class SbcAudioPipeline:
+class AudioPipeline:
     """
-    Decodes a stream of SBC frames to PCM and plays it via sounddevice.
+    Decodes a stream of audio frames (SBC or AAC-LATM) to PCM via FFmpeg
+    and plays it via sounddevice.
 
     Thread model
     ------------
-    write_sbc()  is called from the btstack-audio reader thread.
+    write_audio() is called from the btstack-audio reader thread.
     _pcm_reader_loop() runs in its own daemon thread.
     _audio_callback() is called by the sounddevice WASAPI thread.
     A bounded queue decouples the reader from the callback.
@@ -114,11 +115,13 @@ class SbcAudioPipeline:
 
     def __init__(
         self,
+        codec: str = "sbc",         # "sbc" or "aac"
         ffmpeg_exe: str = "ffmpeg",
         latency_ms: int = 150,
         device_index: Optional[int] = None,
         on_level: Optional[Callable[[float], None]] = None,
     ):
+        self._codec = codec
         self._ffmpeg_exe = ffmpeg_exe
         self._latency_ms = latency_ms
         self._device_index = device_index
@@ -130,7 +133,7 @@ class SbcAudioPipeline:
         self._ffmpeg: Optional[subprocess.Popen] = None
         self._reader: Optional[threading.Thread] = None
         self._sd_stream: Optional[sd.OutputStream] = None
-        self._lock = threading.Lock()  # Serialises write_sbc() calls
+        self._lock = threading.Lock()  # Serialises write_audio() calls
         self._active = False
         self._sample_rate = 44100
         self._channels = 2
@@ -178,9 +181,9 @@ class SbcAudioPipeline:
 
         log.info("Audio pipeline stopped")
 
-    def write_sbc(self, data: bytes) -> None:
+    def write_audio(self, data: bytes) -> None:
         """
-        Feeds raw SBC frame data into FFmpeg's stdin.
+        Feeds raw audio frame data (SBC or AAC-LATM) into FFmpeg's stdin.
         Thread-safe; silently discards data if the pipeline is inactive
         or the pipe is broken.
         """
@@ -199,12 +202,13 @@ class SbcAudioPipeline:
     # ------------------------------------------------------------------
 
     def _start_ffmpeg(self, sample_rate: int, channels: int) -> subprocess.Popen:
-        """Launches FFmpeg with SBC input and raw s16le PCM output via pipes."""
+        """Launches FFmpeg with codec-appropriate input and raw s16le PCM output via pipes."""
+        input_fmt = "latm" if self._codec == "aac" else "sbc"
         return subprocess.Popen(
             [
                 self._ffmpeg_exe,
                 "-loglevel", "quiet",
-                "-f", "sbc",        # Input format: raw SBC frames
+                "-f", input_fmt,    # "sbc" or "latm" (AAC-LATM)
                 "-i", "pipe:0",
                 "-f", "s16le",      # Output: signed 16-bit little-endian PCM
                 "-ar", str(sample_rate),
@@ -365,6 +369,9 @@ class SinkBackend:
         on_audio_level: Optional[Callable[[float], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
         on_pairing_request: Optional[Callable] = None,
+        on_volume_changed: Optional[Callable[[str, int], None]] = None,   # addr, vol_0_127
+        on_metadata: Optional[Callable[[str, dict], None]] = None,        # addr, {title,artist,album}
+        on_audio_start: Optional[Callable[[str, str], None]] = None,      # addr, codec
     ):
         # BT / USB parameters
         self._device_name = device_name
@@ -397,6 +404,9 @@ class SinkBackend:
         self._cb_level = on_audio_level
         self._cb_log = on_log
         self._cb_pairing_request = on_pairing_request
+        self._cb_volume_changed = on_volume_changed
+        self._cb_metadata = on_metadata
+        self._cb_audio_start = on_audio_start
 
         # Pairing control
         self._pairing_allowed = True
@@ -405,8 +415,10 @@ class SinkBackend:
         # Runtime state – set during start()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
-        self._pipelines: dict[str, SbcAudioPipeline] = {}  # addr_upper → pipeline
+        self._pipelines: dict[str, AudioPipeline] = {}     # addr_upper → pipeline
         self._connected_addrs: set[str] = set()            # currently connected devices
+        self._codec_types: dict[str, str] = {}             # addr_upper → "sbc" or "aac"
+        self._device_audio_routes: dict[str, Optional[int]] = {}  # addr_upper → sd device index
         self._stop_event: Optional[asyncio.Event] = None
         self._state = SinkState.IDLE
         self._btstack_proc: Optional[subprocess.Popen] = None
@@ -443,6 +455,21 @@ class SinkBackend:
         self._pairing_allowed = allowed
         self._send_btstack_cmd({"cmd": "set_discoverable", "enabled": allowed})
 
+    def notify_volume_changed(self, vol_0_127: int) -> None:
+        """Notify all connected sources of a volume change via AVRCP absolute volume."""
+        self._send_btstack_cmd({"cmd": "set_volume", "volume": vol_0_127})
+
+    def set_device_audio_route(self, addr: str, device_index: Optional[int]) -> None:
+        """Change the sounddevice output for a specific connected source on the fly."""
+        addr = addr.upper()
+        self._device_audio_routes[addr] = device_index
+        pipeline = self._pipelines.get(addr)
+        if pipeline:
+            codec = self._codec_types.get(addr, "sbc")
+            sr = pipeline._sample_rate
+            ch = pipeline._channels
+            self._start_audio_pipeline(addr, sr, ch, codec)
+
     def start(self) -> None:
         """Transitions to STARTING and launches the background daemon thread."""
         if self._state not in (SinkState.IDLE, SinkState.STOPPED, SinkState.ERROR):
@@ -461,6 +488,8 @@ class SinkBackend:
             pipeline.stop()
         self._pipelines.clear()
         self._connected_addrs.clear()
+        self._codec_types.clear()
+        self._device_audio_routes.clear()
         # Kill the subprocess immediately so rapid Start→Stop→Start cycles
         # don't leave zombie btstack_sink.exe processes holding the WinUSB handle.
         proc = self._btstack_proc
@@ -644,7 +673,7 @@ class SinkBackend:
 
             pipeline = self._pipelines.get(addr_str)
             if pipeline:
-                pipeline.write_sbc(sbc_data)
+                pipeline.write_audio(sbc_data)
 
     def _send_btstack_cmd(self, cmd: dict) -> None:
         """Sends a JSON command line to btstack_sink.exe via stdin."""
@@ -697,8 +726,12 @@ class SinkBackend:
             addr = event.get("addr", "").upper()
             sample_rate = event.get("sample_rate", 44100)
             channels = event.get("channels", 2)
-            self._log(f"Stream START [{addr}] → {sample_rate} Hz, {channels} ch")
-            self._start_audio_pipeline(addr, sample_rate, channels)
+            codec = event.get("codec", "sbc")
+            self._codec_types[addr] = codec
+            self._log(f"Stream START [{addr}] → {sample_rate} Hz, {channels} ch [{codec.upper()}]")
+            self._start_audio_pipeline(addr, sample_rate, channels, codec)
+            if self._cb_audio_start:
+                self._cb_audio_start(addr, codec)
 
         elif evt == "audio_stop":
             addr = event.get("addr", "").upper()
@@ -707,11 +740,28 @@ class SinkBackend:
             if pipeline:
                 pipeline.stop()
 
+        elif evt == "volume_changed":
+            addr = event.get("addr", "").upper()
+            volume = int(event.get("volume", 0))
+            if self._cb_volume_changed:
+                self._cb_volume_changed(addr, volume)
+
+        elif evt == "metadata":
+            addr = event.get("addr", "").upper()
+            meta = {
+                "title":  event.get("title", ""),
+                "artist": event.get("artist", ""),
+                "album":  event.get("album", ""),
+            }
+            if self._cb_metadata:
+                self._cb_metadata(addr, meta)
+
         elif evt == "disconnected":
             addr = event.get("addr", "").upper()
             name = event.get("name", addr)
             self._log(f"A2DP disconnected: {name}")
             self._connected_addrs.discard(addr)
+            self._codec_types.pop(addr, None)
             should_remember = self._remember_map.pop(addr, True)
             if not should_remember:
                 # "Allow once" — remove from allowed set so dialog shows again
@@ -792,21 +842,25 @@ class SinkBackend:
                 {"cmd": "deny", "addr": addr_upper, "cid": cid}
             )
 
-    def _start_audio_pipeline(self, addr: str, sample_rate: int, channels: int) -> None:
-        """Creates (or replaces) the per-device SBC audio pipeline."""
+    def _start_audio_pipeline(
+        self, addr: str, sample_rate: int, channels: int, codec: str = "sbc"
+    ) -> None:
+        """Creates (or replaces) the per-device audio pipeline (SBC or AAC)."""
         existing = self._pipelines.pop(addr, None)
         if existing:
             existing.stop()
-        pipeline = SbcAudioPipeline(
+        device_index = self._device_audio_routes.get(addr, self._audio_device_index)
+        pipeline = AudioPipeline(
+            codec=codec,
             ffmpeg_exe=self._ffmpeg_exe,
             latency_ms=self._latency_ms,
-            device_index=self._audio_device_index,
+            device_index=device_index,
             on_level=self._cb_level,
         )
         pipeline.set_volume(self._volume)
         try:
             pipeline.start(sample_rate, channels)
-            self._log(f"Audio pipeline started [{addr}]")
+            self._log(f"Audio pipeline started [{addr}] codec={codec}")
         except Exception as exc:
             self._log(f"Pipeline error [{addr}]: {exc}")
             return
