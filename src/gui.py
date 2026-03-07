@@ -349,11 +349,15 @@ class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, parent: "App"):
         super().__init__(parent)
         self.title("Settings")
-        self.geometry("420x870")
+        self.geometry("420x600")
         self.resizable(False, False)
         self.grab_set()  # Block interaction with the main window
 
         self._device_indices: list[Optional[int]] = []  # parallel to audio dropdown
+
+        # All settings rows go inside this scrollable area
+        self._s = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self._s.pack(fill="both", expand=True)
 
         self._add_device_name_row()
         self._add_bt_address_row()
@@ -365,6 +369,8 @@ class SettingsDialog(ctk.CTkToplevel):
         self._add_audio_device_row()
         self._add_checkboxes()
         self._add_clear_keys_row()
+
+        # Buttons are pinned outside the scroll area at the bottom
         self._add_buttons()
 
     # ------------------------------------------------------------------
@@ -373,43 +379,42 @@ class SettingsDialog(ctk.CTkToplevel):
 
     def _add_device_name_row(self) -> None:
         """Text entry for the Bluetooth advertised name."""
-        ctk.CTkLabel(self, text="Device name", anchor="w").pack(
+        ctk.CTkLabel(self._s, text="Device name", anchor="w").pack(
             fill="x", padx=20, pady=8
         )
         self._name_var = ctk.StringVar(value=settings.device_name)
-        ctk.CTkEntry(self, textvariable=self._name_var).pack(
+        ctk.CTkEntry(self._s, textvariable=self._name_var).pack(
             fill="x", padx=20, pady=0
         )
 
     def _add_bt_address_row(self) -> None:
-        """Text entry for the local Bluetooth address used by bumble."""
-        ctk.CTkLabel(self, text="Bluetooth address", anchor="w").pack(
+        """Text entry for the local Bluetooth address."""
+        ctk.CTkLabel(self._s, text="Bluetooth address", anchor="w").pack(
             fill="x", padx=20, pady=8
         )
         self._btaddr_var = ctk.StringVar(value=settings.bt_address)
-        ctk.CTkEntry(self, textvariable=self._btaddr_var).pack(
+        ctk.CTkEntry(self._s, textvariable=self._btaddr_var).pack(
             fill="x", padx=20, pady=0
         )
         ctk.CTkLabel(
-            self,
+            self._s,
             text="Format: AA:BB:CC:DD:EE:FF  (change if address conflicts with another device)",
             anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
         ).pack(fill="x", padx=20)
 
     # CoD display names and their corresponding integer CoD values
     _COD_OPTIONS: list[tuple[str, int]] = [
-        ("Headphones (0x240418)",      0x240418),
+        ("Headphones (0x240418)",           0x240418),
         ("Speaker / Loudspeaker (0x240414)", 0x240414),
-        ("Car Audio (0x240420)",       0x240420),
-        ("Wearable Headset (0x240404)", 0x240404),
+        ("Car Audio (0x240420)",             0x240420),
+        ("Wearable Headset (0x240404)",      0x240404),
     ]
 
     def _add_cod_row(self) -> None:
         """Dropdown for the Bluetooth Class of Device advertised to remote devices."""
-        ctk.CTkLabel(self, text="Class of Device", anchor="w").pack(
+        ctk.CTkLabel(self._s, text="Class of Device", anchor="w").pack(
             fill="x", padx=20, pady=(8, 0)
         )
-        # Find currently selected label
         current_label = self._COD_OPTIONS[0][0]
         for label, val in self._COD_OPTIONS:
             if val == settings.class_of_device:
@@ -417,22 +422,22 @@ class SettingsDialog(ctk.CTkToplevel):
                 break
         self._cod_var = ctk.StringVar(value=current_label)
         ctk.CTkOptionMenu(
-            self,
+            self._s,
             values=[lbl for lbl, _ in self._COD_OPTIONS],
             variable=self._cod_var,
         ).pack(fill="x", padx=20, pady=0)
         ctk.CTkLabel(
-            self,
+            self._s,
             text="Affects how your PC appears to phones/headsets. Change if a device behaves oddly.",
-            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF", wraplength=380,
+            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF", wraplength=360,
         ).pack(fill="x", padx=20)
 
     def _add_discoverable_timeout_row(self) -> None:
         """Entry for how many seconds to stay discoverable before auto-off."""
-        ctk.CTkLabel(self, text="Discoverable timeout", anchor="w").pack(
+        ctk.CTkLabel(self._s, text="Discoverable timeout", anchor="w").pack(
             fill="x", padx=20, pady=(8, 0)
         )
-        row = ctk.CTkFrame(self, fg_color="transparent")
+        row = ctk.CTkFrame(self._s, fg_color="transparent")
         row.pack(fill="x", padx=20, pady=0)
         self._timeout_var = ctk.StringVar(value=str(settings.discoverable_timeout_s))
         ctk.CTkEntry(row, textvariable=self._timeout_var, width=72).pack(side="left")
@@ -443,17 +448,17 @@ class SettingsDialog(ctk.CTkToplevel):
 
     def _add_latency_row(self) -> None:
         """Slider for the sounddevice output buffer size (in milliseconds)."""
-        ctk.CTkLabel(self, text="Buffer latency", anchor="w").pack(
+        ctk.CTkLabel(self._s, text="Buffer latency", anchor="w").pack(
             fill="x", padx=20, pady=8
         )
         self._latency_var = ctk.IntVar(value=settings.latency_ms)
         ctk.CTkSlider(
-            self, from_=20, to=500, number_of_steps=48,
+            self._s, from_=20, to=500, number_of_steps=48,
             variable=self._latency_var,
             command=self._on_latency_change,
         ).pack(fill="x", padx=20, pady=0)
         self._latency_label = ctk.CTkLabel(
-            self,
+            self._s,
             text=self._latency_text(settings.latency_ms),
             anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
         )
@@ -461,17 +466,17 @@ class SettingsDialog(ctk.CTkToplevel):
 
     def _add_bitpool_row(self) -> None:
         """Slider for the maximum SBC bitpool value (audio quality ceiling)."""
-        ctk.CTkLabel(self, text="Max SBC bitpool", anchor="w").pack(
+        ctk.CTkLabel(self._s, text="Max SBC bitpool", anchor="w").pack(
             fill="x", padx=20, pady=8
         )
         self._bitpool_var = ctk.IntVar(value=settings.max_bitpool)
         ctk.CTkSlider(
-            self, from_=2, to=75, number_of_steps=73,
+            self._s, from_=2, to=75, number_of_steps=73,
             variable=self._bitpool_var,
             command=self._on_bitpool_change,
         ).pack(fill="x", padx=20, pady=0)
         self._bitpool_label = ctk.CTkLabel(
-            self,
+            self._s,
             text=self._bitpool_text(settings.max_bitpool),
             anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
         )
@@ -479,69 +484,67 @@ class SettingsDialog(ctk.CTkToplevel):
 
     def _add_sbc_advanced_row(self) -> None:
         """Dropdowns for fine-grained SBC encoder parameters."""
-        ctk.CTkLabel(self, text="SBC block length", anchor="w").pack(
+        ctk.CTkLabel(self._s, text="SBC block length", anchor="w").pack(
             fill="x", padx=20, pady=(8, 0)
         )
         self._sbc_block_var = ctk.StringVar(value=str(settings.sbc_block_length))
         ctk.CTkOptionMenu(
-            self, values=["4", "8", "12", "16"], variable=self._sbc_block_var,
+            self._s, values=["4", "8", "12", "16"], variable=self._sbc_block_var,
         ).pack(fill="x", padx=20, pady=0)
         ctk.CTkLabel(
-            self, text="4 = lowest latency (gaming)  ·  16 = best quality (music)",
+            self._s, text="4 = lowest latency (gaming)  ·  16 = best quality (music)",
             anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
         ).pack(fill="x", padx=20)
 
-        ctk.CTkLabel(self, text="SBC subbands", anchor="w").pack(
+        ctk.CTkLabel(self._s, text="SBC subbands", anchor="w").pack(
             fill="x", padx=20, pady=(8, 0)
         )
         self._sbc_sub_var = ctk.StringVar(value=str(settings.sbc_subbands))
         ctk.CTkOptionMenu(
-            self, values=["4", "8"], variable=self._sbc_sub_var,
+            self._s, values=["4", "8"], variable=self._sbc_sub_var,
         ).pack(fill="x", padx=20, pady=0)
         ctk.CTkLabel(
-            self, text="4 = faster/lower latency  ·  8 = better frequency resolution",
+            self._s, text="4 = faster/lower latency  ·  8 = better frequency resolution",
             anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
         ).pack(fill="x", padx=20)
 
-        ctk.CTkLabel(self, text="SBC allocation method", anchor="w").pack(
+        ctk.CTkLabel(self._s, text="SBC allocation method", anchor="w").pack(
             fill="x", padx=20, pady=(8, 0)
         )
         alloc_label = "Loudness" if settings.sbc_allocation == "loudness" else "SNR"
         self._sbc_alloc_var = ctk.StringVar(value=alloc_label)
         ctk.CTkOptionMenu(
-            self, values=["Loudness", "SNR"], variable=self._sbc_alloc_var,
+            self._s, values=["Loudness", "SNR"], variable=self._sbc_alloc_var,
         ).pack(fill="x", padx=20, pady=0)
         ctk.CTkLabel(
-            self, text="Loudness = perceptually optimised  ·  SNR = mathematically optimal",
+            self._s, text="Loudness = perceptually optimised  ·  SNR = mathematically optimal",
             anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
         ).pack(fill="x", padx=20)
 
     def _add_audio_device_row(self) -> None:
         """Dropdown listing all WASAPI output devices."""
-        ctk.CTkLabel(self, text="Audio output device", anchor="w").pack(
+        ctk.CTkLabel(self._s, text="Audio output device", anchor="w").pack(
             fill="x", padx=20, pady=8
         )
         display_names, self._device_indices = self._enumerate_output_devices()
-
-        # Pre-select the currently configured device
         current_idx = self._index_of_current_device(self._device_indices)
         self._audio_var = ctk.StringVar(value=display_names[current_idx])
         ctk.CTkOptionMenu(
-            self, values=display_names, variable=self._audio_var
+            self._s, values=display_names, variable=self._audio_var
         ).pack(fill="x", padx=20, pady=0)
 
     def _add_checkboxes(self) -> None:
         """Debug mode and autostart toggle checkboxes."""
         self._debug_var = ctk.BooleanVar(value=settings.debug_mode)
         ctk.CTkCheckBox(
-            self,
+            self._s,
             text="Debug log (shows AVDTP/L2CAP protocol)",
             variable=self._debug_var,
         ).pack(anchor="w", padx=20, pady=(16, 0))
 
         self._autostart_var = ctk.BooleanVar(value=settings.autostart)
         ctk.CTkCheckBox(
-            self,
+            self._s,
             text="Start with Windows (autostart, minimized to tray)",
             variable=self._autostart_var,
         ).pack(anchor="w", padx=20, pady=(8, 0))
@@ -549,11 +552,11 @@ class SettingsDialog(ctk.CTkToplevel):
     def _add_clear_keys_row(self) -> None:
         """Button to wipe all saved bonding keys."""
         ctk.CTkButton(
-            self,
+            self._s,
             text="Clear saved devices (delete keys.json)",
             fg_color="#374151", hover_color="#6B7280",
             command=self._clear_keys,
-        ).pack(fill="x", padx=20, pady=(20, 0))
+        ).pack(fill="x", padx=20, pady=(20, 8))
 
     def _clear_keys(self) -> None:
         deleted = []
