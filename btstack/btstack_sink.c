@@ -414,10 +414,10 @@ static void on_avrcp_controller_event(uint8_t packet_type, uint16_t channel,
     case AVRCP_SUBEVENT_CONNECTION_ESTABLISHED: {
         if (avrcp_subevent_connection_established_get_status(packet) != ERROR_CODE_SUCCESS) break;
         uint16_t avrcp_cid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
-        /* Register for track-changed notification and fetch current track */
+        /* Register for track-changed notifications only; metadata arrives
+           when the notification fires (avoid immediate command collision). */
         avrcp_controller_enable_notification(avrcp_cid,
             AVRCP_NOTIFICATION_EVENT_TRACK_CHANGED);
-        avrcp_controller_get_now_playing_info(avrcp_cid);
         break;
     }
 
@@ -514,10 +514,15 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
         memcpy(conn->addr, bd, 6);
         addr_to_str(bd, conn->addr_str);
 
+        /* Emit connected with address only — name arrives asynchronously */
         snprintf(evt, sizeof(evt),
                  "{\"event\":\"connected\",\"addr\":\"%s\",\"name\":\"%s\"}",
                  conn->addr_str, conn->addr_str);
         emit_event(evt);
+
+        /* Request the human-readable device name; result via
+           HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE in on_hci_event */
+        gap_remote_name_request(bd, HCI_EVENT_PAGE_SCAN_REPETITION_MODE_R1, 0);
         break;
     }
 
@@ -712,6 +717,25 @@ static void on_hci_event(uint8_t packet_type, uint16_t channel,
             gap_ssp_confirmation_response(bd);
         }
         break;
+
+    case HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE: {
+        /* packet[2]=status, packet[3..8]=BD_ADDR, packet[9..]=name */
+        if (packet[2] != ERROR_CODE_SUCCESS) break;
+        bd_addr_t bd;
+        reverse_bd_addr(&packet[3], bd);
+        char addr_s[18];
+        addr_to_str(bd, addr_s);
+        /* Name is null-terminated UTF-8, up to 248 bytes */
+        char name_safe[249];
+        strncpy(name_safe, (const char *)&packet[9], 248);
+        name_safe[248] = '\0';
+        char name_evt[320];
+        snprintf(name_evt, sizeof(name_evt),
+                 "{\"event\":\"name\",\"addr\":\"%s\",\"name\":\"%s\"}",
+                 addr_s, name_safe);
+        emit_event(name_evt);
+        break;
+    }
 
     default:
         break;
