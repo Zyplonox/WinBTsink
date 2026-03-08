@@ -122,6 +122,11 @@ typedef struct {
 
 static pending_conn_t g_pending[MAX_CONNECTIONS];
 
+/* AVRCP may connect before AVDTP is accepted (separate L2CAP PSM).
+ * Store addr→avrcp_cid pairs here; moved to conn once A2DP establishes. */
+typedef struct { uint8_t addr[6]; uint16_t cid; int valid; } avrcp_early_t;
+static avrcp_early_t g_early_avrcp[MAX_CONNECTIONS];
+
 /* -------------------------------------------------------------------------
  * Global state
  * ---------------------------------------------------------------------- */
@@ -361,9 +366,23 @@ static void on_avrcp_event(uint8_t packet_type, uint16_t channel,
         uint16_t avrcp_cid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
         bd_addr_t bd;
         avrcp_subevent_connection_established_get_bd_addr(packet, bd);
+        emit_log("avrcp: connected (audio may still be pending approval)");
+
         a2dp_conn_t *conn = find_conn_by_addr(bd);
-        if (conn && conn->avrcp_cid == 0) {
-            conn->avrcp_cid = avrcp_cid;
+        if (conn) {
+            /* A2DP already established — link avrcp_cid straight to conn */
+            if (conn->avrcp_cid == 0) conn->avrcp_cid = avrcp_cid;
+        } else {
+            /* A2DP not yet established (AVRCP arrived before AVDTP accept).
+             * Park the cid; A2DP handler will pick it up when conn is allocated. */
+            for (int i = 0; i < MAX_CONNECTIONS; i++) {
+                if (!g_early_avrcp[i].valid) {
+                    memcpy(g_early_avrcp[i].addr, bd, 6);
+                    g_early_avrcp[i].cid   = avrcp_cid;
+                    g_early_avrcp[i].valid = 1;
+                    break;
+                }
+            }
         }
         /* Volume-change notifications (target role) */
         avrcp_target_support_event(avrcp_cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
@@ -377,6 +396,13 @@ static void on_avrcp_event(uint8_t packet_type, uint16_t channel,
         uint16_t avrcp_cid = avrcp_subevent_connection_released_get_avrcp_cid(packet);
         a2dp_conn_t *conn = find_conn_by_avrcp_cid(avrcp_cid);
         if (conn) conn->avrcp_cid = 0;
+        /* Also clear from early-AVRCP table if it was never promoted */
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (g_early_avrcp[i].valid && g_early_avrcp[i].cid == avrcp_cid) {
+                g_early_avrcp[i].valid = 0;
+                break;
+            }
+        }
         break;
     }
 
@@ -526,6 +552,15 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
         conn->a2dp_cid = cid;
         memcpy(conn->addr, bd, 6);
         addr_to_str(bd, conn->addr_str);
+
+        /* Promote any AVRCP connection that arrived before AVDTP was accepted */
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (g_early_avrcp[i].valid && memcmp(g_early_avrcp[i].addr, bd, 6) == 0) {
+                conn->avrcp_cid        = g_early_avrcp[i].cid;
+                g_early_avrcp[i].valid = 0;
+                break;
+            }
+        }
 
         /* Emit connected with address only — name arrives asynchronously */
         snprintf(evt, sizeof(evt),
@@ -1018,27 +1053,15 @@ int main(int argc, char *argv[]) {
 
     /* Register SBC sink stream endpoints (one per simultaneous source) */
     {
-        /* sbc_caps[1] bit layout (A2DP spec):
-         *   bits 7-4: block lengths (bit7=16, bit6=12, bit5=8, bit4=4)
-         *   bits 3-2: subbands     (bit3=8, bit2=4)
-         *   bits 1-0: alloc method (bit1=SNR, bit0=Loudness)
-         * Advertising a single bit forces the source to use that value. */
-        static const struct { int val; uint8_t bit; } blk_map[] =
-            {{4,0x10},{8,0x20},{12,0x40},{16,0x80}};
-        uint8_t block_bit = 0xF0; /* default: all */
-        for (int i = 0; i < 4; i++) {
-            if (blk_map[i].val == g_sbc_block_length) { block_bit = blk_map[i].bit; break; }
-        }
-        uint8_t sub_bit   = (g_sbc_subbands == 4) ? 0x04 : 0x08;
-        uint8_t alloc_bit = (g_sbc_alloc    == 0) ? 0x02 : 0x01; /* 0=SNR, 1=Loudness */
-
+        /* Advertise all SBC combinations so any source can connect.
+         * The user's SBC preferences (g_sbc_block_length etc.) are logged
+         * at startup but not enforced here — FFmpeg decodes any combination. */
         static uint8_t sbc_caps[4] = {
             0xFF,  /* all sample rates + all channel modes */
-            0xFF,  /* overwritten below */
+            0xFF,  /* all block lengths, subbands, allocation methods */
             2,     /* min bitpool */
             53     /* max bitpool — overwritten below */
         };
-        sbc_caps[1] = block_bit | sub_bit | alloc_bit;
         sbc_caps[3] = (uint8_t)g_max_bitpool;
 
         for (int i = 0; i < MAX_CONNECTIONS; i++) {
