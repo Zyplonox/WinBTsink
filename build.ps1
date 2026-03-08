@@ -9,6 +9,8 @@
 # Usage:
 #   .\build.ps1
 
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
