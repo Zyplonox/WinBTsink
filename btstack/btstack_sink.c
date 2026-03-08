@@ -522,7 +522,7 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
 
         /* Request the human-readable device name; result via
            HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE in on_hci_event */
-        gap_remote_name_request(bd, HCI_EVENT_PAGE_SCAN_REPETITION_MODE_R1, 0);
+        gap_remote_name_request(bd, 0x01 /* page scan repetition mode R1 */, 0);
         break;
     }
 
