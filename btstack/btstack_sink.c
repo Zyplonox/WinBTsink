@@ -127,27 +127,10 @@ static pending_conn_t g_pending[MAX_CONNECTIONS];
 typedef struct { uint8_t addr[6]; uint16_t cid; int valid; } avrcp_early_t;
 static avrcp_early_t g_early_avrcp[MAX_CONNECTIONS];
 
-/* -------------------------------------------------------------------------
- * AVRCP connection state
- *
- * g_early_avrcp[]: AVRCP arrived before A2DP signaling established.
- *                  Promoted into conn->avrcp_cid when A2DP establishes.
- *
- * g_pending_avrcp[]: AVRCP L2CAP connection waiting for the user to
- *                    approve/deny the AVDTP connection.
+/* Pending AVRCP connections awaiting AVDTP approval.
  *   valid=0  empty
  *   valid=1  AVRCP l2cap_cid parked, waiting for AVDTP decision
- *   valid=2  AVDTP approved, AVRCP has not arrived yet (pre-approve)
- * ---------------------------------------------------------------------- */
-
-typedef struct {
-    int      valid;
-    uint16_t cid;
-    uint8_t  addr[6];
-} avrcp_early_t;
-
-static avrcp_early_t g_early_avrcp[MAX_CONNECTIONS];
-
+ *   valid=2  AVDTP approved, AVRCP has not arrived yet (pre-approve) */
 typedef struct {
     int      valid;        /* 0=empty, 1=pending cid, 2=AVDTP-approved await AVRCP */
     uint16_t l2cap_cid;
