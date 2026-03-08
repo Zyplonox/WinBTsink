@@ -128,6 +128,35 @@ typedef struct { uint8_t addr[6]; uint16_t cid; int valid; } avrcp_early_t;
 static avrcp_early_t g_early_avrcp[MAX_CONNECTIONS];
 
 /* -------------------------------------------------------------------------
+ * AVRCP connection state
+ *
+ * g_early_avrcp[]: AVRCP arrived before A2DP signaling established.
+ *                  Promoted into conn->avrcp_cid when A2DP establishes.
+ *
+ * g_pending_avrcp[]: AVRCP L2CAP connection waiting for the user to
+ *                    approve/deny the AVDTP connection.
+ *   valid=0  empty
+ *   valid=1  AVRCP l2cap_cid parked, waiting for AVDTP decision
+ *   valid=2  AVDTP approved, AVRCP has not arrived yet (pre-approve)
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+    int      valid;
+    uint16_t cid;
+    uint8_t  addr[6];
+} avrcp_early_t;
+
+static avrcp_early_t g_early_avrcp[MAX_CONNECTIONS];
+
+typedef struct {
+    int      valid;        /* 0=empty, 1=pending cid, 2=AVDTP-approved await AVRCP */
+    uint16_t l2cap_cid;
+    uint8_t  addr[6];
+} pending_avrcp_t;
+
+static pending_avrcp_t g_pending_avrcp[MAX_CONNECTIONS];
+
+/* -------------------------------------------------------------------------
  * Global state
  * ---------------------------------------------------------------------- */
 
@@ -347,6 +376,52 @@ static void on_avdtp_incoming_connection(uint16_t local_cid, bd_addr_t addr) {
 }
 
 /* -------------------------------------------------------------------------
+ * AVRCP deferred-accept API  (patched into btstack-src/src/classic/avrcp.c)
+ * ---------------------------------------------------------------------- */
+
+extern void avrcp_register_incoming_connection_handler(
+    void (*handler)(uint16_t local_cid, bd_addr_t addr));
+extern void avrcp_accept_incoming_connection(uint16_t local_cid);
+extern void avrcp_decline_incoming_connection(uint16_t local_cid);
+
+/* Called by patched avrcp.c BEFORE L2CAP accept */
+static void on_avrcp_incoming_connection(uint16_t local_cid, bd_addr_t addr) {
+    /* Already an established A2DP connection → auto-accept AVRCP */
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (g_conns[i].active && memcmp(g_conns[i].addr, addr, 6) == 0) {
+            emit_log("avrcp: auto-accepting for established A2DP connection");
+            avrcp_accept_incoming_connection(local_cid);
+            return;
+        }
+    }
+
+    /* AVDTP already approved this addr (pre-approval slot) → auto-accept */
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (g_pending_avrcp[i].valid == 2 &&
+            memcmp(g_pending_avrcp[i].addr, addr, 6) == 0) {
+            emit_log("avrcp: auto-accepting (AVDTP pre-approved)");
+            g_pending_avrcp[i].valid = 0;
+            avrcp_accept_incoming_connection(local_cid);
+            return;
+        }
+    }
+
+    /* Park until AVDTP is approved/denied */
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (!g_pending_avrcp[i].valid) {
+            g_pending_avrcp[i].valid     = 1;
+            g_pending_avrcp[i].l2cap_cid = local_cid;
+            memcpy(g_pending_avrcp[i].addr, addr, 6);
+            emit_log("avrcp: gated — waiting for AVDTP approval");
+            return;
+        }
+    }
+
+    emit_log("avrcp: too many pending connections, declining");
+    avrcp_decline_incoming_connection(local_cid);
+}
+
+/* -------------------------------------------------------------------------
  * AVRCP shared event handler (connection established / released)
  * Must be registered with avrcp_register_packet_handler().
  * ---------------------------------------------------------------------- */
@@ -368,6 +443,16 @@ static void on_avrcp_event(uint8_t packet_type, uint16_t channel,
         avrcp_subevent_connection_established_get_bd_addr(packet, bd);
         emit_log("avrcp: connected (audio may still be pending approval)");
 
+        /* Clear any pre-approval slot for this address */
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (g_pending_avrcp[i].valid == 2 &&
+                memcmp(g_pending_avrcp[i].addr, bd, 6) == 0) {
+                g_pending_avrcp[i].valid = 0;
+                break;
+            }
+        }
+
+        /* Link into established A2DP connection, or park in early table */
         a2dp_conn_t *conn = find_conn_by_addr(bd);
         if (conn) {
             /* A2DP already established — link avrcp_cid straight to conn */
@@ -389,6 +474,7 @@ static void on_avrcp_event(uint8_t packet_type, uint16_t channel,
         /* Track-change notifications (controller role) — metadata arrives on event */
         avrcp_controller_enable_notification(avrcp_cid,
             AVRCP_NOTIFICATION_EVENT_TRACK_CHANGED);
+        avrcp_controller_get_now_playing_info(avrcp_cid);
         break;
     }
 
@@ -735,7 +821,7 @@ static void on_hci_event(uint8_t packet_type, uint16_t channel,
             snprintf(evt, sizeof(evt),
                      "{\"event\":\"ready\",\"address\":\"%s\"}", addr_str);
             emit_event(evt);
-            emit_log(g_debug ? "build: aac+avrcp+debug v9" : "build: aac+avrcp v9");
+            emit_log(g_debug ? "build: aac+avrcp+debug v10" : "build: aac+avrcp v10");
 
             /* Apply initial discoverability (off by default, Python will
                send set_discoverable when the GUI toggle is set). */
@@ -850,17 +936,55 @@ static void process_command(const char *line) {
     if (strcmp(cmd, "approve") == 0) {
         pending_conn_t *p = find_pending_by_cid(cid);
         if (p) {
+            uint8_t addr[6];
+            memcpy(addr, p->addr, 6);
             emit_log("avdtp: accepting incoming connection");
             avdtp_accept_incoming_connection(p->l2cap_cid);
             p->valid = 0;
+
+            /* Also accept any pending AVRCP for the same address */
+            int avrcp_handled = 0;
+            for (int i = 0; i < MAX_CONNECTIONS; i++) {
+                if (g_pending_avrcp[i].valid == 1 &&
+                    memcmp(g_pending_avrcp[i].addr, addr, 6) == 0) {
+                    emit_log("avrcp: accepting (AVDTP approved)");
+                    avrcp_accept_incoming_connection(g_pending_avrcp[i].l2cap_cid);
+                    g_pending_avrcp[i].valid = 0;
+                    avrcp_handled = 1;
+                    break;
+                }
+            }
+            if (!avrcp_handled) {
+                /* AVRCP hasn't arrived yet — pre-approve when it does */
+                for (int i = 0; i < MAX_CONNECTIONS; i++) {
+                    if (!g_pending_avrcp[i].valid) {
+                        g_pending_avrcp[i].valid = 2;
+                        memcpy(g_pending_avrcp[i].addr, addr, 6);
+                        break;
+                    }
+                }
+            }
         }
     }
     else if (strcmp(cmd, "deny") == 0) {
         pending_conn_t *p = find_pending_by_cid(cid);
         if (p) {
+            uint8_t addr[6];
+            memcpy(addr, p->addr, 6);
             emit_log("avdtp: declining incoming connection");
             avdtp_decline_incoming_connection(p->l2cap_cid);
             p->valid = 0;
+
+            /* Also decline any pending AVRCP for the same address */
+            for (int i = 0; i < MAX_CONNECTIONS; i++) {
+                if (g_pending_avrcp[i].valid == 1 &&
+                    memcmp(g_pending_avrcp[i].addr, addr, 6) == 0) {
+                    emit_log("avrcp: declining (AVDTP denied)");
+                    avrcp_decline_incoming_connection(g_pending_avrcp[i].l2cap_cid);
+                    g_pending_avrcp[i].valid = 0;
+                    break;
+                }
+            }
         }
     }
     else if (strcmp(cmd, "set_discoverable") == 0) {
@@ -1040,12 +1164,13 @@ int main(int argc, char *argv[]) {
     a2dp_sink_init();
     avrcp_init();
     avrcp_register_packet_handler(&on_avrcp_event);          /* shared: connect/disconnect */
+    avrcp_register_incoming_connection_handler(on_avrcp_incoming_connection);
     avrcp_target_init();
     avrcp_target_register_packet_handler(&on_avrcp_target_event);
     avrcp_controller_init();
     avrcp_controller_register_packet_handler(&on_avrcp_controller_event);
 
-    /* Register deferred-accept hook BEFORE a2dp_sink registers its L2CAP service */
+    /* Register AVDTP deferred-accept hook BEFORE a2dp_sink registers its L2CAP service */
     avdtp_register_incoming_connection_handler(on_avdtp_incoming_connection);
 
     a2dp_sink_register_packet_handler(&on_a2dp_sink_event);
