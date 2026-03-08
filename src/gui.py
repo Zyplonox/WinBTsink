@@ -1091,8 +1091,9 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title("BT-AudioSink")
-        self.geometry("480x780")
-        self.resizable(False, False)
+        self.geometry("480x860")
+        self.minsize(480, 700)
+        self.resizable(False, True)
 
         self._backend: Optional[SinkBackend] = None
         self._running = False

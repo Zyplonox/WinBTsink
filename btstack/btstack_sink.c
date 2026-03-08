@@ -342,6 +342,50 @@ static void on_avdtp_incoming_connection(uint16_t local_cid, bd_addr_t addr) {
 }
 
 /* -------------------------------------------------------------------------
+ * AVRCP shared event handler (connection established / released)
+ * Must be registered with avrcp_register_packet_handler().
+ * ---------------------------------------------------------------------- */
+
+static void on_avrcp_event(uint8_t packet_type, uint16_t channel,
+                           uint8_t *packet, uint16_t size) {
+    UNUSED(channel); UNUSED(size);
+    if (packet_type != HCI_EVENT_PACKET) return;
+    if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) return;
+
+    uint8_t subevent = hci_event_avrcp_meta_get_subevent_code(packet);
+
+    switch (subevent) {
+
+    case AVRCP_SUBEVENT_CONNECTION_ESTABLISHED: {
+        if (avrcp_subevent_connection_established_get_status(packet) != ERROR_CODE_SUCCESS) break;
+        uint16_t avrcp_cid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
+        bd_addr_t bd;
+        avrcp_subevent_connection_established_get_bd_addr(packet, bd);
+        a2dp_conn_t *conn = find_conn_by_addr(bd);
+        if (conn && conn->avrcp_cid == 0) {
+            conn->avrcp_cid = avrcp_cid;
+        }
+        /* Volume-change notifications (target role) */
+        avrcp_target_support_event(avrcp_cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
+        /* Track-change notifications (controller role) — metadata arrives on event */
+        avrcp_controller_enable_notification(avrcp_cid,
+            AVRCP_NOTIFICATION_EVENT_TRACK_CHANGED);
+        break;
+    }
+
+    case AVRCP_SUBEVENT_CONNECTION_RELEASED: {
+        uint16_t avrcp_cid = avrcp_subevent_connection_released_get_avrcp_cid(packet);
+        a2dp_conn_t *conn = find_conn_by_avrcp_cid(avrcp_cid);
+        if (conn) conn->avrcp_cid = 0;
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+/* -------------------------------------------------------------------------
  * AVRCP Target event handler (volume sync)
  * ---------------------------------------------------------------------- */
 
@@ -355,27 +399,6 @@ static void on_avrcp_target_event(uint8_t packet_type, uint16_t channel,
     char evt[256];
 
     switch (subevent) {
-
-    case AVRCP_SUBEVENT_CONNECTION_ESTABLISHED: {
-        if (avrcp_subevent_connection_established_get_status(packet) != ERROR_CODE_SUCCESS) break;
-        uint16_t avrcp_cid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
-        bd_addr_t bd;
-        avrcp_subevent_connection_established_get_bd_addr(packet, bd);
-        a2dp_conn_t *conn = find_conn_by_addr(bd);
-        if (conn && conn->avrcp_cid == 0) {
-            conn->avrcp_cid = avrcp_cid;
-        }
-        /* Tell BTstack we support volume-changed notifications */
-        avrcp_target_support_event(avrcp_cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
-        break;
-    }
-
-    case AVRCP_SUBEVENT_CONNECTION_RELEASED: {
-        uint16_t avrcp_cid = avrcp_subevent_connection_released_get_avrcp_cid(packet);
-        a2dp_conn_t *conn = find_conn_by_avrcp_cid(avrcp_cid);
-        if (conn) conn->avrcp_cid = 0;
-        break;
-    }
 
     case AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED: {
         /* Source is setting our volume (SET_ABSOLUTE_VOLUME) */
@@ -410,16 +433,6 @@ static void on_avrcp_controller_event(uint8_t packet_type, uint16_t channel,
     uint8_t subevent = hci_event_avrcp_meta_get_subevent_code(packet);
 
     switch (subevent) {
-
-    case AVRCP_SUBEVENT_CONNECTION_ESTABLISHED: {
-        if (avrcp_subevent_connection_established_get_status(packet) != ERROR_CODE_SUCCESS) break;
-        uint16_t avrcp_cid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
-        /* Register for track-changed notifications only; metadata arrives
-           when the notification fires (avoid immediate command collision). */
-        avrcp_controller_enable_notification(avrcp_cid,
-            AVRCP_NOTIFICATION_EVENT_TRACK_CHANGED);
-        break;
-    }
 
     case AVRCP_SUBEVENT_NOTIFICATION_TRACK_CHANGED: {
         /* Track changed — re-register (one-shot in AVRCP 1.3) and refetch */
@@ -991,6 +1004,7 @@ int main(int argc, char *argv[]) {
     /* A2DP Sink + AVRCP (Target + Controller) */
     a2dp_sink_init();
     avrcp_init();
+    avrcp_register_packet_handler(&on_avrcp_event);          /* shared: connect/disconnect */
     avrcp_target_init();
     avrcp_target_register_packet_handler(&on_avrcp_target_event);
     avrcp_controller_init();
