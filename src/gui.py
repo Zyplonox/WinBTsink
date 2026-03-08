@@ -999,8 +999,10 @@ class DeviceCard(ctk.CTkFrame):
         row1 = ctk.CTkFrame(self, fg_color="transparent")
         row1.pack(fill="x", padx=8, pady=(6, 0))
 
+        # Show "Unknown Device" when the name hasn't been resolved yet
+        display_name = name if name != addr else "Unknown Device"
         self._name_label = ctk.CTkLabel(
-            row1, text=name,
+            row1, text=display_name,
             font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
         )
         self._name_label.pack(side="left", fill="x", expand=True)
@@ -1027,13 +1029,17 @@ class DeviceCard(ctk.CTkFrame):
         )
         self._meta_label.pack(fill="x", padx=8, pady=(2, 0))
 
-        # ── Row 3: MAC address ─────────────────────────────────────────
+        # ── Row 3: MAC address (always shown) ──────────────────────────
         ctk.CTkLabel(
             self, text=addr,
             font=ctk.CTkFont(size=10), text_color="#6B7280", anchor="w",
         ).pack(fill="x", padx=8, pady=(1, 6))
 
     # ------------------------------------------------------------------
+
+    def set_name(self, name: str) -> None:
+        """Updates the device name label once the remote name is resolved."""
+        self._name_label.configure(text=name)
 
     def set_codec(self, codec: str) -> None:
         """Updates the codec badge (e.g. 'SBC', 'AAC')."""
@@ -1085,7 +1091,7 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title("BT-AudioSink")
-        self.geometry("480x720")
+        self.geometry("480x780")
         self.resizable(False, False)
 
         self._backend: Optional[SinkBackend] = None
@@ -1435,6 +1441,15 @@ class App(ctk.CTk):
         if card and card.winfo_exists():
             card.set_codec(codec)
 
+    def _on_device_name(self, addr: str, name: str) -> None:
+        """Called when the remote Bluetooth name is resolved for a connected device."""
+        card = self._device_cards.get(addr.upper())
+        if card and card.winfo_exists():
+            card.set_name(name)
+        # Also update the stored display name so disconnect log shows the real name
+        if addr.upper() in self._connected_devices:
+            self._connected_devices[addr.upper()] = name
+
     def _on_route_selected(self, addr: str, device_index) -> None:
         """Called when the user picks a different audio output for a device."""
         if self._backend:
@@ -1492,6 +1507,7 @@ class App(ctk.CTk):
             on_metadata=lambda a, m: self.after(0, self._on_metadata, a, m),
             on_audio_start=lambda a, c: self.after(0, self._on_audio_start, a, c),
             on_pairing_timeout=lambda: self.after(0, self._on_pairing_timeout),
+            on_device_name=lambda a, n: self.after(0, self._on_device_name, a, n),
         )
         # Sync the pairing switch state into the new backend before it starts,
         # so the "ready" event sends the correct set_discoverable command.

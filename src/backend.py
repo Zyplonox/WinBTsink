@@ -373,6 +373,7 @@ class SinkBackend:
         on_metadata: Optional[Callable[[str, dict], None]] = None,        # addr, {title,artist,album}
         on_audio_start: Optional[Callable[[str, str], None]] = None,      # addr, codec
         on_pairing_timeout: Optional[Callable[[], None]] = None,
+        on_device_name: Optional[Callable[[str, str], None]] = None,      # addr, name
         discoverable_timeout_s: int = 0,
         class_of_device: int = 0x240418,
         sbc_block_length: int = 16,
@@ -417,6 +418,7 @@ class SinkBackend:
         self._cb_volume_changed = on_volume_changed
         self._cb_metadata = on_metadata
         self._cb_audio_start = on_audio_start
+        self._cb_device_name = on_device_name
         self._cb_pairing_timeout = on_pairing_timeout
 
         # Pairing / discoverability control
@@ -753,10 +755,16 @@ class SinkBackend:
             cid = event.get("cid", 0)
             asyncio.ensure_future(self._handle_l2cap_request(addr, cid))
 
+        elif evt == "name":
+            addr = event.get("addr", "").upper()
+            name = event.get("name", "")
+            if name and self._cb_device_name:
+                self._cb_device_name(addr, name)
+
         elif evt == "connected":
             addr = event.get("addr", "").upper()
             name = event.get("name", addr)
-            self._log(f"A2DP connected: {name} ({addr})")
+            self._log(f"A2DP connected: {addr}")
             self._connected_addrs.add(addr)
             self._set_state(SinkState.CONNECTED)
             if self._cb_connected:
