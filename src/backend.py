@@ -869,7 +869,7 @@ class SinkBackend:
             if not future.done():
                 loop.call_soon_threadsafe(future.set_result, (approved, remember))
 
-        self._cb_pairing_request(addr_upper, addr_upper, resolve)
+        self._cb_pairing_request("Unknown Device", addr_upper, resolve)
 
         try:
             approved, remember = await asyncio.wait_for(future, timeout=30.0)
