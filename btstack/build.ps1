@@ -6,7 +6,7 @@
     1. Installs MSYS2 (if missing) via direct download.
     2. Installs MinGW-w64 toolchain + CMake inside MSYS2.
     3. Clones BTstack at a pinned commit (if not already present).
-    4. Applies the AVDTP deferred-accept patch (Python script).
+    4. Applies the AVDTP and AVRCP deferred-accept patches (Python scripts).
     5. Runs CMake + make to produce btstack/build/btstack_sink.exe.
 
 .NOTES
@@ -26,7 +26,8 @@ $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
 $BtstackSrc  = Join-Path $ScriptDir "btstack-src"
 $BuildDir    = Join-Path $ScriptDir "build"
-$PatchScript = Join-Path $ScriptDir "patches\apply_avdtp_patch.py"
+$PatchScript      = Join-Path $ScriptDir "patches\apply_avdtp_patch.py"
+$PatchScriptAvrcp = Join-Path $ScriptDir "patches\apply_avrcp_patch.py"
 $ExePath     = Join-Path $BuildDir "btstack_sink.exe"
 
 # Pinned BTstack tag (stable, tested with WinBTsink)
@@ -98,8 +99,8 @@ if (-not (Test-Path $BtstackSrc) -or $Force) {
     Write-Host "BTstack source already present (use -Force to re-clone)." -ForegroundColor DarkGray
 }
 
-# ── Step 4: Apply AVDTP deferred-accept patch ────────────────────────────────
-Write-Step "Applying AVDTP deferred-accept patch..."
+# ── Step 4: Apply AVDTP + AVRCP deferred-accept patches ──────────────────────
+Write-Step "Applying AVDTP + AVRCP deferred-accept patches..."
 
 $python = Get-Command python -ErrorAction SilentlyContinue
 if (-not $python) {
@@ -113,7 +114,12 @@ if (-not $python) {
 if ($LASTEXITCODE -ne 0) {
     throw "AVDTP patch failed."
 }
-Write-Host "Patch applied." -ForegroundColor Green
+
+& $python.Source $PatchScriptAvrcp $BtstackSrc
+if ($LASTEXITCODE -ne 0) {
+    throw "AVRCP patch failed."
+}
+Write-Host "Patches applied." -ForegroundColor Green
 
 # ── Step 5: CMake configure + build ─────────────────────────────────────────
 Write-Step "Building btstack_sink.exe..."
