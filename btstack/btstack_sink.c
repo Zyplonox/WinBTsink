@@ -22,7 +22,9 @@
  *                  {"event":"connected","addr":"..."}
  *                  {"event":"name","addr":"...","name":"iPhone"}     (async, after connected)
  *                  {"event":"disconnected","addr":"..."}
- *                  {"event":"audio_start","addr":"...","sample_rate":44100,"channels":2,"codec":"sbc"}
+ *                  {"event":"audio_start","addr":"...","sample_rate":44100,"channels":2,"codec":"sbc",
+ *                   "block_length":16,"subbands":8,"allocation":"loudness","bitpool":53}
+ *                   (the four SBC fields are present for codec "sbc" only)
  *                  {"event":"audio_stop","addr":"..."}
  *                  {"event":"volume_changed","addr":"...","volume":90}
  *                  {"event":"metadata","addr":"...","title":"...","artist":"...","album":"..."}
@@ -32,6 +34,7 @@
  *
  * Command-line arguments (all optional, positional):
  *   btstack_sink.exe <usb_filter> <device_name> <max_bitpool> <debug> <cod_hex> <keystore_path>
+ *                    <sbc_block_length> <sbc_subbands> <sbc_allocation>
  *     usb_filter     case-insensitive substring of the WinUSB device path that
  *                    selects the dongle, e.g. "vid_0a12&pid_0001#5&2c1f8b6&0&3#".
  *                    Empty = first Bluetooth dongle found.
@@ -41,6 +44,12 @@
  *     cod_hex        Class of Device, hex without prefix (e.g. 240418)
  *     keystore_path  full path of the link-key TLV file. Empty = btstack_keys.db
  *                    next to this executable.
+ *     sbc_block_length  4, 8, 12, 16 or 0 = offer all (source chooses)
+ *     sbc_subbands      4, 8 or 0 = offer all
+ *     sbc_allocation    1 = loudness, 2 = SNR, 0 = offer both
+ *   The SBC settings restrict the capabilities the sink advertises; A2DP
+ *   sources must support every SBC block length, subband count and
+ *   allocation method, so the source then encodes with exactly these values.
  *
  * Shutting down: send {"cmd":"stop"} or simply close stdin; both power off
  * HCI and exit the run loop.
@@ -104,6 +113,11 @@ typedef struct {
     char     addr_str[18];      /* "XX:XX:XX:XX:XX:XX" */
     int      sample_rate;
     int      channels;
+    /* Negotiated SBC parameters (valid when codec_type == AVDTP_CODEC_SBC) */
+    int      sbc_block_length;
+    int      sbc_subbands;
+    int      sbc_allocation;    /* AVDTP_SBC_ALLOCATION_METHOD_LOUDNESS / _SNR */
+    int      sbc_bitpool;       /* max bitpool the source may use */
     /* AVRCP "Now Playing" metadata (accumulated per info-done event) */
     char     meta_title[META_BUF_SIZE];
     char     meta_artist[META_BUF_SIZE];
@@ -169,6 +183,9 @@ static char     g_device_name[64]  = "PC-AudioSink";
 static char     g_usb_filter[256]  = "";
 static char     g_keystore_path[MAX_PATH] = "";
 static int      g_max_bitpool      = 53;
+static int      g_sbc_block_length = 0;  /* 4/8/12/16, 0 = offer all */
+static int      g_sbc_subbands     = 0;  /* 4/8, 0 = offer all */
+static int      g_sbc_allocation   = 0;  /* 1 = loudness, 2 = SNR, 0 = offer both */
 static int      g_discoverable     = 0;  /* set via cmd after ready */
 static int      g_debug            = 0;  /* verbose protocol logging when 1 */
 static uint32_t g_cod              = 0x240418; /* Class of Device: Headphones */
@@ -775,17 +792,22 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
         uint8_t  seid = a2dp_subevent_signaling_media_codec_sbc_configuration_get_local_seid(packet);
         a2dp_conn_t *conn = find_conn_by_cid(cid);
         if (conn) {
-            conn->local_seid  = seid;
-            conn->codec_type  = AVDTP_CODEC_SBC;
-            conn->sample_rate = a2dp_subevent_signaling_media_codec_sbc_configuration_get_sampling_frequency(packet);
-            conn->channels    = a2dp_subevent_signaling_media_codec_sbc_configuration_get_num_channels(packet);
+            conn->local_seid       = seid;
+            conn->codec_type       = AVDTP_CODEC_SBC;
+            conn->sample_rate      = a2dp_subevent_signaling_media_codec_sbc_configuration_get_sampling_frequency(packet);
+            conn->channels         = a2dp_subevent_signaling_media_codec_sbc_configuration_get_num_channels(packet);
+            conn->sbc_block_length = a2dp_subevent_signaling_media_codec_sbc_configuration_get_block_length(packet);
+            conn->sbc_subbands     = a2dp_subevent_signaling_media_codec_sbc_configuration_get_subbands(packet);
+            conn->sbc_allocation   = a2dp_subevent_signaling_media_codec_sbc_configuration_get_allocation_method(packet);
+            conn->sbc_bitpool      = a2dp_subevent_signaling_media_codec_sbc_configuration_get_max_bitpool_value(packet);
             if (g_debug) {
-                char dbg[128];
+                char dbg[160];
                 snprintf(dbg, sizeof(dbg),
-                         "SBC config: seid=%u rate=%d ch=%d bitpool=%u..%u",
+                         "SBC config: seid=%u rate=%d ch=%d blocks=%d subbands=%d alloc=%d bitpool=%u..%d",
                          seid, conn->sample_rate, conn->channels,
+                         conn->sbc_block_length, conn->sbc_subbands, conn->sbc_allocation,
                          a2dp_subevent_signaling_media_codec_sbc_configuration_get_min_bitpool_value(packet),
-                         a2dp_subevent_signaling_media_codec_sbc_configuration_get_max_bitpool_value(packet));
+                         conn->sbc_bitpool);
                 emit_log(dbg);
             }
         }
@@ -816,11 +838,21 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
         uint16_t cid = a2dp_subevent_stream_started_get_a2dp_cid(packet);
         a2dp_conn_t *conn = find_conn_by_cid(cid);
         if (conn) {
-            snprintf(evt, sizeof(evt),
-                     "{\"event\":\"audio_start\",\"addr\":\"%s\","
-                     "\"sample_rate\":%d,\"channels\":%d,\"codec\":\"%s\"}",
-                     conn->addr_str, conn->sample_rate, conn->channels,
-                     conn->codec_type == AVDTP_CODEC_MPEG_2_4_AAC ? "aac" : "sbc");
+            if (conn->codec_type == AVDTP_CODEC_MPEG_2_4_AAC) {
+                snprintf(evt, sizeof(evt),
+                         "{\"event\":\"audio_start\",\"addr\":\"%s\","
+                         "\"sample_rate\":%d,\"channels\":%d,\"codec\":\"aac\"}",
+                         conn->addr_str, conn->sample_rate, conn->channels);
+            } else {
+                snprintf(evt, sizeof(evt),
+                         "{\"event\":\"audio_start\",\"addr\":\"%s\","
+                         "\"sample_rate\":%d,\"channels\":%d,\"codec\":\"sbc\","
+                         "\"block_length\":%d,\"subbands\":%d,\"allocation\":\"%s\",\"bitpool\":%d}",
+                         conn->addr_str, conn->sample_rate, conn->channels,
+                         conn->sbc_block_length, conn->sbc_subbands,
+                         conn->sbc_allocation == AVDTP_SBC_ALLOCATION_METHOD_SNR ? "snr" : "loudness",
+                         conn->sbc_bitpool);
+            }
             emit_event(evt);
         }
         break;
@@ -1219,6 +1251,35 @@ static void stdin_ds_callback(btstack_data_source_t *ds, btstack_data_source_cal
 }
 
 /* -------------------------------------------------------------------------
+ * SBC capability byte 1 from the user's block length / subband / allocation
+ * choice. Bit layout per A2DP §4.3.2 (matches avdtp.h's AVDTP_SBC_* enums):
+ *   bit7 blocks 4, bit6 blocks 8, bit5 blocks 12, bit4 blocks 16,
+ *   bit3 subbands 4, bit2 subbands 8, bit1 SNR, bit0 loudness.
+ * ---------------------------------------------------------------------- */
+
+static uint8_t sbc_capability_byte1(void) {
+    uint8_t b = 0;
+    switch (g_sbc_block_length) {
+        case 4:  b |= AVDTP_SBC_BLOCK_LENGTH_4  << 4; break;
+        case 8:  b |= AVDTP_SBC_BLOCK_LENGTH_8  << 4; break;
+        case 12: b |= AVDTP_SBC_BLOCK_LENGTH_12 << 4; break;
+        case 16: b |= AVDTP_SBC_BLOCK_LENGTH_16 << 4; break;
+        default: b |= 0xF0; break;
+    }
+    switch (g_sbc_subbands) {
+        case 4:  b |= AVDTP_SBC_SUBBANDS_4 << 2; break;
+        case 8:  b |= AVDTP_SBC_SUBBANDS_8 << 2; break;
+        default: b |= 0x0C; break;
+    }
+    switch (g_sbc_allocation) {
+        case 1:  b |= AVDTP_SBC_ALLOCATION_METHOD_LOUDNESS; break;
+        case 2:  b |= AVDTP_SBC_ALLOCATION_METHOD_SNR; break;
+        default: b |= 0x03; break;
+    }
+    return b;
+}
+
+/* -------------------------------------------------------------------------
  * SDP records
  * ---------------------------------------------------------------------- */
 
@@ -1262,6 +1323,9 @@ int main(int argc, char *argv[]) {
     if (argc >= 5)  g_debug       = atoi(argv[4]);
     if (argc >= 6)  g_cod         = (uint32_t)strtoul(argv[5], NULL, 16);
     if (argc >= 7)  strncpy(g_keystore_path, argv[6], sizeof(g_keystore_path) - 1);
+    if (argc >= 8)  g_sbc_block_length = atoi(argv[7]);
+    if (argc >= 9)  g_sbc_subbands     = atoi(argv[8]);
+    if (argc >= 10) g_sbc_allocation   = atoi(argv[9]);
     if (g_max_bitpool < 2 || g_max_bitpool > 250) g_max_bitpool = 53;
 
     /* Default TLV key-store path: next to this executable */
@@ -1322,16 +1386,24 @@ int main(int argc, char *argv[]) {
     a2dp_sink_register_media_handler(&on_a2dp_media_packet);
 
     /* Register SBC sink stream endpoints (one per simultaneous source).
-     * Advertise every SBC combination so any source can connect; FFmpeg
-     * decodes whatever the source picks. Only the bitpool ceiling is
-     * user-configurable. The capability buffers must outlive the endpoints. */
-    static uint8_t sbc_caps[4] = {
-        0xFF,  /* all sample rates + all channel modes */
-        0xFF,  /* all block lengths, subbands, allocation methods */
-        2,     /* min bitpool */
-        0,     /* max bitpool, set from g_max_bitpool below */
-    };
+     * Byte 0: all sample rates + all channel modes. Byte 1: block lengths /
+     * subbands / allocation, narrowed to the user's choice (0 = offer all).
+     * The source must pick from what we offer, so a narrowed capability set
+     * is how the SBC settings take effect. FFmpeg decodes any combination.
+     * The capability buffers must outlive the endpoints. */
+    static uint8_t sbc_caps[4] = { 0xFF, 0x00, 2, 0 };
+    sbc_caps[1] = sbc_capability_byte1();
     sbc_caps[3] = (uint8_t)g_max_bitpool;
+    {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "sbc caps: blocks=%s subbands=%s alloc=%s max_bitpool=%d",
+                 g_sbc_block_length ? (g_sbc_block_length == 4 ? "4" : g_sbc_block_length == 8 ? "8" :
+                                       g_sbc_block_length == 12 ? "12" : "16") : "all",
+                 g_sbc_subbands ? (g_sbc_subbands == 4 ? "4" : "8") : "all",
+                 g_sbc_allocation == 1 ? "loudness" : g_sbc_allocation == 2 ? "snr" : "all",
+                 g_max_bitpool);
+        emit_log(msg);
+    }
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         a2dp_sink_create_stream_endpoint(AVDTP_AUDIO, AVDTP_CODEC_SBC,
                                          sbc_caps, sizeof(sbc_caps),

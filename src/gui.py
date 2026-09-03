@@ -257,6 +257,9 @@ class Settings:
     volume: float = 1.0
     discoverable_timeout_s: int = 0        # 0 = never auto-off
     class_of_device: int = 0x240418        # Headphones by default
+    sbc_block_length: int = 0              # 4/8/12/16, 0 = Auto (source chooses)
+    sbc_subbands: int = 0                  # 4/8, 0 = Auto
+    sbc_allocation: str = "auto"           # "auto", "loudness" or "snr"
 
     #: Keys persisted in config.json and the JSON types accepted for each.
     _PERSIST: dict[str, tuple[type, ...]] = {
@@ -268,6 +271,9 @@ class Settings:
         "volume":                 (int, float),
         "discoverable_timeout_s": (int,),
         "class_of_device":        (int,),
+        "sbc_block_length":       (int,),
+        "sbc_subbands":           (int,),
+        "sbc_allocation":         (str,),
     }
 
     def load(self) -> None:
@@ -338,6 +344,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self._add_discoverable_timeout_row()
         self._add_latency_row()
         self._add_bitpool_row()
+        self._add_sbc_rows()
         self._add_audio_device_row()
         self._add_checkboxes()
         self._add_clear_keys_row()
@@ -438,6 +445,36 @@ class SettingsDialog(ctk.CTkToplevel):
             anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
         )
         self._bitpool_label.pack(fill="x", padx=20)
+
+    # SBC encoder parameters the sink offers to the source. "Auto" advertises
+    # every option and lets the source pick; a fixed value forces it.
+    _SBC_BLOCK_OPTIONS = ["Auto", "4", "8", "12", "16"]
+    _SBC_SUBBAND_OPTIONS = ["Auto", "4", "8"]
+    _SBC_ALLOC_OPTIONS = [("Auto", "auto"), ("Loudness", "loudness"), ("SNR", "snr")]
+
+    def _add_sbc_rows(self) -> None:
+        """Dropdowns for SBC block length, subbands and allocation method."""
+        def row(title: str, values: list[str], current: str, hint: str) -> ctk.StringVar:
+            ctk.CTkLabel(self._s, text=title, anchor="w").pack(fill="x", padx=20, pady=(8, 0))
+            var = ctk.StringVar(value=current)
+            ctk.CTkOptionMenu(self._s, values=values, variable=var).pack(fill="x", padx=20, pady=0)
+            ctk.CTkLabel(self._s, text=hint, anchor="w", font=ctk.CTkFont(size=11),
+                         text_color="#9CA3AF", wraplength=360).pack(fill="x", padx=20)
+            return var
+
+        block = str(settings.sbc_block_length) if settings.sbc_block_length else "Auto"
+        self._sbc_block_var = row(
+            "SBC block length", self._SBC_BLOCK_OPTIONS, block,
+            "4 = lowest latency  ·  16 = best quality (most sources pick 16 on Auto)")
+        sub = str(settings.sbc_subbands) if settings.sbc_subbands else "Auto"
+        self._sbc_sub_var = row(
+            "SBC subbands", self._SBC_SUBBAND_OPTIONS, sub,
+            "4 = lower latency  ·  8 = better frequency resolution")
+        alloc = next((lbl for lbl, val in self._SBC_ALLOC_OPTIONS
+                      if val == settings.sbc_allocation), "Auto")
+        self._sbc_alloc_var = row(
+            "SBC allocation method", [lbl for lbl, _ in self._SBC_ALLOC_OPTIONS], alloc,
+            "Loudness = perceptually optimised  ·  SNR = mathematically optimal")
 
     def _add_audio_device_row(self) -> None:
         """Dropdown listing all WASAPI output devices."""
@@ -554,6 +591,12 @@ class SettingsDialog(ctk.CTkToplevel):
             settings.discoverable_timeout_s = 0
         settings.latency_ms = int(self._latency_var.get())
         settings.max_bitpool = int(self._bitpool_var.get())
+        block = self._sbc_block_var.get()
+        settings.sbc_block_length = int(block) if block != "Auto" else 0
+        sub = self._sbc_sub_var.get()
+        settings.sbc_subbands = int(sub) if sub != "Auto" else 0
+        settings.sbc_allocation = next(
+            (val for lbl, val in self._SBC_ALLOC_OPTIONS if lbl == self._sbc_alloc_var.get()), "auto")
         audio_name = self._audio_var.get()
         settings.audio_device_name = None if audio_name == "Default" else audio_name
         settings.debug_mode = self._debug_var.get()
@@ -928,9 +971,16 @@ class DeviceCard(ctk.CTkFrame):
         """Updates the device name label once the remote name is resolved."""
         self._name_label.configure(text=name)
 
-    def set_codec(self, codec: str) -> None:
-        """Updates the codec badge (e.g. 'SBC', 'AAC')."""
-        self._codec_badge.configure(text=codec.upper())
+    def set_codec(self, codec: str, info: Optional[dict] = None) -> None:
+        """Updates the codec badge, e.g. 'AAC 44.1k' or 'SBC 16/8/L bp53'."""
+        text = codec.upper()
+        info = info or {}
+        if codec == "sbc" and info.get("block_length"):
+            alloc = "S" if info.get("allocation") == "snr" else "L"
+            text = f"SBC {info['block_length']}/{info.get('subbands', '?')}/{alloc} bp{info.get('bitpool', '?')}"
+        elif info.get("sample_rate"):
+            text = f"{text} {info['sample_rate'] / 1000:g}k"
+        self._codec_badge.configure(text=text, width=max(36, 7 * len(text)))
 
     def set_metadata(self, title: str, artist: str, album: str) -> None:
         """Updates the now-playing line; hides it when all fields are empty."""
@@ -1353,11 +1403,11 @@ class App(ctk.CTk):
                 meta.get("album", ""),
             )
 
-    def _on_audio_start(self, addr: str, codec: str) -> None:
+    def _on_audio_start(self, addr: str, codec: str, info: dict) -> None:
         """Updates the codec badge on the device card when streaming starts."""
         card = self._device_cards.get(addr.upper())
         if card and card.winfo_exists():
-            card.set_codec(codec)
+            card.set_codec(codec, info)
 
     def _on_device_name(self, addr: str, name: str) -> None:
         """Called when the remote Bluetooth name is resolved for a connected device."""
@@ -1413,6 +1463,9 @@ class App(ctk.CTk):
             allowed_macs_path=_allowed_macs_file(),
             discoverable_timeout_s=settings.discoverable_timeout_s,
             class_of_device=settings.class_of_device,
+            sbc_block_length=settings.sbc_block_length,
+            sbc_subbands=settings.sbc_subbands,
+            sbc_allocation=settings.sbc_allocation,
             on_state_change=self._ui(gen, self._on_state_change),
             on_device_connected=self._ui(gen, self._on_device_connected),
             on_device_disconnected=self._ui(gen, self._on_device_disconnected),

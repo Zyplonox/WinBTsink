@@ -399,6 +399,9 @@ class SinkBackend:
         allowed_macs_path: Optional[str] = None,
         discoverable_timeout_s: int = 0,
         class_of_device: int = 0x240418,
+        sbc_block_length: int = 0,          # 4/8/12/16, 0 = let the source choose
+        sbc_subbands: int = 0,              # 4/8, 0 = let the source choose
+        sbc_allocation: str = "auto",       # "loudness", "snr" or "auto"
         # Callbacks
         on_state_change: Optional[Callable[[SinkState], None]] = None,
         on_device_connected: Optional[Callable[[str], None]] = None,          # addr
@@ -409,7 +412,7 @@ class SinkBackend:
         on_pairing_request: Optional[Callable[[str, Callable], None]] = None, # addr, resolve(approved, remember)
         on_volume_changed: Optional[Callable[[str, int], None]] = None,       # addr, vol_0_127
         on_metadata: Optional[Callable[[str, dict], None]] = None,            # addr, {title,artist,album}
-        on_audio_start: Optional[Callable[[str, str], None]] = None,          # addr, codec
+        on_audio_start: Optional[Callable[[str, str, dict], None]] = None,    # addr, codec, stream info
         on_pairing_timeout: Optional[Callable[[], None]] = None,
     ):
         # BT / USB parameters
@@ -418,6 +421,9 @@ class SinkBackend:
         self._max_bitpool = max_bitpool
         self._class_of_device = class_of_device
         self._keystore_path = keystore_path
+        self._sbc_block_length = sbc_block_length if sbc_block_length in (4, 8, 12, 16) else 0
+        self._sbc_subbands = sbc_subbands if sbc_subbands in (4, 8) else 0
+        self._sbc_allocation = {"loudness": 1, "snr": 2}.get(sbc_allocation, 0)
 
         # Audio parameters
         self._latency_ms = latency_ms
@@ -602,6 +608,9 @@ class SinkBackend:
             "1" if self._debug else "0",
             format(self._class_of_device, "X"),
             self._keystore_path or "",
+            str(self._sbc_block_length),
+            str(self._sbc_subbands),
+            str(self._sbc_allocation),
         ]
         self._log(f"Launching BTstack: {exe.name}"
                   + (f" (dongle {self._usb_filter})" if self._usb_filter else ""))
@@ -749,10 +758,22 @@ class SinkBackend:
             with self._lock:
                 self._codec_types[addr] = codec
                 self._streaming.add(addr)
-            self._log(f"Stream START [{addr}] → {sample_rate} Hz, {channels} ch [{codec.upper()}]")
+            info = {"sample_rate": sample_rate, "channels": channels}
+            if codec == "sbc" and event.get("block_length"):
+                info.update(
+                    block_length=int(event.get("block_length", 0)),
+                    subbands=int(event.get("subbands", 0)),
+                    allocation=str(event.get("allocation", "")),
+                    bitpool=int(event.get("bitpool", 0)),
+                )
+                detail = (f", SBC {info['block_length']} blocks / {info['subbands']} subbands / "
+                          f"{info['allocation']} / bitpool {info['bitpool']}")
+            else:
+                detail = ""
+            self._log(f"Stream START [{addr}] → {sample_rate} Hz, {channels} ch [{codec.upper()}]{detail}")
             self._start_audio_pipeline(addr, sample_rate, channels, codec)
             if self._cb_audio_start:
-                self._cb_audio_start(addr, codec)
+                self._cb_audio_start(addr, codec, info)
 
         elif evt == "audio_stop":
             self._log(f"Stream STOP [{addr}]")

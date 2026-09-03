@@ -40,6 +40,7 @@ gui.py (Tk mainloop)
   └─ SinkBackend (src/backend.py) — plain threads, no asyncio
        ├─ btstack_sink.exe  (btstack/btstack_sink.c)   spawned via subprocess.Popen
        │     argv   : <usb_filter> <device_name> <max_bitpool> <debug> <cod_hex> <keystore_path>
+       │              <sbc_block_length> <sbc_subbands> <sbc_allocation>   (0 = offer all)
        │     stdin  : JSON command lines  (approve / deny / set_discoverable / set_volume / stop)
        │     stderr : JSON event lines    (ready / l2cap_request / connected / name / audio_start / ...)
        │     stdout : BINARY audio frames [u32le len][6-byte bd_addr][SBC or AAC payload]
