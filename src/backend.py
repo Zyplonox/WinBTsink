@@ -116,11 +116,14 @@ class WavRecorder:
         self._wav: Optional[wave.Wave_write] = None
         self._fmt: Optional[tuple[int, int]] = None
         self._part = 0
+        self._closed = False
         self.path: Optional[Path] = None
         self.frames = 0
 
     def open(self, sample_rate: int, channels: int) -> Path:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("recorder already closed")
             if self._wav is not None and self._fmt == (sample_rate, channels):
                 return self.path  # type: ignore[return-value]
             self._close_locked()
@@ -143,6 +146,7 @@ class WavRecorder:
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             self._close_locked()
 
     def _close_locked(self) -> None:
@@ -202,9 +206,15 @@ class AudioPipeline:
         self._volume: float = 1.0  # Linear multiplier; 1.0 = unity, 2.0 = double
         self.underruns = 0         # callbacks that found the PCM queue empty
         self._pcm_tap: Optional[Callable[[bytes], None]] = None  # e.g. WavRecorder.write
+        self._pcm_tap_error: Optional[Callable[[Exception], None]] = None
 
-    def set_pcm_tap(self, tap: Optional[Callable[[bytes], None]]) -> None:
-        """Receives every decoded PCM block (before volume) on the reader thread."""
+    def set_pcm_tap(self, tap: Optional[Callable[[bytes], None]],
+                    on_error: Optional[Callable[[Exception], None]] = None) -> None:
+        """
+        Receives every decoded PCM block (before volume) on the reader thread.
+        If the tap raises it is detached and on_error is called (reader thread).
+        """
+        self._pcm_tap_error = on_error
         self._pcm_tap = tap
 
     @property
@@ -409,6 +419,12 @@ class AudioPipeline:
                 except Exception as exc:
                     log.warning("pcm tap failed, detaching: %s", exc)
                     self._pcm_tap = None
+                    on_error, self._pcm_tap_error = self._pcm_tap_error, None
+                    if on_error:
+                        try:
+                            on_error(exc)
+                        except Exception:
+                            log.debug("pcm tap error handler failed", exc_info=True)
 
             arr = np.frombuffer(raw, dtype=np.int16)
             if len(arr) < expected:
@@ -781,7 +797,13 @@ class SinkBackend:
             self._recorders[addr] = rec
             pipeline = self._pipelines.get(addr)
         if pipeline:
-            self._attach_recorder(pipeline, rec)
+            try:
+                self._attach_recorder(pipeline, rec)
+            except Exception:
+                with self._lock:
+                    self._recorders.pop(addr, None)
+                rec.close()
+                raise
         self._log(f"Recording {addr} → {base}")
         return base
 
@@ -803,10 +825,17 @@ class SinkBackend:
         with self._lock:
             return addr.upper() in self._recorders
 
-    @staticmethod
-    def _attach_recorder(pipeline: AudioPipeline, rec: WavRecorder) -> None:
+    def _attach_recorder(self, pipeline: AudioPipeline, rec: WavRecorder) -> None:
         rec.open(pipeline.sample_rate, pipeline.channels)
-        pipeline.set_pcm_tap(rec.write)
+
+        def on_error(exc: Exception) -> None:
+            # write failed on the reader thread (disk full, file gone): end the recording
+            addr = next((a for a, r in self._recorders.items() if r is rec), None)
+            self._log(f"Recording error: {exc}")
+            if addr:
+                self.stop_recording(addr)
+
+        pipeline.set_pcm_tap(rec.write, on_error)
 
     # ---- sink-initiated connections -----------------------------------
 
@@ -1107,6 +1136,7 @@ class SinkBackend:
                 auto = self._store.auto_connect_addrs()
             for auto_addr in auto:
                 self.connect_device(auto_addr)
+            self._connect_next()   # requests queued while STARTING
 
         elif evt == "connect_failed":
             self._log(f"Could not connect to {addr} (status {event.get('status', '?')})")
@@ -1387,9 +1417,16 @@ class SinkBackend:
             if rec:
                 try:
                     self._attach_recorder(pipeline, rec)
+                except RuntimeError:
+                    pass   # recorder was stopped meanwhile
                 except OSError as exc:
                     self._log(f"Recording error [{addr}]: {exc}")
                     self.stop_recording(addr)
+                with self._lock:
+                    still = self._recorders.get(addr) is rec
+                if not still:   # stop_recording() raced the attach
+                    pipeline.set_pcm_tap(None)
+                    rec.close()
         self._log(f"Audio pipeline started [{addr}] codec={codec}")
 
     def _stop_pipeline(self, addr: str) -> None:

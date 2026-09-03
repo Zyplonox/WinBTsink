@@ -81,9 +81,11 @@ class ApiServer:
     """Runs a ThreadingHTTPServer on a daemon thread; stop() shuts it down."""
 
     def __init__(self, controller: Any, host: str = "127.0.0.1", port: int = 8765):
+        if not 1 <= int(port) <= 65535:
+            raise ValueError(f"API port out of range: {port}")
         self._controller = controller
         self._host = host
-        self._port = port
+        self._port = int(port)
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -145,6 +147,10 @@ class ApiServer:
 
         self._server = ThreadingHTTPServer((self._host, self._port), Handler)
         self._server.daemon_threads = True
+        # Never join handler threads in server_close(): a handler may be
+        # waiting for the GUI thread (controller.start/stop use after()),
+        # and the GUI thread is the one calling stop() → deadlock.
+        self._server.block_on_close = False
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True, name="api")
         self._thread.start()
         log.info("API listening on %s", self.url)

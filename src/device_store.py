@@ -54,25 +54,41 @@ class DeviceStore:
             if isinstance(data, list):                      # legacy: ["AA:BB:...", ...]
                 self.devices = {str(a).upper(): {"name": "", "volume": 1.0} for a in data}
             elif isinstance(data, dict):
+                devices: dict[str, dict] = {}
                 for addr, info in (data.get("devices") or {}).items():
                     info = info if isinstance(info, dict) else {}
-                    self.devices[str(addr).upper()] = {
+                    try:
+                        volume = float(info.get("volume", 1.0))
+                    except (TypeError, ValueError):
+                        volume = 1.0   # one bad field must not drop the device or the rest
+                    devices[str(addr).upper()] = {
                         "name": str(info.get("name", "")),
-                        "volume": float(info.get("volume", 1.0)),
+                        "volume": max(0.0, min(2.0, volume)),
                         "auto_connect": bool(info.get("auto_connect", False)),
                     }
-                self.forget_keys = [str(a).upper() for a in data.get("forget_keys", [])]
+                self.devices = devices
+                self.forget_keys = [str(a).upper() for a in (data.get("forget_keys") or [])
+                                    if isinstance(a, str)]
             else:
                 raise ValueError("unexpected JSON layout")
         except Exception as exc:
+            self.devices = {}
+            self.forget_keys = []
             self.load_error = f"{self.path.name}: {exc}"
             log.warning("device store unreadable: %s", exc)
 
     def save(self) -> Optional[str]:
-        """Writes the file; returns an error message instead of raising."""
+        """
+        Writes the file; returns an error message instead of raising. An
+        unreadable original is kept as .bak before it is overwritten, so a
+        hand-edited file with a typo is not silently lost.
+        """
         if not self.path:
             return None
         try:
+            if self.load_error and self.path.exists():
+                self.path.replace(self.path.with_suffix(".json.bak"))
+                self.load_error = None
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump({"devices": self.devices, "forget_keys": self.forget_keys},

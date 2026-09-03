@@ -307,6 +307,8 @@ class Settings:
                 continue
             if isinstance(value, types):
                 setattr(self, key, value)
+        if not 1024 <= self.api_port <= 65535:
+            self.api_port = 8765
         self.autostart = get_autostart()
 
     def save(self) -> None:

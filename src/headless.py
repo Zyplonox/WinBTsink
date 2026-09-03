@@ -102,6 +102,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     def on_state(s: SinkState) -> None:
         log.info("state: %s", s.name)
         if s == SinkState.ERROR:
+            state["error"] = True   # exit status 1 so a service wrapper can restart us
             stopped.set()
 
     def start() -> None:
@@ -127,11 +128,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     api: Optional[ApiServer] = None
     port = args.api if args.api is not None else (settings.api_port or 8765)
     if not args.no_api:
-        api = ApiServer(BackendController(lambda: state["backend"], start, stop, settings), port=port)
         try:
+            api = ApiServer(BackendController(lambda: state["backend"], start, stop, settings), port=port)
             api.start()
             log.info("Control API: %s", api.url)
-        except OSError as exc:
+        except (OSError, ValueError, OverflowError) as exc:
             log.warning("API not started (%s)", exc)
             api = None
 
@@ -152,7 +153,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         stop()
         if api:
             api.stop()
-    return 0
+    return 1 if state.get("error") else 0
 
 
 if __name__ == "__main__":

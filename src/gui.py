@@ -1135,6 +1135,7 @@ class App(ctk.CTk):
         self._media_keys: Optional[MediaKeyListener] = None
         self._eq_after: Optional[str] = None   # pending after() id for the EQ debounce
         self._api: Optional[ApiServer] = None
+        self._stop_thread: Optional[threading.Thread] = None
 
         self._build_ui()
         self._log("Ready – scanning USB dongles…")
@@ -1197,10 +1198,10 @@ class App(ctk.CTk):
             stop=lambda: self.after(0, self._stop_backend),
             settings=settings,
         )
-        api = ApiServer(controller, port=settings.api_port)
         try:
+            api = ApiServer(controller, port=settings.api_port)
             api.start()
-        except OSError as exc:
+        except (OSError, ValueError, OverflowError) as exc:
             self._log(f"Control API not started: {exc}")
             return
         self._api = api
@@ -1658,7 +1659,9 @@ class App(ctk.CTk):
                                  for addr, name in choices}
         labels = list(self._connect_choices) or [tr("no remembered devices")]
         self._connect_var.set(labels[0])
-        state = "normal" if (self._running and self._connect_choices) else "disabled"
+        ready = (self._running and self._backend is not None
+                 and self._backend.state in (SinkState.READY, SinkState.CONNECTED))
+        state = "normal" if (ready and self._connect_choices) else "disabled"
         self._connect_menu.configure(values=labels, state=state)
         self._connect_btn.configure(state=state)
 
@@ -1812,6 +1815,9 @@ class App(ctk.CTk):
         """Creates and starts a SinkBackend with the current settings."""
         if self._running:
             return
+        if self._stop_thread is not None and self._stop_thread.is_alive():
+            self._log("Previous engine is still shutting down – try again in a moment.")
+            return
         self._on_dongle_selected(self._dongle_var.get())
         if not settings.usb_filter:
             self._log("No WinUSB dongle selected – scan first.")
@@ -1852,6 +1858,8 @@ class App(ctk.CTk):
 
     def _stop_backend(self) -> None:
         """Stops the backend on a worker thread and resets the UI to idle."""
+        if not self._running and self._backend is None:
+            return   # nothing to stop (e.g. /api/stop while idle)
         self._running = False
         self._backend_gen += 1        # drop callbacks still queued from this backend
         self._start_btn.configure(
@@ -1867,6 +1875,7 @@ class App(ctk.CTk):
             self._log("Stopping BT stack…")
             t = threading.Thread(target=backend.stop, daemon=True, name="bt-stop")
             t.start()
+            self._stop_thread = t
             # The engine needs a few seconds to release the dongle; a Start
             # before that would fail, so keep the button disabled meanwhile.
             self._start_btn.configure(state="disabled")
@@ -1907,6 +1916,7 @@ class App(ctk.CTk):
         if state == SinkState.ERROR:
             self._notify(tr("Error"), tr("The Bluetooth stack stopped with an error. See the log."))
         self._update_tray_tooltip()
+        self._refresh_connect_row()
 
     def _on_device_connected(self, address: str) -> None:
         addr = address.upper()
