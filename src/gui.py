@@ -29,6 +29,7 @@ import sounddevice as sd
 from PIL import Image, ImageDraw
 
 from backend import SinkBackend, SinkState
+from device_store import DeviceStore
 from media_keys import MediaKeyListener
 from usb_devices import list_bluetooth_dongles
 from winusb_installer import download_and_run_zadig, list_native_bt_devices
@@ -352,6 +353,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self._add_sbc_rows()
         self._add_audio_device_row()
         self._add_checkboxes()
+        self._add_devices_rows(parent.device_store)
         self._add_clear_keys_row()
 
         # Buttons are pinned outside the scroll area at the bottom
@@ -529,6 +531,43 @@ class SettingsDialog(ctk.CTkToplevel):
             anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF", wraplength=360,
         ).pack(fill="x", padx=44)
 
+    def _add_devices_rows(self, store: DeviceStore) -> None:
+        """One row per remembered device with a Forget button."""
+        self._store = store
+        ctk.CTkLabel(self._s, text="Remembered devices", anchor="w").pack(
+            fill="x", padx=20, pady=(16, 2)
+        )
+        self._devices_frame = ctk.CTkFrame(self._s, fg_color="transparent")
+        self._devices_frame.pack(fill="x", padx=20)
+        self._render_devices()
+
+    def _render_devices(self) -> None:
+        for w in self._devices_frame.winfo_children():
+            w.destroy()
+        if not self._store.devices:
+            ctk.CTkLabel(self._devices_frame, text="none", anchor="w",
+                         font=ctk.CTkFont(size=11), text_color="#9CA3AF").pack(fill="x")
+            return
+        for addr, info in sorted(self._store.devices.items(), key=lambda kv: kv[1].get("name") or kv[0]):
+            row = ctk.CTkFrame(self._devices_frame, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+            name = info.get("name") or "Unknown device"
+            ctk.CTkLabel(row, text=name, anchor="w", font=ctk.CTkFont(size=12)).pack(side="left")
+            ctk.CTkLabel(row, text=f"  {addr}", anchor="w", font=ctk.CTkFont(size=10),
+                         text_color="#6B7280").pack(side="left")
+            ctk.CTkButton(row, text="Forget", width=64, height=22, font=ctk.CTkFont(size=11),
+                          fg_color="#374151", hover_color="#7F1D1D",
+                          command=lambda a=addr, n=name: self._forget_device(a, n),
+                          ).pack(side="right")
+
+    def _forget_device(self, addr: str, name: str) -> None:
+        self._store.forget(addr)
+        error = self._store.save()
+        self.master._log(  # type: ignore[attr-defined]
+            f"Could not save device list ({error})" if error
+            else f"Forgot {name} ({addr}); its bonding key is dropped on the next start.")
+        self._render_devices()
+
     def _add_clear_keys_row(self) -> None:
         """Button that forgets every paired device (approval list + bonding keys)."""
         ctk.CTkButton(
@@ -536,7 +575,7 @@ class SettingsDialog(ctk.CTkToplevel):
             text="Forget all paired devices",
             fg_color="#374151", hover_color="#6B7280",
             command=self._clear_keys,
-        ).pack(fill="x", padx=20, pady=(20, 0))
+        ).pack(fill="x", padx=20, pady=(12, 0))
         ctk.CTkLabel(
             self._s,
             text="Deletes the remembered-device list and the Bluetooth bonding keys. "
@@ -546,24 +585,21 @@ class SettingsDialog(ctk.CTkToplevel):
 
     def _clear_keys(self) -> None:
         # The dialog can only be opened while the backend is stopped, so
-        # nothing holds these files open.
-        deleted = []
+        # the key store is not in use and can simply be deleted.
+        self._store.forget_all()
         errors = []
-        for path in (_keystore_file(), _allowed_macs_file()):
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-                    deleted.append(os.path.basename(path))
-            except Exception as exc:
-                errors.append(f"{os.path.basename(path)}: {exc}")
-
-        if errors:
-            msg = "Error forgetting devices: " + ", ".join(errors)
-        elif deleted:
-            msg = f"Paired devices forgotten ({', '.join(deleted)}) – all devices must pair again."
-        else:
-            msg = "No paired devices stored (nothing to delete)."
-        self.master._log(msg)  # type: ignore[attr-defined]
+        error = self._store.save()
+        if error:
+            errors.append(error)
+        try:
+            if os.path.exists(_keystore_file()):
+                os.remove(_keystore_file())
+        except Exception as exc:
+            errors.append(f"{os.path.basename(_keystore_file())}: {exc}")
+        self.master._log(  # type: ignore[attr-defined]
+            "Error forgetting devices: " + ", ".join(errors) if errors
+            else "All paired devices forgotten – every device must pair again.")
+        self._render_devices()
 
     def _add_buttons(self) -> None:
         """Cancel / Save button row at the bottom of the dialog."""
@@ -1128,6 +1164,7 @@ class App(ctk.CTk):
         self.resizable(False, True)
 
         self._backend: Optional[SinkBackend] = None
+        self.device_store = DeviceStore(_allowed_macs_file())   # shared with backend + settings
         self._backend_gen = 0           # bumped on every start/stop; stale callbacks are dropped
         self._running = False
         self._level_value = 0.0         # written by the audio thread, read by _poll_level
@@ -1653,7 +1690,7 @@ class App(ctk.CTk):
             ffmpeg_exe=_get_ffmpeg(),
             debug=settings.debug_mode,
             keystore_path=_keystore_file(),
-            allowed_macs_path=_allowed_macs_file(),
+            device_store=self.device_store,
             discoverable_timeout_s=settings.discoverable_timeout_s,
             class_of_device=settings.class_of_device,
             sbc_block_length=settings.sbc_block_length,
@@ -1738,7 +1775,8 @@ class App(ctk.CTk):
 
     def _on_device_connected(self, address: str) -> None:
         addr = address.upper()
-        self._connected_devices.setdefault(addr, addr)   # name arrives later
+        # Remembered devices are shown by their stored name until the fresh one arrives
+        self._connected_devices.setdefault(addr, self.device_store.name(addr) or addr)
 
         # Hide placeholder
         self._placeholder_lbl.pack_forget()
@@ -1754,6 +1792,8 @@ class App(ctk.CTk):
             )
             card.pack(fill="x", padx=4, pady=(0, 4))
             self._device_cards[addr] = card
+            if self._backend:
+                card.set_volume_pct(round(self._backend.device_volume(addr) * 100))
 
         # Auto-lock new pairings once a device connects
         if self._pairing_switch and self._pairing_switch.get():

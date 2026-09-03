@@ -10,6 +10,7 @@
  *                  {"cmd":"set_discoverable","enabled":true}
  *                  {"cmd":"set_volume","addr":"XX:XX:XX:XX:XX:XX","volume":90}
  *                  {"cmd":"player","addr":"XX:XX:XX:XX:XX:XX","action":"play|pause|stop|next|prev"}
+ *                  {"cmd":"forget_key","addr":"XX:XX:XX:XX:XX:XX"}   drop the bonding key
  *                  {"cmd":"stop"}
  *
  * stdout (binary): Audio frames, each prefixed by a header:
@@ -1218,6 +1219,17 @@ static void process_command(const char *line) {
                 snprintf(msg, sizeof(msg), "player: %s failed (0x%02x)", action, rc);
                 emit_log(msg);
             }
+        }
+    }
+    else if (strcmp(cmd, "forget_key") == 0) {
+        bd_addr_t bd;
+        if (sscanf_bd_addr(addr, bd)) {
+            gap_drop_link_key_for_bd_addr(bd);
+            char msg[64];
+            snprintf(msg, sizeof(msg), "forgot bonding key for %s", addr);
+            emit_log(msg);
+        } else {
+            emit_log("forget_key: invalid address");
         }
     }
     else if (strcmp(cmd, "stop") == 0) {

@@ -47,6 +47,8 @@ from typing import Callable, Optional
 import numpy as np
 import sounddevice as sd
 
+from device_store import DeviceStore
+
 log = logging.getLogger("bt-sink.backend")
 
 #: Suppress the FFmpeg/subprocess console window on Windows.
@@ -396,7 +398,7 @@ class SinkBackend:
         ffmpeg_exe: str = "ffmpeg",
         debug: bool = False,
         keystore_path: Optional[str] = None,
-        allowed_macs_path: Optional[str] = None,
+        device_store: Optional[DeviceStore] = None,   # remembered devices (shared with the GUI)
         discoverable_timeout_s: int = 0,
         class_of_device: int = 0x240418,
         sbc_block_length: int = 0,          # 4/8/12/16, 0 = let the source choose
@@ -448,8 +450,9 @@ class SinkBackend:
 
         # Feature flags / persistence
         self._debug = debug
-        self._allowed_macs_path = Path(allowed_macs_path) if allowed_macs_path else None
-        self._allowed_macs: set[str] = self._load_allowed_macs()
+        self._store = device_store if device_store is not None else DeviceStore(None)
+        if self._store.load_error:
+            self._log(f"Could not read remembered devices ({self._store.load_error}); starting with none")
 
         # Pairing / discoverability control
         self._pairing_allowed = True
@@ -620,6 +623,8 @@ class SinkBackend:
 
         self._stop_all_pipelines()
         with self._lock:
+            for addr in self._connected_addrs:
+                self._persist_device_volume(addr)
             self._connected_addrs.clear()
             self._codec_types.clear()
             self._device_audio_routes.clear()
@@ -784,19 +789,30 @@ class SinkBackend:
                 self._send_cmd({"cmd": "set_discoverable", "enabled": self._pairing_allowed})
                 if self._pairing_allowed:
                     self._arm_discoverable_timer()
+                # Bonding keys of devices forgotten while the engine was down
+                pending = self._store.pop_pending_forget()
+                for forget_addr in pending:
+                    self._send_cmd({"cmd": "forget_key", "addr": forget_addr})
+                if pending:
+                    self._save_store()
 
         elif evt == "l2cap_request":
             self._handle_l2cap_request(addr, int(event.get("cid", 0)))
 
         elif evt == "name":
             name = event.get("name", "")
-            if name and self._cb_device_name:
-                self._cb_device_name(addr, name)
+            if name:
+                with self._lock:
+                    if self._store.set_name(addr, name):
+                        self._save_store()
+                if self._cb_device_name:
+                    self._cb_device_name(addr, name)
 
         elif evt == "connected":
             self._log(f"A2DP connected: {addr}")
             with self._lock:
                 self._connected_addrs.add(addr)
+                self._device_volumes.setdefault(addr, self._store.volume(addr))
             self._set_state(SinkState.CONNECTED)
             if self._cb_connected:
                 self._cb_connected(addr)
@@ -850,6 +866,7 @@ class SinkBackend:
         elif evt == "disconnected":
             self._log(f"A2DP disconnected: {addr}")
             with self._lock:
+                self._persist_device_volume(addr)
                 self._connected_addrs.discard(addr)     # before stopping: blocks a
                 self._streaming.discard(addr)           # concurrent pipeline restart
                 self._codec_types.pop(addr, None)
@@ -880,7 +897,7 @@ class SinkBackend:
         Unknown device + pairing disabled → deny.
         Unknown device + pairing enabled → ask the GUI, deny after PAIRING_TIMEOUT_S.
         """
-        if addr in self._allowed_macs or self._session_allowed_ok(addr):
+        if self._store.is_remembered(addr) or self._session_allowed_ok(addr):
             self._log(f"AVDTP: auto-approving known device {addr}")
             self._send_cmd({"cmd": "approve", "addr": addr, "cid": cid})
             return
@@ -928,8 +945,8 @@ class SinkBackend:
                 return
             if approved:
                 if remember:
-                    self._allowed_macs.add(addr)
-                    self._save_allowed_macs()
+                    self._store.remember(addr)
+                    self._save_store()
                 else:
                     self._session_allowed[addr] = time.monotonic()
 
@@ -1039,33 +1056,18 @@ class SinkBackend:
             p.stop()
 
     # ------------------------------------------------------------------
-    # Allowed-MAC persistence
+    # Remembered-device persistence (caller holds self._lock)
     # ------------------------------------------------------------------
 
-    def _load_allowed_macs(self) -> set[str]:
-        path = self._allowed_macs_path
-        if not path or not path.exists():
-            return set()
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = _json.load(f)
-            if isinstance(data, list):
-                return {str(m).upper() for m in data}
-            raise ValueError("expected a JSON list")
-        except Exception as exc:
-            self._log(f"Could not read remembered devices ({path.name}): {exc}")
-            return set()
+    def _save_store(self) -> None:
+        error = self._store.save()
+        if error:
+            self._log(f"Could not save remembered devices ({error})")
 
-    def _save_allowed_macs(self) -> None:
-        path = self._allowed_macs_path
-        if not path:
-            return
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                _json.dump(sorted(self._allowed_macs), f, indent=2)
-        except OSError as exc:
-            self._log(f"Could not save remembered devices ({path.name}): {exc}")
+    def _persist_device_volume(self, addr: str) -> None:
+        vol = self._device_volumes.get(addr)
+        if vol is not None and self._store.set_volume(addr, vol):
+            self._save_store()
 
     # ------------------------------------------------------------------
     # Helpers
