@@ -7,38 +7,39 @@ The GUI communicates exclusively via callbacks and the start() / stop() API.
 Architecture overview
 ---------------------
 ┌─ SinkBackend ──────────────────────────────────────────────────────────┐
-│  start()  → daemon thread → asyncio loop → _async_main()              │
-│                                              ├─ launch btstack_sink.exe│
-│                                              ├─ read stderr (events)   │
-│                                              ├─ read stdout (SBC audio)│
-│                                              └─ wait for stop event    │
+│  start()  → launches btstack_sink.exe and three daemon threads:        │
+│               bt-events  reads stderr JSON lines → _on_btstack_event   │
+│               bt-audio   reads stdout audio frames → AudioPipeline     │
+│               bt-watch   waits for the process, reports a crash        │
+│  stop()   → sends {"cmd":"stop"}, closes stdin, waits, kills if needed │
 │                                                                        │
-│  stop()   → sends {"cmd":"stop"} → joins pipeline                     │
+│  A SinkBackend instance is single-use: start() once, stop() once.      │
 │                                                                        │
-│  Callbacks (always called from the BT thread):                        │
-│    on_state_change, on_device_connected, on_device_disconnected,       │
-│    on_audio_level, on_log                                              │
-│    → GUI must forward these to the Tk mainloop via root.after(0, …)   │
+│  Callbacks fire on the bt-events thread (audio level: on the           │
+│  sounddevice thread). The GUI must marshal them to its own thread.    │
 └────────────────────────────────────────────────────────────────────────┘
 
 Audio pipeline
 --------------
-btstack_sink.exe stdout (length-prefixed audio frames, SBC or AAC-LATM)
-  → _stdout_audio_thread reads frames
-  → AudioPipeline.write_audio() feeds FFmpeg subprocess
-  → background reader thread fills a PCM queue
+btstack_sink.exe stdout (length-prefixed frames, SBC or AAC-LATM, tagged
+with the source address)
+  → bt-audio thread routes each frame to the device's AudioPipeline
+  → AudioPipeline.write_audio() feeds an FFmpeg subprocess (decode to PCM)
+  → pcm-reader thread fills a bounded queue
   → sounddevice OutputStream callback drains the queue in real time
+
+IPC contract with btstack_sink.exe: see the header of btstack/btstack_sink.c.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json as _json
 import logging
 import queue
 import subprocess
 import sys
 import threading
+import time
 from enum import Enum, auto
 from pathlib import Path
 from typing import Callable, Optional
@@ -51,45 +52,23 @@ log = logging.getLogger("bt-sink.backend")
 #: Suppress the FFmpeg/subprocess console window on Windows.
 _POPEN_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
+#: Seconds the backend waits for the GUI to answer a pairing request before
+#: it denies on its own. The GUI dialog auto-denies earlier (30 s); this is
+#: only the safety net for a GUI that never answers.
+PAIRING_TIMEOUT_S = 35
 
-# ---------------------------------------------------------------------------
-# Allowed-MAC persistence  (no BT stack dependency)
-# ---------------------------------------------------------------------------
+#: "Allow once" approvals stay valid this long if the device never actually
+#: connects, so a phone that gives up mid-handshake is asked again later.
+SESSION_ALLOW_TTL_S = 60
 
-def _load_allowed_macs(path: Path) -> set:
-    """Loads the set of previously allowed MAC addresses from disk."""
-    try:
-        if path.exists():
-            with open(path, encoding="utf-8") as f:
-                data = _json.load(f)
-            if isinstance(data, list):
-                return {str(m).upper() for m in data}
-    except Exception as e:
-        log.debug("Load allowed_macs: %s", e)
-    return set()
-
-
-def _save_allowed_macs(macs: set, path: Path) -> None:
-    """Persists the allowed MAC set to disk."""
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            _json.dump(sorted(macs), f, indent=2)
-    except Exception as e:
-        log.debug("Save allowed_macs: %s", e)
-
-
-# ---------------------------------------------------------------------------
-# State machine
-# ---------------------------------------------------------------------------
 
 class SinkState(Enum):
     """Lifecycle states of the SinkBackend."""
     IDLE = auto()       # Not started yet
-    STARTING = auto()   # Thread launched, launching btstack_sink.exe
-    READY = auto()      # BTstack powered on, discoverable, waiting for a source
-    CONNECTED = auto()  # A Bluetooth source is connected and streaming
-    ERROR = auto()      # Unrecoverable error (transport failure, etc.)
+    STARTING = auto()   # Launching btstack_sink.exe
+    READY = auto()      # BTstack powered on, waiting for a source
+    CONNECTED = auto()  # At least one Bluetooth source is connected
+    ERROR = auto()      # Unrecoverable error (transport failure, crash, ...)
     STOPPED = auto()    # Cleanly stopped by the user
 
 
@@ -104,13 +83,13 @@ class AudioPipeline:
 
     Thread model
     ------------
-    write_audio() is called from the btstack-audio reader thread.
+    write_audio() is called from the bt-audio reader thread.
     _pcm_reader_loop() runs in its own daemon thread.
     _audio_callback() is called by the sounddevice WASAPI thread.
     A bounded queue decouples the reader from the callback.
     """
 
-    #: Number of stereo int16 frames delivered to sounddevice per callback.
+    #: Number of frames delivered to sounddevice per callback.
     BLOCK_SIZE = 512
 
     def __init__(
@@ -131,13 +110,20 @@ class AudioPipeline:
         self._pcm_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=500)
 
         self._ffmpeg: Optional[subprocess.Popen] = None
-        self._reader: Optional[threading.Thread] = None
         self._sd_stream: Optional[sd.OutputStream] = None
-        self._lock = threading.Lock()  # Serialises write_audio() calls
+        self._lock = threading.Lock()  # Guards _ffmpeg / _active across threads
         self._active = False
         self._sample_rate = 44100
         self._channels = 2
         self._volume: float = 1.0  # Linear multiplier; 1.0 = unity, 2.0 = double
+
+    @property
+    def sample_rate(self) -> int:
+        return self._sample_rate
+
+    @property
+    def channels(self) -> int:
+        return self._channels
 
     def set_volume(self, volume: float) -> None:
         """Sets the output volume as a linear multiplier in [0.0, 2.0]."""
@@ -149,57 +135,81 @@ class AudioPipeline:
 
     def start(self, sample_rate: int, channels: int) -> None:
         """
-        Starts the FFmpeg subprocess, PCM reader thread, and sounddevice stream.
+        Starts FFmpeg, the sounddevice stream and the PCM reader thread.
+        Raises on failure and leaves nothing running.
         Must only be called once; re-use requires creating a new instance.
         """
         if self._active:
             return
         self._sample_rate = sample_rate
         self._channels = channels
-        log.info("Audio pipeline starting: %d Hz, %d ch", sample_rate, channels)
+        log.info("Audio pipeline starting: %d Hz, %d ch, codec=%s",
+                 sample_rate, channels, self._codec)
 
-        self._ffmpeg = self._start_ffmpeg(sample_rate, channels)
-        self._reader = self._start_reader_thread()
-        self._sd_stream = self._start_sd_stream(sample_rate, channels)
-        self._active = True
+        ffmpeg = self._start_ffmpeg(sample_rate, channels)
+        try:
+            stream = self._start_sd_stream(sample_rate, channels)
+        except Exception:
+            self._close_ffmpeg(ffmpeg, graceful=False)
+            raise
 
-        out_dev = sd.query_devices(kind="output")
-        log.info("Audio output: %s", out_dev["name"])
+        with self._lock:
+            self._ffmpeg = ffmpeg
+            self._sd_stream = stream
+            self._active = True
+        threading.Thread(target=self._pcm_reader_loop, daemon=True,
+                         name="pcm-reader").start()
+        log.info("Audio output: %s", self._output_device_name())
 
     def stop(self) -> None:
         """Stops the stream, drains FFmpeg, and frees all resources."""
-        self._active = False
+        with self._lock:
+            if not self._active:
+                return
+            self._active = False
+            ffmpeg, self._ffmpeg = self._ffmpeg, None
+            stream, self._sd_stream = self._sd_stream, None
 
-        if self._sd_stream:
-            self._sd_stream.stop()
-            self._sd_stream.close()
-            self._sd_stream = None
+        if stream:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as exc:
+                log.debug("sounddevice stream close: %s", exc)
 
-        if self._ffmpeg:
-            self._stop_ffmpeg()
-            self._ffmpeg = None
-
+        if ffmpeg:
+            self._close_ffmpeg(ffmpeg, graceful=True)
+        self._report_level(None)   # VU meter back to zero
         log.info("Audio pipeline stopped")
 
     def write_audio(self, data: bytes) -> None:
         """
         Feeds raw audio frame data (SBC or AAC-LATM) into FFmpeg's stdin.
-        Thread-safe; silently discards data if the pipeline is inactive
-        or the pipe is broken.
+        Called from the single bt-audio thread. The pipe write happens outside
+        the lock: it can block when FFmpeg stalls, and stop() must still be
+        able to kill FFmpeg (which unblocks the write with an OSError).
         """
-        if not self._active or not self._ffmpeg:
-            return
         with self._lock:
-            try:
-                assert self._ffmpeg.stdin
-                self._ffmpeg.stdin.write(data)
-                self._ffmpeg.stdin.flush()
-            except (BrokenPipeError, OSError, AssertionError):
-                pass
+            ffmpeg = self._ffmpeg if self._active else None
+        if not ffmpeg or not ffmpeg.stdin:
+            return
+        try:
+            ffmpeg.stdin.write(data)
+            ffmpeg.stdin.flush()
+        except (OSError, ValueError):
+            pass  # BrokenPipe (FFmpeg gone) or closed file during stop()
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _output_device_name(self) -> str:
+        try:
+            if self._device_index is None:
+                return sd.query_devices(kind="output")["name"]  # type: ignore[index]
+            return sd.query_devices(self._device_index)["name"]  # type: ignore[index]
+        except Exception:
+            return "unknown"
 
     def _start_ffmpeg(self, sample_rate: int, channels: int) -> subprocess.Popen:
         """Launches FFmpeg with codec-appropriate input and raw s16le PCM output via pipes."""
@@ -221,14 +231,6 @@ class AudioPipeline:
             creationflags=_POPEN_FLAGS,
         )
 
-    def _start_reader_thread(self) -> threading.Thread:
-        """Starts the background thread that reads PCM blocks from FFmpeg."""
-        t = threading.Thread(
-            target=self._pcm_reader_loop, daemon=True, name="pcm-reader"
-        )
-        t.start()
-        return t
-
     def _start_sd_stream(self, sample_rate: int, channels: int) -> sd.OutputStream:
         """Creates and starts the sounddevice output stream."""
         kwargs: dict = dict(
@@ -242,18 +244,31 @@ class AudioPipeline:
         if self._device_index is not None:
             kwargs["device"] = self._device_index
         stream = sd.OutputStream(**kwargs)
-        stream.start()
+        try:
+            stream.start()
+        except Exception:
+            stream.close()
+            raise
         return stream
 
-    def _stop_ffmpeg(self) -> None:
-        """Closes FFmpeg's stdin and waits for it to exit (with a timeout)."""
+    @staticmethod
+    def _close_ffmpeg(ffmpeg: subprocess.Popen, graceful: bool) -> None:
+        """Ends FFmpeg (EOF on stdin, then kill) and closes its pipes."""
         try:
-            assert self._ffmpeg and self._ffmpeg.stdin
-            self._ffmpeg.stdin.close()
-            self._ffmpeg.wait(timeout=2)
+            if graceful:
+                if ffmpeg.stdin:
+                    ffmpeg.stdin.close()
+                ffmpeg.wait(timeout=2)
+            else:
+                ffmpeg.kill()
         except Exception:
-            if self._ffmpeg:
-                self._ffmpeg.kill()
+            ffmpeg.kill()
+        for pipe in (ffmpeg.stdin, ffmpeg.stdout):
+            try:
+                if pipe:
+                    pipe.close()
+            except OSError:
+                pass
 
     def _pcm_reader_loop(self) -> None:
         """
@@ -262,31 +277,37 @@ class AudioPipeline:
 
         Exits when FFmpeg's stdout closes (EOF) or raises an unexpected error.
         Pads the final short block with silence to keep the queue block-aligned.
+        Never blocks on a full queue: FFmpeg must always be drained, otherwise
+        it stops reading its stdin and the whole audio path backs up.
         """
-        bytes_per_block = self.BLOCK_SIZE * self._channels * 2  # int16 = 2 bytes
-        assert self._ffmpeg and self._ffmpeg.stdout
+        with self._lock:
+            ffmpeg = self._ffmpeg
+        if not ffmpeg or not ffmpeg.stdout:
+            return
+        expected = self.BLOCK_SIZE * self._channels
+        bytes_per_block = expected * 2  # int16
 
         while True:
             try:
-                raw = self._ffmpeg.stdout.read(bytes_per_block)
-                if not raw:
-                    break  # FFmpeg process exited / pipe closed
-
-                arr = np.frombuffer(raw, dtype=np.int16)
-
-                # Pad the last (potentially short) block with silence
-                expected = self.BLOCK_SIZE * self._channels
-                if len(arr) < expected:
-                    pad = np.zeros(expected - len(arr), dtype=np.int16)
-                    arr = np.concatenate([arr, pad])
-
-                block = arr.reshape(self.BLOCK_SIZE, self._channels)
-                self._pcm_q.put(block, timeout=0.5)
-
-            except queue.Full:
-                log.debug("PCM queue full – frames dropped")
+                raw = ffmpeg.stdout.read(bytes_per_block)
             except Exception:
                 break
+            if not raw:
+                break  # FFmpeg process exited / pipe closed
+
+            arr = np.frombuffer(raw, dtype=np.int16)
+            if len(arr) < expected:
+                arr = np.concatenate([arr, np.zeros(expected - len(arr), dtype=np.int16)])
+            block = arr.reshape(self.BLOCK_SIZE, self._channels)
+            try:
+                self._pcm_q.put_nowait(block)
+            except queue.Full:
+                # Output device stalled: drop the oldest block, keep the newest
+                try:
+                    self._pcm_q.get_nowait()
+                    self._pcm_q.put_nowait(block)
+                except (queue.Empty, queue.Full):
+                    pass
 
     def _apply_volume(self, block: np.ndarray) -> np.ndarray:
         """
@@ -306,14 +327,14 @@ class AudioPipeline:
         sounddevice output callback – called from the WASAPI thread.
 
         Drains one block from the PCM queue; fills with silence on underrun.
-        Computes RMS level for the VU meter after applying volume.
+        Reports the RMS level of what is actually played (after volume).
         """
         if status:
             log.debug("sounddevice: %s", status)
 
         try:
-            block = self._pcm_q.get_nowait()
-            outdata[:] = self._apply_volume(block)
+            block = self._apply_volume(self._pcm_q.get_nowait())
+            outdata[:] = block
         except queue.Empty:
             outdata.fill(0)
             block = None  # Underrun – report zero level
@@ -321,7 +342,7 @@ class AudioPipeline:
         self._report_level(block)
 
     def _report_level(self, block: Optional[np.ndarray]) -> None:
-        """Computes RMS of the current PCM block and forwards it to the GUI."""
+        """Computes RMS of the played PCM block and forwards it to the GUI."""
         if not self._on_level:
             return
         if block is not None:
@@ -335,6 +356,19 @@ class AudioPipeline:
 
 
 # ---------------------------------------------------------------------------
+# Pairing approval bookkeeping
+# ---------------------------------------------------------------------------
+
+class _PendingApproval:
+    """One open pairing question for a remote address (may cover several cids)."""
+
+    def __init__(self, addr: str, cid: int):
+        self.addr = addr
+        self.cids = [cid]
+        self.timer: Optional[threading.Timer] = None
+
+
+# ---------------------------------------------------------------------------
 # SinkBackend – public API consumed by the GUI
 # ---------------------------------------------------------------------------
 
@@ -344,16 +378,17 @@ class SinkBackend:
 
     Usage
     -----
-    backend = SinkBackend(device_name="PC-AudioSink", transport="usb:0", ...)
-    backend.start()   # returns immediately; work happens in a daemon thread
-    backend.stop()    # blocks briefly to signal the asyncio loop
+    backend = SinkBackend(device_name="PC-AudioSink", usb_filter="vid_0a12&…", ...)
+    backend.start()   # returns immediately; work happens on daemon threads
+    backend.stop()    # blocks up to a few seconds while the engine shuts down
+
+    An instance cannot be restarted; create a new one after stop().
     """
 
     def __init__(
         self,
         device_name: str = "PC-AudioSink",
-        bt_address: str = "F0:F1:F2:F3:F4:F5",
-        transport: str = "usb:0",
+        usb_filter: str = "",
         latency_ms: int = 50,
         max_bitpool: int = 53,
         volume: float = 1.0,
@@ -362,81 +397,74 @@ class SinkBackend:
         debug: bool = False,
         keystore_path: Optional[str] = None,
         allowed_macs_path: Optional[str] = None,
-        # Callbacks
-        on_state_change: Optional[Callable[[SinkState], None]] = None,
-        on_device_connected: Optional[Callable[[str, str], None]] = None,
-        on_device_disconnected: Optional[Callable[[str], None]] = None,
-        on_audio_level: Optional[Callable[[float], None]] = None,
-        on_log: Optional[Callable[[str], None]] = None,
-        on_pairing_request: Optional[Callable] = None,
-        on_volume_changed: Optional[Callable[[str, int], None]] = None,   # addr, vol_0_127
-        on_metadata: Optional[Callable[[str, dict], None]] = None,        # addr, {title,artist,album}
-        on_audio_start: Optional[Callable[[str, str], None]] = None,      # addr, codec
-        on_pairing_timeout: Optional[Callable[[], None]] = None,
-        on_device_name: Optional[Callable[[str, str], None]] = None,      # addr, name
         discoverable_timeout_s: int = 0,
         class_of_device: int = 0x240418,
-        sbc_block_length: int = 16,
-        sbc_subbands: int = 8,
-        sbc_allocation: str = "loudness",
+        # Callbacks
+        on_state_change: Optional[Callable[[SinkState], None]] = None,
+        on_device_connected: Optional[Callable[[str], None]] = None,          # addr
+        on_device_disconnected: Optional[Callable[[str], None]] = None,       # addr
+        on_device_name: Optional[Callable[[str, str], None]] = None,          # addr, name
+        on_audio_level: Optional[Callable[[float], None]] = None,
+        on_log: Optional[Callable[[str], None]] = None,
+        on_pairing_request: Optional[Callable[[str, Callable], None]] = None, # addr, resolve(approved, remember)
+        on_volume_changed: Optional[Callable[[str, int], None]] = None,       # addr, vol_0_127
+        on_metadata: Optional[Callable[[str, dict], None]] = None,            # addr, {title,artist,album}
+        on_audio_start: Optional[Callable[[str, str], None]] = None,          # addr, codec
+        on_pairing_timeout: Optional[Callable[[], None]] = None,
     ):
         # BT / USB parameters
         self._device_name = device_name
-        self._bt_address = bt_address
-        self._transport_str = transport
+        self._usb_filter = usb_filter
         self._max_bitpool = max_bitpool
         self._class_of_device = class_of_device
-        self._sbc_block_length = sbc_block_length
-        self._sbc_subbands = sbc_subbands
-        self._sbc_allocation = sbc_allocation
+        self._keystore_path = keystore_path
 
         # Audio parameters
         self._latency_ms = latency_ms
-        self._volume = volume
+        self._volume = max(0.0, min(2.0, volume))
         self._audio_device_index = audio_device_index
         self._ffmpeg_exe = ffmpeg_exe
 
-        # Feature flags
-        self._debug = debug
-        self._allowed_macs_path = Path(allowed_macs_path) if allowed_macs_path else None
-        # keystore_path kept for API compatibility; BTstack manages its own bonding
-        self._keystore_path = Path(keystore_path) if keystore_path else None
-
-        # Allowed MACs: devices the user has previously approved with "Remember"
-        self._allowed_macs: set = (
-            _load_allowed_macs(self._allowed_macs_path)
-            if self._allowed_macs_path else set()
-        )
-
-        # GUI callbacks
+        # GUI callbacks (assigned first: _log() below needs them)
         self._cb_state = on_state_change
         self._cb_connected = on_device_connected
         self._cb_disconnected = on_device_disconnected
+        self._cb_device_name = on_device_name
         self._cb_level = on_audio_level
         self._cb_log = on_log
         self._cb_pairing_request = on_pairing_request
         self._cb_volume_changed = on_volume_changed
         self._cb_metadata = on_metadata
         self._cb_audio_start = on_audio_start
-        self._cb_device_name = on_device_name
         self._cb_pairing_timeout = on_pairing_timeout
+
+        # Feature flags / persistence
+        self._debug = debug
+        self._allowed_macs_path = Path(allowed_macs_path) if allowed_macs_path else None
+        self._allowed_macs: set[str] = self._load_allowed_macs()
 
         # Pairing / discoverability control
         self._pairing_allowed = True
         self._discoverable_timeout_s = discoverable_timeout_s
         self._discoverable_timer: Optional[threading.Timer] = None
-        self._remember_map: dict[str, bool] = {}  # addr_upper → persist key to disk
+        self._discoverable_timer_id = 0
+        self._pending: dict[str, _PendingApproval] = {}    # addr → open pairing question
+        self._session_allowed: dict[str, float] = {}       # "allow once" addr → approval time
 
-        # Runtime state – set during start()
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
-        self._pipelines: dict[str, AudioPipeline] = {}     # addr_upper → pipeline
-        self._connected_addrs: set[str] = set()            # currently connected devices
-        self._codec_types: dict[str, str] = {}             # addr_upper → "sbc" or "aac"
-        self._device_audio_routes: dict[str, Optional[int]] = {}  # addr_upper → sd device index
-        self._stop_event: Optional[asyncio.Event] = None
+        # Runtime state
+        self._lock = threading.RLock()                     # guards everything below
+        self._started = False
+        self._stopping = False
         self._state = SinkState.IDLE
-        self._btstack_proc: Optional[subprocess.Popen] = None
+        self._proc: Optional[subprocess.Popen] = None
+        self._cmd_lock = threading.Lock()                  # serialises stdin writes
+        self._threads: list[threading.Thread] = []
+        self._pipelines: dict[str, AudioPipeline] = {}     # addr → pipeline
+        self._pipeline_swap = threading.Lock()             # serialises pipeline replacement
+        self._streaming: set[str] = set()                  # addrs between audio_start/stop
+        self._connected_addrs: set[str] = set()
+        self._codec_types: dict[str, str] = {}             # addr → "sbc" or "aac"
+        self._device_audio_routes: dict[str, Optional[int]] = {}  # addr → sd device index
 
     # ------------------------------------------------------------------
     # Public API
@@ -444,173 +472,139 @@ class SinkBackend:
 
     @property
     def state(self) -> SinkState:
-        """Current backend state (thread-safe read; set only from BT thread)."""
         return self._state
 
     def set_volume(self, volume: float) -> None:
         """Updates the output volume (linear multiplier, 0.0–2.0)."""
         self._volume = max(0.0, min(2.0, volume))
-        for pipeline in self._pipelines.values():
-            pipeline.set_volume(self._volume)
-
-    def clear_allowed_macs(self) -> None:
-        """Wipes the in-memory allowed-MAC set and its JSON file on disk."""
-        self._allowed_macs.clear()
-        if self._allowed_macs_path and self._allowed_macs_path.exists():
-            try:
-                self._allowed_macs_path.unlink()
-                log.debug("allowed_macs.json deleted")
-            except Exception as exc:
-                log.debug("Could not delete allowed_macs: %s", exc)
-        # BTstack bonding keys (TLV file) are managed inside btstack_sink.exe.
-        # A future "clear_bonding_keys" command can be added to btstack_sink.exe.
-
-    def set_pairing_mode(self, allowed: bool) -> None:
-        """Allow (True) or block (False) pairing requests from unknown devices."""
-        # Cancel any pending auto-off timer first
-        if self._discoverable_timer is not None:
-            self._discoverable_timer.cancel()
-            self._discoverable_timer = None
-        self._pairing_allowed = allowed
-        self._send_btstack_cmd({"cmd": "set_discoverable", "enabled": allowed})
-        # Start auto-off timer when enabling discoverability
-        if allowed and self._discoverable_timeout_s > 0:
-            self._discoverable_timer = threading.Timer(
-                self._discoverable_timeout_s, self._on_discoverable_timeout
-            )
-            self._discoverable_timer.daemon = True
-            self._discoverable_timer.start()
-
-    def _on_discoverable_timeout(self) -> None:
-        """Fires when the auto-discoverable timer expires; disables discoverability."""
-        self._discoverable_timer = None
-        self._pairing_allowed = False
-        self._send_btstack_cmd({"cmd": "set_discoverable", "enabled": False})
-        if self._cb_pairing_timeout:
-            self._cb_pairing_timeout()
+        with self._lock:
+            pipelines = list(self._pipelines.values())
+        for p in pipelines:
+            p.set_volume(self._volume)
 
     def notify_volume_changed(self, vol_0_127: int) -> None:
-        """Notify all connected sources of a volume change via AVRCP absolute volume."""
-        self._send_btstack_cmd({"cmd": "set_volume", "volume": vol_0_127})
+        """Tell all connected sources our volume via AVRCP absolute volume."""
+        self._send_cmd({"cmd": "set_volume", "volume": int(max(0, min(127, vol_0_127)))})
+
+    def set_pairing_mode(self, allowed: bool) -> None:
+        """
+        Allow (True) or block (False) pairing requests from unknown devices.
+        May be called before start(); the setting is applied once BTstack is ready.
+        """
+        with self._lock:
+            self._pairing_allowed = allowed
+            self._cancel_discoverable_timer()
+            if self._state in (SinkState.READY, SinkState.CONNECTED):
+                self._send_cmd({"cmd": "set_discoverable", "enabled": allowed})
+                if allowed:
+                    self._arm_discoverable_timer()
 
     def set_device_audio_route(self, addr: str, device_index: Optional[int]) -> None:
-        """Change the sounddevice output for a specific connected source on the fly."""
+        """
+        Change the sounddevice output for a specific connected source on the
+        fly. The pipeline restart takes up to a few seconds, so it runs on a
+        worker thread rather than the caller's (GUI) thread.
+        """
         addr = addr.upper()
-        self._device_audio_routes[addr] = device_index
-        pipeline = self._pipelines.get(addr)
-        if pipeline:
+        with self._lock:
+            self._device_audio_routes[addr] = device_index
+            pipeline = self._pipelines.get(addr)
             codec = self._codec_types.get(addr, "sbc")
-            sr = pipeline._sample_rate
-            ch = pipeline._channels
-            self._start_audio_pipeline(addr, sr, ch, codec)
+        if pipeline:
+            threading.Thread(
+                target=self._start_audio_pipeline,
+                args=(addr, pipeline.sample_rate, pipeline.channels, codec),
+                daemon=True, name="bt-reroute").start()
 
     def start(self) -> None:
-        """Transitions to STARTING and launches the background daemon thread."""
-        if self._state not in (SinkState.IDLE, SinkState.STOPPED, SinkState.ERROR):
-            return
+        """Launches btstack_sink.exe on a background thread; returns immediately."""
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
         self._set_state(SinkState.STARTING)
-        self._thread = threading.Thread(
-            target=self._run_loop, daemon=True, name="bt-backend"
-        )
-        self._thread.start()
+        threading.Thread(target=self._launch, daemon=True, name="bt-launch").start()
 
     def stop(self) -> None:
-        """Signals the asyncio loop to exit and stops all audio pipelines."""
-        # Cancel any pending auto-off timer
-        if self._discoverable_timer is not None:
-            self._discoverable_timer.cancel()
-            self._discoverable_timer = None
-        if self._loop and self._loop.is_running() and self._stop_event is not None:
-            self._loop.call_soon_threadsafe(self._stop_event.set)
-        for pipeline in list(self._pipelines.values()):
-            pipeline.stop()
-        self._pipelines.clear()
-        self._connected_addrs.clear()
-        self._codec_types.clear()
-        self._device_audio_routes.clear()
-        # Kill the subprocess immediately so rapid Start→Stop→Start cycles
-        # don't leave zombie btstack_sink.exe processes holding the WinUSB handle.
-        proc = self._btstack_proc
+        """
+        Shuts the engine down: asks it to power off, closes its stdin, waits a
+        few seconds, kills it if necessary, then stops all audio pipelines.
+        Safe to call from any thread and more than once.
+        """
+        with self._lock:
+            if self._stopping:
+                return
+            self._stopping = True
+            self._cancel_discoverable_timer()
+            for pending in self._pending.values():
+                if pending.timer:
+                    pending.timer.cancel()
+            self._pending.clear()
+            proc = self._proc
+
         if proc and proc.poll() is None:
+            self._send_cmd({"cmd": "stop"})
             try:
-                proc.kill()
+                if proc.stdin:
+                    proc.stdin.close()   # EOF also triggers shutdown in the engine
             except OSError:
                 pass
-        self._set_state(SinkState.STOPPED)
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                self._log("btstack_sink.exe did not exit, killing it")
+                proc.kill()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    pass
+
+        for t in self._threads:
+            t.join(timeout=2.0)
+
+        self._stop_all_pipelines()
+        with self._lock:
+            self._connected_addrs.clear()
+            self._codec_types.clear()
+            self._device_audio_routes.clear()
+            self._session_allowed.clear()
+        self._set_state(SinkState.STOPPED, force=True)
 
     # ------------------------------------------------------------------
-    # Background thread / asyncio loop
+    # Process lifecycle
     # ------------------------------------------------------------------
 
-    def _run_loop(self) -> None:
-        """Entry point for the daemon thread."""
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._stop_event = asyncio.Event()
-        try:
-            self._loop.run_until_complete(self._async_main())
-        except Exception as exc:
-            self._log(f"Fatal error: {exc}")
-            self._set_state(SinkState.ERROR)
-        finally:
-            self._loop.close()
-            self._loop = None
-            self._stop_event = None
-
-    # ------------------------------------------------------------------
-    # BTstack subprocess management
-    # ------------------------------------------------------------------
-
-    def _find_btstack_exe(self) -> Optional[str]:
-        """Locates btstack_sink.exe relative to this script or in a PyInstaller bundle."""
-        candidates = []
-
-        # Development: btstack/build/btstack_sink.exe next to project root
-        here = Path(__file__).resolve().parent.parent
-        candidates.append(here / "btstack" / "build" / "btstack_sink.exe")
-
-        # PyInstaller bundle: next to the running .exe
+    @staticmethod
+    def _find_btstack_exe() -> Optional[Path]:
+        """Locates btstack_sink.exe in a PyInstaller bundle or the source tree."""
+        candidates: list[Path] = []
         if getattr(sys, "frozen", False):
-            candidates.append(Path(sys.executable).parent / "btstack_sink.exe")
+            # PyInstaller onefile extracts bundled binaries into _MEIPASS
+            candidates.append(Path(getattr(sys, "_MEIPASS")) / "btstack_sink.exe")
+        here = Path(__file__).resolve().parent
+        candidates.append(here.parent / "btstack" / "build" / "btstack_sink.exe")
+        candidates.append(here / "btstack_sink.exe")
+        return next((p for p in candidates if p.exists()), None)
 
-        # Same directory as this script (alternative bundle layout)
-        candidates.append(Path(__file__).parent / "btstack_sink.exe")
-
-        for p in candidates:
-            if p.exists():
-                return str(p)
-        return None
-
-    async def _async_main(self) -> None:
-        """Launches btstack_sink.exe and drives the event loop until stop()."""
+    def _launch(self) -> None:
         exe = self._find_btstack_exe()
         if not exe:
-            self._log("Error: btstack_sink.exe not found.")
-            self._log("Build it first: cd btstack && .\\build.ps1")
+            self._log("Error: btstack_sink.exe not found. Build it first: .\\btstack\\build.ps1")
             self._set_state(SinkState.ERROR)
             return
 
-        # Parse USB index from "usb:N"
-        usb_index = 0
-        if self._transport_str.startswith("usb:"):
-            try:
-                usb_index = int(self._transport_str.split(":")[1])
-            except (IndexError, ValueError):
-                pass
-
+        # argv layout: see header of btstack/btstack_sink.c
         cmd = [
-            exe,
-            str(usb_index),                              # argv[1]
-            self._device_name,                           # argv[2]
-            self._bt_address,                            # argv[3]
-            str(self._max_bitpool),                      # argv[4]
-            "1" if self._debug else "0",                 # argv[5]
-            format(self._class_of_device, "X"),          # argv[6] CoD hex (e.g. "240418")
-            str(self._sbc_block_length),                 # argv[7] 4/8/12/16
-            str(self._sbc_subbands),                     # argv[8] 4 or 8
-            "0" if self._sbc_allocation == "snr" else "1",  # argv[9] 0=SNR,1=Loudness
+            str(exe),
+            self._usb_filter,
+            self._device_name,
+            str(self._max_bitpool),
+            "1" if self._debug else "0",
+            format(self._class_of_device, "X"),
+            self._keystore_path or "",
         ]
-        self._log(f"Launching BTstack: {Path(exe).name} (usb:{usb_index})")
+        self._log(f"Launching BTstack: {exe.name}"
+                  + (f" (dongle {self._usb_filter})" if self._usb_filter else ""))
 
         try:
             proc = subprocess.Popen(
@@ -622,207 +616,175 @@ class SinkBackend:
             )
         except OSError as exc:
             self._log(f"Failed to launch btstack_sink.exe: {exc}")
-            self._log("Possible causes:")
-            self._log("  • btstack_sink.exe not found or not built")
-            self._log("  • WinUSB driver (Zadig) not installed for the dongle")
             self._set_state(SinkState.ERROR)
             return
 
-        self._btstack_proc = proc
-        loop = asyncio.get_event_loop()
+        with self._lock:
+            if self._stopping:       # stop() raced us: don't leave a zombie
+                proc.kill()
+                return
+            self._proc = proc
+            self._threads = [
+                threading.Thread(target=self._event_thread, args=(proc.stderr,),
+                                 daemon=True, name="bt-events"),
+                threading.Thread(target=self._audio_thread, args=(proc.stdout,),
+                                 daemon=True, name="bt-audio"),
+                threading.Thread(target=self._watch_thread, args=(proc,),
+                                 daemon=True, name="bt-watch"),
+            ]
+            for t in self._threads:
+                t.start()
 
-        # Thread: read stderr events → dispatch to asyncio loop
-        t_events = threading.Thread(
-            target=self._stderr_reader_thread,
-            args=(proc.stderr, loop),
-            daemon=True,
-            name="btstack-events",
-        )
-        t_events.start()
+    def _watch_thread(self, proc: subprocess.Popen) -> None:
+        """Reports an engine that died on its own (crash, dongle lost, kill)."""
+        code = proc.wait()
+        if self._stopping:
+            return
+        self._log(f"btstack_sink.exe exited unexpectedly (code {code})")
+        self._stop_all_pipelines()
+        with self._lock:
+            self._connected_addrs.clear()
+            self._cancel_discoverable_timer()
+        self._set_state(SinkState.ERROR)
 
-        # Thread: read stdout SBC frames → feed to audio pipeline
-        t_audio = threading.Thread(
-            target=self._stdout_audio_thread,
-            args=(proc.stdout,),
-            daemon=True,
-            name="btstack-audio",
-        )
-        t_audio.start()
-
-        # Block until stop() signals the event
-        assert self._stop_event is not None
-        await self._stop_event.wait()
-
-        # Graceful shutdown
-        self._send_btstack_cmd({"cmd": "stop"})
-        try:
-            proc.wait(timeout=3.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
-        self._btstack_proc = None
-
-    def _stderr_reader_thread(
-        self, stderr_pipe, loop: asyncio.AbstractEventLoop
-    ) -> None:
-        """Reads JSON event lines from btstack_sink.exe stderr; dispatches to asyncio loop."""
+    def _event_thread(self, stderr_pipe) -> None:
+        """Reads JSON event lines from btstack_sink.exe stderr and dispatches them."""
         for raw_line in stderr_pipe:
+            if self._stopping:
+                break
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
             try:
                 event = _json.loads(line)
             except _json.JSONDecodeError:
-                loop.call_soon_threadsafe(self._log, f"[btstack] {line}")
+                event = None
+            if not isinstance(event, dict):
+                self._log(f"[btstack] {line}")
                 continue
-            loop.call_soon_threadsafe(self._on_btstack_event, event)
+            try:
+                self._on_btstack_event(event)
+            except Exception as exc:  # a bad handler must not kill event dispatch
+                log.exception("event handler failed")
+                self._log(f"Internal error handling {event.get('event')}: {exc}")
 
-    def _stdout_audio_thread(self, stdout_pipe) -> None:
+    def _audio_thread(self, stdout_pipe) -> None:
         """
-        Reads addr-tagged length-prefixed SBC frames from btstack_sink.exe stdout.
-        Frame format:
-          [uint32_le total_len = 6 + sbc_len]
-          [6 bytes bd_addr, MSB first]
-          [sbc_len bytes SBC payload]
-        Routes each frame to the matching per-device audio pipeline.
+        Reads addr-tagged length-prefixed audio frames from btstack_sink.exe stdout:
+          [uint32_le total_len = 6 + payload_len][6 bytes bd_addr][payload]
+        BufferedReader.read(n) blocks until n bytes or EOF, so short reads
+        mean the engine is gone.
         """
-        def read_exact(n: int) -> bytes:
-            buf = b""
-            while len(buf) < n:
-                chunk = stdout_pipe.read(n - len(buf))
-                if not chunk:
-                    return b""
-                buf += chunk
-            return buf
-
+        read = stdout_pipe.read
         while True:
-            header = stdout_pipe.read(4)
-            if not header or len(header) < 4:
+            header = read(4)
+            if len(header) < 4:
                 break
             total_len = int.from_bytes(header, "little")
-            if total_len <= 6 or total_len > 65542:
-                continue  # Sanity check; skip malformed frames
-
-            addr_bytes = read_exact(6)
-            if len(addr_bytes) < 6:
+            if total_len < 7 or total_len > 65541:
+                # The stream cannot be resynchronised; give up on audio.
+                self._log(f"audio: malformed frame header ({total_len}), stopping audio reader")
                 break
-            addr_str = ":".join(f"{b:02X}" for b in addr_bytes)
-
-            sbc_len = total_len - 6
-            sbc_data = read_exact(sbc_len)
-            if len(sbc_data) < sbc_len:
+            body = read(total_len)
+            if len(body) < total_len:
                 break
-
-            pipeline = self._pipelines.get(addr_str)
+            addr = ":".join(f"{b:02X}" for b in body[:6])
+            with self._lock:
+                pipeline = self._pipelines.get(addr)
             if pipeline:
-                pipeline.write_audio(sbc_data)
+                pipeline.write_audio(body[6:])
 
-    def _send_btstack_cmd(self, cmd: dict) -> None:
-        """Sends a JSON command line to btstack_sink.exe via stdin."""
-        proc = self._btstack_proc
-        if proc and proc.stdin and proc.poll() is None:
+    def _send_cmd(self, cmd: dict) -> None:
+        """Sends a JSON command line to btstack_sink.exe via stdin (any thread)."""
+        proc = self._proc
+        if not proc or not proc.stdin or proc.poll() is not None:
+            return
+        line = (_json.dumps(cmd) + "\n").encode("utf-8")
+        with self._cmd_lock:
             try:
-                line = (_json.dumps(cmd) + "\n").encode("utf-8")
                 proc.stdin.write(line)
                 proc.stdin.flush()
-            except (OSError, BrokenPipeError):
-                pass
+            except (OSError, ValueError):
+                pass   # engine gone / stdin closed by stop()
 
     # ------------------------------------------------------------------
-    # BTstack event handling  (always called from asyncio loop thread)
+    # Event handling  (bt-events thread only)
     # ------------------------------------------------------------------
 
     def _on_btstack_event(self, event: dict) -> None:
-        """Routes events from btstack_sink.exe to the appropriate handler."""
         evt = event.get("event", "")
+        addr = str(event.get("addr", "")).upper()
 
         if self._debug and evt not in ("log", "error"):
             self._log(f"[dbg] {event}")
 
         if evt == "ready":
-            addr = event.get("address", "")
-            self._log(f"BTstack ready! Address: {addr}")
+            self._log(f"BTstack ready! Address: {event.get('address', '')}")
             self._set_state(SinkState.READY)
-            # Apply current discoverability setting
-            self._send_btstack_cmd(
-                {"cmd": "set_discoverable", "enabled": self._pairing_allowed}
-            )
+            with self._lock:
+                self._send_cmd({"cmd": "set_discoverable", "enabled": self._pairing_allowed})
+                if self._pairing_allowed:
+                    self._arm_discoverable_timer()
 
         elif evt == "l2cap_request":
-            # iPhone / Switch is requesting an AVDTP connection.
-            # This fires BEFORE L2CAP is accepted — the key BTstack advantage.
-            addr = event.get("addr", "").upper()
-            cid = event.get("cid", 0)
-            asyncio.ensure_future(self._handle_l2cap_request(addr, cid))
+            self._handle_l2cap_request(addr, int(event.get("cid", 0)))
 
         elif evt == "name":
-            addr = event.get("addr", "").upper()
             name = event.get("name", "")
             if name and self._cb_device_name:
                 self._cb_device_name(addr, name)
 
         elif evt == "connected":
-            addr = event.get("addr", "").upper()
-            name = event.get("name", addr)
             self._log(f"A2DP connected: {addr}")
-            self._connected_addrs.add(addr)
+            with self._lock:
+                self._connected_addrs.add(addr)
             self._set_state(SinkState.CONNECTED)
             if self._cb_connected:
-                self._cb_connected(name, addr)
+                self._cb_connected(addr)
 
         elif evt == "audio_start":
-            addr = event.get("addr", "").upper()
-            sample_rate = event.get("sample_rate", 44100)
-            channels = event.get("channels", 2)
-            codec = event.get("codec", "sbc")
-            self._codec_types[addr] = codec
+            sample_rate = int(event.get("sample_rate", 44100))
+            channels = int(event.get("channels", 2))
+            codec = str(event.get("codec", "sbc"))
+            with self._lock:
+                self._codec_types[addr] = codec
+                self._streaming.add(addr)
             self._log(f"Stream START [{addr}] → {sample_rate} Hz, {channels} ch [{codec.upper()}]")
             self._start_audio_pipeline(addr, sample_rate, channels, codec)
             if self._cb_audio_start:
                 self._cb_audio_start(addr, codec)
 
         elif evt == "audio_stop":
-            addr = event.get("addr", "").upper()
             self._log(f"Stream STOP [{addr}]")
-            pipeline = self._pipelines.pop(addr, None)
-            if pipeline:
-                pipeline.stop()
+            with self._lock:
+                self._streaming.discard(addr)
+            self._stop_pipeline(addr)
 
         elif evt == "volume_changed":
-            addr = event.get("addr", "").upper()
-            volume = int(event.get("volume", 0))
             if self._cb_volume_changed:
-                self._cb_volume_changed(addr, volume)
+                self._cb_volume_changed(addr, int(event.get("volume", 0)))
 
         elif evt == "metadata":
-            addr = event.get("addr", "").upper()
-            meta = {
-                "title":  event.get("title", ""),
-                "artist": event.get("artist", ""),
-                "album":  event.get("album", ""),
-            }
             if self._cb_metadata:
-                self._cb_metadata(addr, meta)
+                self._cb_metadata(addr, {
+                    "title":  event.get("title", ""),
+                    "artist": event.get("artist", ""),
+                    "album":  event.get("album", ""),
+                })
 
         elif evt == "disconnected":
-            addr = event.get("addr", "").upper()
-            name = event.get("name", addr)
-            self._log(f"A2DP disconnected: {name}")
-            self._connected_addrs.discard(addr)
-            self._codec_types.pop(addr, None)
-            should_remember = self._remember_map.pop(addr, True)
-            if not should_remember:
-                # "Allow once" — remove from allowed set so dialog shows again
-                self._allowed_macs.discard(addr)
-                if self._allowed_macs_path:
-                    _save_allowed_macs(self._allowed_macs, self._allowed_macs_path)
-            pipeline = self._pipelines.pop(addr, None)
-            if pipeline:
-                pipeline.stop()
-            if not self._connected_addrs:
+            self._log(f"A2DP disconnected: {addr}")
+            with self._lock:
+                self._connected_addrs.discard(addr)     # before stopping: blocks a
+                self._streaming.discard(addr)           # concurrent pipeline restart
+                self._codec_types.pop(addr, None)
+                self._session_allowed.pop(addr, None)   # "allow once" ends here
+                none_left = not self._connected_addrs
+            self._stop_pipeline(addr)
+            if none_left and self._state == SinkState.CONNECTED:
                 self._set_state(SinkState.READY)
             if self._cb_disconnected:
-                self._cb_disconnected(name)
+                self._cb_disconnected(addr)
 
         elif evt == "log":
             self._log(f"[btstack] {event.get('msg', '')}")
@@ -831,101 +793,218 @@ class SinkBackend:
             self._log(f"[btstack error] {event.get('msg', '')}")
             self._set_state(SinkState.ERROR)
 
-    async def _handle_l2cap_request(self, addr_upper: str, cid: int) -> None:
+    # ------------------------------------------------------------------
+    # Pairing approval
+    # ------------------------------------------------------------------
+
+    def _handle_l2cap_request(self, addr: str, cid: int) -> None:
         """
         Gate an incoming AVDTP L2CAP connection on user approval.
 
-        Known device (in _allowed_macs) → auto-approve, no dialog.
-        Unknown device + pairing disabled → auto-deny.
-        Unknown device + pairing enabled → show GUI dialog, wait for answer.
+        Known device (remembered or allowed-once this session) → approve.
+        Unknown device + pairing disabled → deny.
+        Unknown device + pairing enabled → ask the GUI, deny after PAIRING_TIMEOUT_S.
         """
-        if addr_upper in self._allowed_macs:
-            self._log(f"AVDTP: auto-approving known device {addr_upper}")
-            self._send_btstack_cmd(
-                {"cmd": "approve", "addr": addr_upper, "cid": cid}
-            )
+        if addr in self._allowed_macs or self._session_allowed_ok(addr):
+            self._log(f"AVDTP: auto-approving known device {addr}")
+            self._send_cmd({"cmd": "approve", "addr": addr, "cid": cid})
             return
 
-        if not self._pairing_allowed:
-            self._log(f"AVDTP: rejecting unknown device (pairing off): {addr_upper}")
-            self._send_btstack_cmd(
-                {"cmd": "deny", "addr": addr_upper, "cid": cid}
-            )
+        if not self._pairing_allowed or not self._cb_pairing_request:
+            self._log(f"AVDTP: rejecting unknown device (pairing off): {addr}")
+            self._send_cmd({"cmd": "deny", "addr": addr, "cid": cid})
             return
 
-        # Unknown device + pairing allowed → show dialog
-        self._log(f"AVDTP connection from unknown device: {addr_upper}")
+        with self._lock:
+            pending = self._pending.get(addr)
+            if pending:
+                # Dialog already open for this device (retry from the source):
+                # answer both channels with the one decision.
+                pending.cids.append(cid)
+                return
+            pending = _PendingApproval(addr, cid)
+            self._pending[addr] = pending
+            pending.timer = threading.Timer(
+                PAIRING_TIMEOUT_S, self._resolve_pairing, args=(addr, False, False))
+            pending.timer.daemon = True
+            pending.timer.start()
 
-        if not self._cb_pairing_request:
-            self._send_btstack_cmd(
-                {"cmd": "deny", "addr": addr_upper, "cid": cid}
-            )
-            return
+        self._log(f"AVDTP connection from unknown device: {addr}")
 
-        loop = asyncio.get_event_loop()
-        future: asyncio.Future = loop.create_future()
-
-        def resolve(approved: bool, remember: bool) -> None:
-            if not future.done():
-                loop.call_soon_threadsafe(future.set_result, (approved, remember))
-
-        self._cb_pairing_request("Unknown Device", addr_upper, resolve)
+        def resolve(approved: bool, remember: bool = False) -> None:
+            self._resolve_pairing(addr, bool(approved), bool(remember))
 
         try:
-            approved, remember = await asyncio.wait_for(future, timeout=30.0)
-        except asyncio.TimeoutError:
-            approved, remember = False, False
+            self._cb_pairing_request(addr, resolve)
+        except Exception as exc:
+            self._log(f"Pairing dialog failed ({exc}); denying {addr}")
+            resolve(False, False)
+
+    def _resolve_pairing(self, addr: str, approved: bool, remember: bool) -> None:
+        """Answers an open pairing question exactly once (any thread)."""
+        with self._lock:
+            pending = self._pending.pop(addr, None)
+            if pending is None:
+                return   # already answered or timed out
+            if pending.timer:
+                pending.timer.cancel()
+            cids = list(pending.cids)
+            if self._stopping:
+                return
+            if approved:
+                if remember:
+                    self._allowed_macs.add(addr)
+                    self._save_allowed_macs()
+                else:
+                    self._session_allowed[addr] = time.monotonic()
 
         if approved:
-            self._remember_map[addr_upper] = remember
-            self._allowed_macs.add(addr_upper)
-            if remember and self._allowed_macs_path:
-                _save_allowed_macs(self._allowed_macs, self._allowed_macs_path)
-            self._send_btstack_cmd(
-                {"cmd": "approve", "addr": addr_upper, "cid": cid}
-            )
+            self._log(f"AVDTP connection approved: {addr}" + (" (remembered)" if remember else ""))
         else:
-            self._log(f"AVDTP connection denied: {addr_upper}")
-            self._send_btstack_cmd(
-                {"cmd": "deny", "addr": addr_upper, "cid": cid}
-            )
+            self._log(f"AVDTP connection denied: {addr}")
+        for cid in cids:
+            self._send_cmd({"cmd": "approve" if approved else "deny", "addr": addr, "cid": cid})
 
-    def _start_audio_pipeline(
-        self, addr: str, sample_rate: int, channels: int, codec: str = "sbc"
-    ) -> None:
-        """Creates (or replaces) the per-device audio pipeline (SBC or AAC)."""
-        existing = self._pipelines.pop(addr, None)
-        if existing:
-            existing.stop()
-        device_index = self._device_audio_routes.get(addr, self._audio_device_index)
-        pipeline = AudioPipeline(
-            codec=codec,
-            ffmpeg_exe=self._ffmpeg_exe,
-            latency_ms=self._latency_ms,
-            device_index=device_index,
-            on_level=self._cb_level,
-        )
-        pipeline.set_volume(self._volume)
-        try:
-            pipeline.start(sample_rate, channels)
-            self._log(f"Audio pipeline started [{addr}] codec={codec}")
-        except Exception as exc:
-            self._log(f"Pipeline error [{addr}]: {exc}")
+    def _session_allowed_ok(self, addr: str) -> bool:
+        with self._lock:
+            approved_at = self._session_allowed.get(addr)
+            if approved_at is None:
+                return False
+            if addr in self._connected_addrs:
+                return True
+            if time.monotonic() - approved_at <= SESSION_ALLOW_TTL_S:
+                return True
+            del self._session_allowed[addr]
+            return False
+
+    # ------------------------------------------------------------------
+    # Discoverable auto-off timer
+    # ------------------------------------------------------------------
+
+    def _arm_discoverable_timer(self) -> None:
+        """Caller holds self._lock."""
+        if self._discoverable_timeout_s <= 0:
             return
-        self._pipelines[addr] = pipeline
+        self._discoverable_timer_id += 1
+        timer_id = self._discoverable_timer_id
+        self._discoverable_timer = threading.Timer(
+            self._discoverable_timeout_s, self._on_discoverable_timeout, args=(timer_id,))
+        self._discoverable_timer.daemon = True
+        self._discoverable_timer.start()
+
+    def _cancel_discoverable_timer(self) -> None:
+        """Caller holds self._lock."""
+        self._discoverable_timer_id += 1   # invalidates a callback already in flight
+        if self._discoverable_timer is not None:
+            self._discoverable_timer.cancel()
+            self._discoverable_timer = None
+
+    def _on_discoverable_timeout(self, timer_id: int) -> None:
+        with self._lock:
+            if timer_id != self._discoverable_timer_id or self._stopping:
+                return
+            self._discoverable_timer = None
+            self._pairing_allowed = False
+            self._send_cmd({"cmd": "set_discoverable", "enabled": False})
+        if self._cb_pairing_timeout:
+            self._cb_pairing_timeout()
+
+    # ------------------------------------------------------------------
+    # Audio pipelines
+    # ------------------------------------------------------------------
+
+    def _start_audio_pipeline(self, addr: str, sample_rate: int, channels: int,
+                              codec: str = "sbc") -> None:
+        """
+        Creates (or replaces) the per-device audio pipeline (SBC or AAC).
+        Replacements are serialised, and a pipeline is only installed while
+        the device is still streaming, so a route change racing an
+        audio_stop/disconnect can neither leak nor resurrect a pipeline.
+        """
+        with self._pipeline_swap:
+            with self._lock:
+                if self._stopping or addr not in self._streaming:
+                    return
+                old = self._pipelines.pop(addr, None)
+                device_index = self._device_audio_routes.get(addr, self._audio_device_index)
+            if old:
+                old.stop()
+            pipeline = AudioPipeline(
+                codec=codec,
+                ffmpeg_exe=self._ffmpeg_exe,
+                latency_ms=self._latency_ms,
+                device_index=device_index,
+                on_level=self._cb_level,
+            )
+            pipeline.set_volume(self._volume)
+            try:
+                pipeline.start(sample_rate, channels)
+            except Exception as exc:
+                self._log(f"Pipeline error [{addr}]: {exc}")
+                return
+            with self._lock:
+                if self._stopping or addr not in self._streaming:
+                    pipeline.stop()
+                    return
+                self._pipelines[addr] = pipeline
+        self._log(f"Audio pipeline started [{addr}] codec={codec}")
+
+    def _stop_pipeline(self, addr: str) -> None:
+        with self._lock:
+            pipeline = self._pipelines.pop(addr, None)
+        if pipeline:
+            pipeline.stop()
+
+    def _stop_all_pipelines(self) -> None:
+        with self._lock:
+            pipelines = list(self._pipelines.values())
+            self._pipelines.clear()
+        for p in pipelines:
+            p.stop()
+
+    # ------------------------------------------------------------------
+    # Allowed-MAC persistence
+    # ------------------------------------------------------------------
+
+    def _load_allowed_macs(self) -> set[str]:
+        path = self._allowed_macs_path
+        if not path or not path.exists():
+            return set()
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = _json.load(f)
+            if isinstance(data, list):
+                return {str(m).upper() for m in data}
+            raise ValueError("expected a JSON list")
+        except Exception as exc:
+            self._log(f"Could not read remembered devices ({path.name}): {exc}")
+            return set()
+
+    def _save_allowed_macs(self) -> None:
+        path = self._allowed_macs_path
+        if not path:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump(sorted(self._allowed_macs), f, indent=2)
+        except OSError as exc:
+            self._log(f"Could not save remembered devices ({path.name}): {exc}")
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _set_state(self, state: SinkState) -> None:
-        """Updates internal state and fires the on_state_change callback."""
+    def _set_state(self, state: SinkState, force: bool = False) -> None:
+        """Updates the state and fires on_state_change. Ignored after stop() unless forced."""
+        if self._stopping and not force:
+            return
         self._state = state
         if self._cb_state:
             try:
                 self._cb_state(state)
             except Exception:
-                pass
+                log.debug("on_state_change callback failed", exc_info=True)
 
     def _log(self, msg: str) -> None:
         """Logs to the Python logger and forwards to the GUI callback."""
@@ -934,4 +1013,4 @@ class SinkBackend:
             try:
                 self._cb_log(msg)
             except Exception:
-                pass
+                log.debug("on_log callback failed", exc_info=True)
