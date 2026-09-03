@@ -434,6 +434,14 @@ static pending_conn_t *find_pending_by_cid(uint16_t cid) {
     return NULL;
 }
 
+static pending_conn_t *find_pending_by_addr(const bd_addr_t addr) {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (g_pending[i].valid && memcmp(g_pending[i].addr, addr, 6) == 0)
+            return &g_pending[i];
+    }
+    return NULL;
+}
+
 /* -------------------------------------------------------------------------
  * Pending AVRCP helpers
  * ---------------------------------------------------------------------- */
@@ -958,6 +966,25 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
         break;
     }
 
+    case A2DP_SUBEVENT_STREAM_ESTABLISHED: {
+        /* For sink-initiated connections BTstack reports "no usable SEP" or
+         * a failed media channel only here, leaving the signaling link open.
+         * Tell Python and tear the link down so the slot is released. */
+        uint8_t status = a2dp_subevent_stream_established_get_status(packet);
+        if (status == ERROR_CODE_SUCCESS) break;
+        uint16_t cid = a2dp_subevent_stream_established_get_a2dp_cid(packet);
+        bd_addr_t bd;
+        a2dp_subevent_stream_established_get_bd_addr(packet, bd);
+        char addr_s[18];
+        addr_to_str(bd, addr_s);
+        snprintf(evt, sizeof(evt),
+                 "{\"event\":\"connect_failed\",\"addr\":\"%s\",\"status\":%u}",
+                 addr_s, (unsigned)status);
+        emit_event(evt);
+        a2dp_sink_disconnect(cid);
+        break;
+    }
+
     case A2DP_SUBEVENT_STREAM_STARTED: {
         uint16_t cid = a2dp_subevent_stream_started_get_a2dp_cid(packet);
         a2dp_conn_t *conn = find_conn_by_cid(cid);
@@ -1374,8 +1401,18 @@ static void process_command(const char *line) {
         bd_addr_t bd;
         if (!sscanf_bd_addr(addr, bd)) {
             emit_log("connect: invalid address");
-        } else if (find_conn_by_addr(bd)) {
-            emit_log("connect: already connected");
+        } else if (find_conn_by_addr(bd) || find_pending_by_addr(bd) ||
+                   avdtp_get_connection_for_bd_addr(bd) != NULL) {
+            /* Already connected, or the device is connecting to us right now
+             * (parked in g_pending / L2CAP still opening). avdtp_connect()
+             * would report success without a cid in that state and
+             * a2dp_sink_establish_stream() asserts on it. */
+            emit_log("connect: device already connected or connecting");
+            char msg[96];
+            snprintf(msg, sizeof(msg),
+                     "{\"event\":\"connect_failed\",\"addr\":\"%s\",\"status\":%u}",
+                     addr, (unsigned)ERROR_CODE_COMMAND_DISALLOWED);
+            emit_event(msg);
         } else {
             uint16_t new_cid = 0;
             uint8_t rc = a2dp_sink_establish_stream(bd, &new_cid);
