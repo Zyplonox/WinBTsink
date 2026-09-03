@@ -34,6 +34,7 @@ from config import (
     configure_logging,
     enumerate_output_devices,
     keystore_file as _keystore_file,
+    migrate_legacy_keystore,
     set_autostart,
     settings,
 )
@@ -1139,6 +1140,10 @@ class App(ctk.CTk):
 
         self._build_ui()
         self._log("Ready – scanning USB dongles…")
+        migrated = migrate_legacy_keystore()
+        if migrated:
+            self._log(f"Bonding keys moved from {migrated} to the app data folder; "
+                      "paired devices keep working.")
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Unmap>", self._on_unmap)  # Minimize button → tray

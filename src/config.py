@@ -57,6 +57,30 @@ def allowed_macs_file() -> str:
     return os.path.join(appdata_dir(), "allowed_macs.json")
 
 
+def migrate_legacy_keystore() -> Optional[str]:
+    """
+    Versions before 2.1 kept the bonding keys next to btstack_sink.exe
+    (btstack\\build\\btstack_keys.db when running from source). Copy that
+    file to the AppData location once, so already bonded devices keep
+    connecting without pairing again. Returns the old path when migrated.
+    """
+    new = keystore_file()
+    if os.path.exists(new):
+        return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    old = os.path.join(os.path.dirname(here), "btstack", "build", "btstack_keys.db")
+    if not os.path.exists(old):
+        return None
+    try:
+        import shutil
+        os.makedirs(appdata_dir(), exist_ok=True)
+        shutil.copy2(old, new)
+        return old
+    except OSError as exc:
+        log.warning("Could not migrate bonding keys from %s: %s", old, exc)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Audio output device enumeration
 # ---------------------------------------------------------------------------

@@ -231,6 +231,10 @@ Everything lives in `%APPDATA%\BT-AudioSink\`:
 
 To reset all pairings use **Settings → Forget all paired devices** (or delete both files).
 
+Upgrading from a version before 2.1 (keys used to live next to `btstack_sink.exe`):
+the old `btstackuildtstack_keys.db` is copied to the new location on first start,
+so already paired devices keep connecting without pairing again.
+
 ---
 
 ## Headless mode and control API

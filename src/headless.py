@@ -36,7 +36,7 @@ from typing import Optional
 
 from api_server import ApiServer, BackendController
 from backend import SinkBackend, SinkState
-from config import allowed_macs_file, configure_logging, settings
+from config import allowed_macs_file, configure_logging, migrate_legacy_keystore, settings
 from device_store import DeviceStore
 from usb_devices import list_bluetooth_dongles
 
@@ -70,6 +70,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     configure_logging(logging.DEBUG if args.debug else logging.INFO)
     settings.load()
+    if migrate_legacy_keystore():
+        log.info("Bonding keys migrated to the app data folder")
     if args.name:
         settings.device_name = args.name
     if args.debug:
