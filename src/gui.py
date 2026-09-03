@@ -15,7 +15,6 @@ on the mainloop reads, so the real-time audio thread never waits for Tk.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sys
@@ -25,10 +24,19 @@ from datetime import datetime
 from typing import Callable, Optional
 
 import customtkinter as ctk
-import sounddevice as sd
 from PIL import Image, ImageDraw
 
-from backend import SinkBackend, SinkState, build_eq_filter
+from api_server import ApiServer, BackendController
+from backend import SinkBackend, SinkState
+from config import (
+    allowed_macs_file as _allowed_macs_file,
+    appdata_dir as _appdata_dir,
+    configure_logging,
+    enumerate_output_devices,
+    keystore_file as _keystore_file,
+    set_autostart,
+    settings,
+)
 from device_store import DeviceStore
 from media_keys import MediaKeyListener
 from usb_devices import list_bluetooth_dongles
@@ -41,26 +49,6 @@ try:
     _TRAY_AVAILABLE = True
 except ImportError:
     _TRAY_AVAILABLE = False
-
-
-# ---------------------------------------------------------------------------
-# AppData directory helpers
-# ---------------------------------------------------------------------------
-
-def _appdata_dir() -> str:
-    """Returns %APPDATA%\\BT-AudioSink (or ~/BT-AudioSink on non-Windows)."""
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    return os.path.join(base, "BT-AudioSink")
-
-def _config_file() -> str:
-    return os.path.join(_appdata_dir(), "config.json")
-
-def _keystore_file() -> str:
-    """BTstack link-key store (bonding keys), written by btstack_sink.exe."""
-    return os.path.join(_appdata_dir(), "btstack_keys.db")
-
-def _allowed_macs_file() -> str:
-    return os.path.join(_appdata_dir(), "allowed_macs.json")
 
 
 # ---------------------------------------------------------------------------
@@ -80,139 +68,12 @@ def scan_bt_dongles() -> list[tuple[str, str]]:
         return []
 
 
-# ---------------------------------------------------------------------------
-# Audio output device enumeration (shared by settings dialog and device cards)
-# ---------------------------------------------------------------------------
-
-def enumerate_output_devices() -> tuple[list[str], list[Optional[int]]]:
-    """
-    Returns (display_names, device_indices) for the WASAPI output devices,
-    with "Default" (index None) first.  Only the WASAPI host API is listed
-    because sounddevice reports every device once per host API, and names
-    are what gets persisted.
-    """
-    names: list[str] = ["Default"]
-    indices: list[Optional[int]] = [None]
-    try:
-        wasapi = next((i for i, api in enumerate(sd.query_hostapis())
-                       if "WASAPI" in api["name"].upper()), None)
-        for i, dev in enumerate(sd.query_devices()):
-            if dev["max_output_channels"] <= 0:  # type: ignore[index]
-                continue
-            if wasapi is not None and dev["hostapi"] != wasapi:  # type: ignore[index]
-                continue
-            names.append(dev["name"])  # type: ignore[index]
-            indices.append(i)
-    except Exception as exc:
-        log.warning("Audio device enumeration failed: %s", exc)
-    return names, indices
-
-
-def resolve_output_device_index(name: Optional[str]) -> Optional[int]:
-    """Maps a persisted device name to the current sounddevice index (None = default)."""
-    if not name:
-        return None
-    names, indices = enumerate_output_devices()
-    try:
-        return indices[names.index(name)]
-    except ValueError:
-        log.warning("Audio device '%s' not found, using default", name)
-        return None
-
-
-def _get_ffmpeg() -> str:
-    """
-    Locates the FFmpeg executable.
-
-    When running as a frozen PyInstaller bundle, look for ffmpeg.exe next
-    to the extracted files in _MEIPASS.  Otherwise delegate to imageio-ffmpeg
-    which bundles a pre-built binary, falling back to "ffmpeg" on PATH.
-    """
-    if getattr(sys, "frozen", False):
-        path = os.path.join(sys._MEIPASS, "ffmpeg.exe")  # type: ignore[attr-defined]
-        if os.path.exists(path):
-            return path
-    try:
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        return "ffmpeg"
-
-
-# ---------------------------------------------------------------------------
-# Windows autostart (registry)
-# ---------------------------------------------------------------------------
-
-_AUTOSTART_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-_AUTOSTART_REG_NAME = "BT-AudioSink"
-
-
-def _autostart_command() -> str:
-    """The registry value that launches this app minimized on login."""
-    exe = sys.executable
-    if getattr(sys, "frozen", False):
-        return f'"{exe}" --minimized'
-    # From source: use pythonw.exe so no console window appears at login
-    pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
-    if os.path.exists(pythonw):
-        exe = pythonw
-    return f'"{exe}" "{os.path.abspath(__file__)}" --minimized'
-
-
-def _get_autostart() -> bool:
-    """True when the autostart entry exists and points at an existing executable."""
-    if sys.platform != "win32":
-        return False
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY, 0,
-                            winreg.KEY_QUERY_VALUE) as key:
-            value, _ = winreg.QueryValueEx(key, _AUTOSTART_REG_NAME)
-        exe = value.split('"')[1] if value.startswith('"') else value.split(" ")[0]
-        return os.path.exists(exe)
-    except Exception:
-        return False
-
-
-def _set_autostart(enabled: bool) -> None:
-    """
-    Adds or removes the autostart registry entry.
-
-    The --minimized flag is appended so Windows starts the app hidden in the
-    system tray rather than showing the main window on login.
-    """
-    if sys.platform != "win32":
-        return
-    try:
-        import winreg
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY, 0, winreg.KEY_SET_VALUE
-        )
-        if enabled:
-            winreg.SetValueEx(key, _AUTOSTART_REG_NAME, 0, winreg.REG_SZ,
-                              _autostart_command())
-        else:
-            try:
-                winreg.DeleteValue(key, _AUTOSTART_REG_NAME)
-            except FileNotFoundError:
-                pass
-        winreg.CloseKey(key)
-    except Exception as e:
-        log.warning("Autostart registry: %s", e)
-
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+configure_logging()
 log = logging.getLogger("bt-sink.gui")
 
 
+def _set_autostart(enabled: bool) -> None:
+    set_autostart(enabled, __file__)
 # ---------------------------------------------------------------------------
 # State display mappings
 # ---------------------------------------------------------------------------
@@ -234,115 +95,6 @@ STATE_LABELS = {
     SinkState.ERROR:     "Error",
     SinkState.STOPPED:   "Stopped",
 }
-
-
-# ---------------------------------------------------------------------------
-# Settings  (persisted to %APPDATA%\BT-AudioSink\config.json)
-# ---------------------------------------------------------------------------
-
-class Settings:
-    """
-    Holds all user-configurable parameters.
-
-    Autostart state is intentionally read from the registry rather than
-    config.json so it always reflects the true system state even if the
-    registry entry was removed externally.
-    """
-
-    device_name: str = "PC-AudioSink"
-    usb_filter: str = ""                   # Selected dongle; chosen at runtime, not persisted
-    latency_ms: int = 50
-    max_bitpool: int = 53
-    audio_device_name: Optional[str] = None  # WASAPI output device; None = system default
-    debug_mode: bool = False
-    autostart: bool = False
-    volume: float = 1.0
-    discoverable_timeout_s: int = 0        # 0 = never auto-off
-    class_of_device: int = 0x240418        # Headphones by default
-    sbc_block_length: int = 0              # 4/8/12/16, 0 = Auto (source chooses)
-    sbc_subbands: int = 0                  # 4/8, 0 = Auto
-    sbc_allocation: str = "auto"           # "auto", "loudness" or "snr"
-    media_keys: bool = False               # forward keyboard media keys via AVRCP
-    notifications: bool = True             # Windows toasts on connect/disconnect/pairing
-    offer_aptx: bool = False               # advertise aptX / aptX HD (experimental)
-    multi_device_mode: str = "mix"         # "mix" | "duck" | "solo"
-    duck_level: int = 25                   # background volume in percent for "duck"
-    recording_dir: str = ""                # "" = ~/Music/BT-AudioSink
-    eq_bass: int = 0                       # dB, -12..+12 (0 = flat)
-    eq_mid: int = 0
-    eq_treble: int = 0
-
-    #: Keys persisted in config.json and the JSON types accepted for each.
-    _PERSIST: dict[str, tuple[type, ...]] = {
-        "device_name":            (str,),
-        "latency_ms":             (int,),
-        "max_bitpool":            (int,),
-        "audio_device_name":      (str, type(None)),
-        "debug_mode":             (bool,),
-        "volume":                 (int, float),
-        "discoverable_timeout_s": (int,),
-        "class_of_device":        (int,),
-        "sbc_block_length":       (int,),
-        "sbc_subbands":           (int,),
-        "sbc_allocation":         (str,),
-        "media_keys":             (bool,),
-        "notifications":          (bool,),
-        "offer_aptx":             (bool,),
-        "multi_device_mode":      (str,),
-        "duck_level":             (int,),
-        "recording_dir":          (str,),
-        "eq_bass":                (int,),
-        "eq_mid":                 (int,),
-        "eq_treble":              (int,),
-    }
-
-    @property
-    def audio_filter(self) -> str:
-        return build_eq_filter(self.eq_bass, self.eq_mid, self.eq_treble)
-
-    @property
-    def effective_recording_dir(self) -> str:
-        return self.recording_dir or os.path.join(os.path.expanduser("~"), "Music", "BT-AudioSink")
-
-    def load(self) -> None:
-        """
-        Loads persisted values from config.json and autostart state from the
-        registry.  Unreadable files and wrongly typed values fall back to the
-        defaults instead of crashing the app at startup.
-        """
-        data: dict = {}
-        try:
-            with open(_config_file(), encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                data = loaded
-        except FileNotFoundError:
-            pass  # First launch
-        except Exception as e:
-            log.warning("Config unreadable, using defaults: %s", e)
-
-        for key, types in self._PERSIST.items():
-            if key not in data:
-                continue
-            value = data[key]
-            # bool is a subclass of int; keep it out of int-only fields
-            if isinstance(value, bool) and bool not in types:
-                continue
-            if isinstance(value, types):
-                setattr(self, key, value)
-        self.autostart = _get_autostart()
-
-    def save(self) -> None:
-        """Writes persisted values to config.json, creating the directory if needed."""
-        try:
-            os.makedirs(_appdata_dir(), exist_ok=True)
-            with open(_config_file(), "w", encoding="utf-8") as f:
-                json.dump({k: getattr(self, k) for k in self._PERSIST}, f, indent=2)
-        except OSError as e:
-            log.warning("Save settings: %s", e)
-
-
-settings = Settings()
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +358,22 @@ class SettingsDialog(ctk.CTkToplevel):
             variable=self._notify_var,
         ).pack(anchor="w", padx=20, pady=(8, 0))
 
+        api_row = ctk.CTkFrame(self._s, fg_color="transparent")
+        api_row.pack(fill="x", padx=20, pady=(8, 0))
+        self._api_var = ctk.BooleanVar(value=settings.api_enabled)
+        ctk.CTkCheckBox(
+            api_row, text="Local control API on port", variable=self._api_var,
+        ).pack(side="left")
+        self._api_port_var = ctk.StringVar(value=str(settings.api_port))
+        ctk.CTkEntry(api_row, textvariable=self._api_port_var, width=70).pack(side="left", padx=(6, 0))
+        ctk.CTkLabel(
+            self._s,
+            text="http://127.0.0.1:<port>/ shows a small remote control page; scripts can use "
+                 "the /api endpoints (see src/api_server.py). Only reachable from this PC. "
+                 "Takes effect after restarting the app.",
+            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF", wraplength=360,
+        ).pack(fill="x", padx=44)
+
         self._media_keys_var = ctk.BooleanVar(value=settings.media_keys)
         ctk.CTkCheckBox(
             self._s,
@@ -769,6 +537,11 @@ class SettingsDialog(ctk.CTkToplevel):
         settings.debug_mode = self._debug_var.get()
         settings.media_keys = self._media_keys_var.get()
         settings.notifications = self._notify_var.get()
+        settings.api_enabled = self._api_var.get()
+        try:
+            settings.api_port = max(1024, min(65535, int(self._api_port_var.get())))
+        except ValueError:
+            settings.api_port = 8765
         settings.autostart = self._autostart_var.get()
         _set_autostart(settings.autostart)  # Sync registry immediately
         settings.save()
@@ -1326,6 +1099,7 @@ class App(ctk.CTk):
         self._active_stream_addr = ""   # device whose stream started most recently
         self._media_keys: Optional[MediaKeyListener] = None
         self._eq_after: Optional[str] = None   # pending after() id for the EQ debounce
+        self._api: Optional[ApiServer] = None
 
         self._build_ui()
         self._log("Ready – scanning USB dongles…")
@@ -1338,9 +1112,37 @@ class App(ctk.CTk):
         # The tray icon exists from the start so notifications work while the
         # window is visible but behind other windows.
         self.after(200, self._ensure_tray_icon)
+        self.after(300, self._start_api)
 
         if start_minimized and _TRAY_AVAILABLE:
             self.after(100, self._minimize_to_tray)
+
+    # ------------------------------------------------------------------
+    # Local HTTP control API
+    # ------------------------------------------------------------------
+
+    def _start_api(self) -> None:
+        if not settings.api_enabled or self._api is not None:
+            return
+        controller = BackendController(
+            get_backend=lambda: self._backend,
+            start=lambda: self.after(0, self._start_backend),
+            stop=lambda: self.after(0, self._stop_backend),
+            settings=settings,
+        )
+        api = ApiServer(controller, port=settings.api_port)
+        try:
+            api.start()
+        except OSError as exc:
+            self._log(f"Control API not started: {exc}")
+            return
+        self._api = api
+        self._log(f"Control API: {api.url}")
+
+    def _stop_api(self) -> None:
+        if self._api is not None:
+            self._api.stop()
+            self._api = None
 
     # ------------------------------------------------------------------
     # Backend → mainloop marshalling
@@ -1946,25 +1748,8 @@ class App(ctk.CTk):
         self._scan_dongle_btn.configure(state="disabled")
 
         self._backend = SinkBackend(
-            device_name=settings.device_name,
-            usb_filter=settings.usb_filter,
-            latency_ms=settings.latency_ms,
-            max_bitpool=settings.max_bitpool,
-            volume=settings.volume,
-            audio_device_index=resolve_output_device_index(settings.audio_device_name),
-            ffmpeg_exe=_get_ffmpeg(),
-            debug=settings.debug_mode,
-            keystore_path=_keystore_file(),
             device_store=self.device_store,
-            discoverable_timeout_s=settings.discoverable_timeout_s,
-            class_of_device=settings.class_of_device,
-            sbc_block_length=settings.sbc_block_length,
-            sbc_subbands=settings.sbc_subbands,
-            sbc_allocation=settings.sbc_allocation,
-            offer_aptx=settings.offer_aptx,
-            multi_device_mode=settings.multi_device_mode,
-            duck_level=settings.duck_level / 100.0,
-            audio_filter=settings.audio_filter,
+            **settings.backend_kwargs(),
             on_state_change=self._ui(gen, self._on_state_change),
             on_device_connected=self._ui(gen, self._on_device_connected),
             on_device_disconnected=self._ui(gen, self._on_device_disconnected),
@@ -2257,6 +2042,7 @@ class App(ctk.CTk):
         """
         settings.save()   # volume changes on the main window are only saved here
         self._stop_media_keys()
+        self._stop_api()
         if self._tray_icon is not None:
             try:
                 self._tray_icon.stop()  # type: ignore[union-attr]
@@ -2294,6 +2080,10 @@ class App(ctk.CTk):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    if "--headless" in sys.argv:
+        # Same executable, no window: see headless.py (control via the HTTP API)
+        from headless import main as headless_main
+        sys.exit(headless_main([a for a in sys.argv[1:] if a != "--headless"]))
     # The --minimized flag is written into the Windows autostart registry entry
     # so the app starts hidden when the user logs in.
     start_minimized = "--minimized" in sys.argv

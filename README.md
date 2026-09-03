@@ -231,6 +231,41 @@ To reset all pairings use **Settings → Forget all paired devices** (or delete 
 
 ---
 
+## Headless mode and control API
+
+The sink can run without a window, using the same settings and remembered
+devices as the GUI:
+
+```powershell
+python src\headless.py                # or: BT-AudioSink.exe --headless
+python src\headless.py --list-dongles
+python src\headless.py --dongle "VID:0A12" --name "Living room" --allow-unknown
+```
+
+Remembered devices are approved automatically; unknown devices are denied unless
+`--allow-unknown` is given (then they are approved and remembered). Stop with Ctrl+C.
+
+Both the headless runner (by default) and the GUI (Settings → "Local control API")
+can expose a small HTTP API on `127.0.0.1`:
+
+| Method | Path | Body |
+|--------|------|------|
+| GET | `/` | remote-control web page |
+| GET | `/api/status` | – |
+| POST | `/api/start`, `/api/stop` | – |
+| POST | `/api/pairing` | `{"allowed": true}` |
+| POST | `/api/volume` | `{"percent": 80}` |
+| POST | `/api/eq` | `{"bass": 3, "mid": 0, "treble": -2}` |
+| POST | `/api/devices/<addr>/volume` | `{"percent": 50}` |
+| POST | `/api/devices/<addr>/mute` | `{"muted": true}` |
+| POST | `/api/devices/<addr>/player` | `{"action": "play"}` (play, pause, stop, next, prev) |
+| POST | `/api/devices/<addr>/record` | `{"enabled": true}` |
+| POST | `/api/devices/<addr>/connect`, `/disconnect` | – |
+
+The API is bound to localhost only and has no authentication.
+
+---
+
 ## System tray
 
 Clicking the **–** button hides the window to the system tray instead of closing the app.
@@ -310,7 +345,12 @@ WinBTsink/
 ├── start.bat               ← Launches the GUI via Python
 ├── src/
 │   ├── gui.py              ← CustomTkinter GUI (entry point)
+│   ├── headless.py         ← Run without a window (python src\headless.py / exe --headless)
 │   ├── backend.py          ← Bluetooth + audio backend (launches btstack_sink.exe)
+│   ├── config.py           ← Settings, data paths, audio device list
+│   ├── device_store.py     ← Remembered devices (name, volume, auto-connect)
+│   ├── api_server.py       ← Local HTTP control API
+│   ├── media_keys.py       ← Keyboard media keys → AVRCP
 │   ├── usb_devices.py      ← Attached USB Bluetooth dongles via SetupAPI
 │   └── winusb_installer.py ← Zadig download / launch helper
 ├── btstack/

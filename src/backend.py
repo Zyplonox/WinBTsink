@@ -608,6 +608,8 @@ class SinkBackend:
         self._device_volumes: dict[str, float] = {}        # addr → per-device gain
         self._device_muted: set[str] = set()
         self._recorders: dict[str, WavRecorder] = {}       # addr → active recording
+        self._playback: dict[str, str] = {}                # addr → last AVRCP playback status
+        self._names: dict[str, str] = {}                   # addr → resolved remote name
 
     # ------------------------------------------------------------------
     # Public API
@@ -616,6 +618,51 @@ class SinkBackend:
     @property
     def state(self) -> SinkState:
         return self._state
+
+    @property
+    def pairing_allowed(self) -> bool:
+        return self._pairing_allowed
+
+    @property
+    def master_volume(self) -> float:
+        return self._volume
+
+    def display_name(self, addr: str) -> str:
+        """Resolved remote name, else the stored one, else the address."""
+        addr = addr.upper()
+        with self._lock:
+            return self._names.get(addr) or self._store.name(addr) or addr
+
+    def snapshot(self) -> dict:
+        """JSON-friendly view of the current state (for the HTTP API / CLI)."""
+        with self._lock:
+            devices = []
+            for addr in sorted(self._connected_addrs):
+                pipeline = self._pipelines.get(addr)
+                devices.append({
+                    "addr": addr,
+                    "name": self._names.get(addr) or self._store.name(addr) or "",
+                    "remembered": self._store.is_remembered(addr),
+                    "streaming": addr in self._streaming,
+                    "codec": self._codec_types.get(addr) if addr in self._streaming else None,
+                    "sample_rate": pipeline.sample_rate if pipeline else None,
+                    "volume": round(self._device_volumes.get(addr, 1.0), 3),
+                    "muted": addr in self._device_muted,
+                    "playback": self._playback.get(addr, ""),
+                    "recording": addr in self._recorders,
+                })
+            return {
+                "state": self._state.name.lower(),
+                "pairing_allowed": self._pairing_allowed,
+                "master_volume": round(self._volume, 3),
+                "multi_device_mode": self._multi_mode,
+                "audio_filter": self._audio_filter,
+                "devices": devices,
+                "remembered": [
+                    {"addr": a, "name": info.get("name", ""), "auto_connect": bool(info.get("auto_connect"))}
+                    for a, info in self._store.devices.items()
+                ],
+            }
 
     # ---- volume: master gain × per-device gain × mute ----------------
 
@@ -1074,6 +1121,7 @@ class SinkBackend:
             name = event.get("name", "")
             if name:
                 with self._lock:
+                    self._names[addr] = name
                     if self._store.set_name(addr, name):
                         self._save_store()
                 if self._cb_device_name:
@@ -1126,8 +1174,11 @@ class SinkBackend:
                 self._cb_volume_changed(addr, int(event.get("volume", 0)))
 
         elif evt == "playback":
+            status = str(event.get("status", ""))
+            with self._lock:
+                self._playback[addr] = status
             if self._cb_playback_status:
-                self._cb_playback_status(addr, str(event.get("status", "")))
+                self._cb_playback_status(addr, status)
 
         elif evt == "stats":
             if self._cb_stats:
@@ -1159,6 +1210,7 @@ class SinkBackend:
                 self._connected_addrs.discard(addr)     # before stopping: blocks a
                 self._streaming.discard(addr)           # concurrent pipeline restart
                 self._codec_types.pop(addr, None)
+                self._playback.pop(addr, None)
                 self._session_allowed.pop(addr, None)   # "allow once" ends here
                 none_left = not self._connected_addrs
             self._stop_pipeline(addr)

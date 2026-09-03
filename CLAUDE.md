@@ -24,6 +24,7 @@ python -m pip install -r requirements.txt
 
 # Run from source
 python src\gui.py
+python src\headless.py            # no window; HTTP API on 127.0.0.1:8765 (see src/api_server.py)
 
 # Full release build: C engine + pip + PyInstaller -> dist\BT-AudioSink.exe
 powershell -ExecutionPolicy Bypass -File .\build.ps1
@@ -33,16 +34,22 @@ MSYS2 is looked up via `MSYS2_ROOT`, `C:\msys64`, `C:\tools\msys64`. The C build
 
 ## Architecture
 
+### Modules
+
+`src/config.py` holds `Settings` (persisted to `%APPDATA%\BT-AudioSink\config.json`, typed loading, `backend_kwargs()`), the data-file paths, the WASAPI output-device list and the autostart registry helpers; it imports no Tk so `headless.py` can use it. `device_store.py` is the remembered-device list shared by GUI and backend. `api_server.py` is the HTTP API; `BackendController` adapts a backend to it and is used by both the GUI and the headless runner. `media_keys.py` registers global media hotkeys on its own message-loop thread.
+
 ### Process topology and IPC
 
 ```
-gui.py (Tk mainloop)
+gui.py (Tk mainloop) or headless.py
   └─ SinkBackend (src/backend.py) — plain threads, no asyncio
        ├─ btstack_sink.exe  (btstack/btstack_sink.c)   spawned via subprocess.Popen
        │     argv   : <usb_filter> <device_name> <max_bitpool> <debug> <cod_hex> <keystore_path>
-       │              <sbc_block_length> <sbc_subbands> <sbc_allocation>   (0 = offer all)
-       │     stdin  : JSON command lines  (approve / deny / set_discoverable / set_volume / stop)
-       │     stderr : JSON event lines    (ready / l2cap_request / connected / name / audio_start / ...)
+       │              <sbc_block_length> <sbc_subbands> <sbc_allocation> <vendor_codecs>
+       │     stdin  : JSON command lines  (approve / deny / set_discoverable / set_volume / player /
+       │              forget_key / connect / disconnect / stop)
+       │     stderr : JSON event lines    (ready / l2cap_request / connected / name / audio_start /
+       │              playback / metadata / stats / connect_failed / ...)
        │     stdout : BINARY audio frames [u32le len][6-byte bd_addr][SBC or AAC payload]
        └─ AudioPipeline (one per connected device)
              ffmpeg subprocess (stdin = raw codec frames, stdout = s16le PCM)
