@@ -142,6 +142,8 @@ If you already have MSYS2, `bash btstack/do_build.sh` does the clone/patch/build
 | **Stop** | Stop everything cleanly |
 | **Settings** | Device name, latency, audio device, autostart |
 | **USB Dongle** | Dropdown + Scan button: select the WinUSB dongle to use |
+| **Connect to** | Connect to a remembered device from the PC side (the device must be on and in range). Devices with "auto-connect" (Settings) are connected automatically after Start. |
+| Device card | Per device: player controls, volume + mute, audio output, codec badge, ✕ to disconnect |
 | **Volume** | Output volume slider (0–200%) |
 | **Allow new pairings** | Toggle: allow unknown devices to pair (see Security) |
 | **Install WinUSB…** | Download & launch Zadig |

@@ -59,6 +59,7 @@ class DeviceStore:
                     self.devices[str(addr).upper()] = {
                         "name": str(info.get("name", "")),
                         "volume": float(info.get("volume", 1.0)),
+                        "auto_connect": bool(info.get("auto_connect", False)),
                     }
                 self.forget_keys = [str(a).upper() for a in data.get("forget_keys", [])]
             else:
@@ -127,6 +128,17 @@ class DeviceStore:
             return False
         entry["volume"] = round(max(0.0, min(2.0, volume)), 3)
         return True
+
+    def auto_connect(self, addr: str) -> bool:
+        return bool(self.devices.get(addr.upper(), {}).get("auto_connect", False))
+
+    def set_auto_connect(self, addr: str, enabled: bool) -> None:
+        entry = self.devices.get(addr.upper())
+        if entry is not None:
+            entry["auto_connect"] = bool(enabled)
+
+    def auto_connect_addrs(self) -> list[str]:
+        return [a for a, info in self.devices.items() if info.get("auto_connect")]
 
     def pop_pending_forget(self) -> list[str]:
         pending, self.forget_keys = self.forget_keys, []

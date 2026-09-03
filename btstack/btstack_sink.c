@@ -11,6 +11,8 @@
  *                  {"cmd":"set_volume","addr":"XX:XX:XX:XX:XX:XX","volume":90}
  *                  {"cmd":"player","addr":"XX:XX:XX:XX:XX:XX","action":"play|pause|stop|next|prev"}
  *                  {"cmd":"forget_key","addr":"XX:XX:XX:XX:XX:XX"}   drop the bonding key
+ *                  {"cmd":"connect","addr":"XX:XX:XX:XX:XX:XX"}      sink-initiated A2DP connection
+ *                  {"cmd":"disconnect","addr":"XX:XX:XX:XX:XX:XX"}
  *                  {"cmd":"stop"}
  *
  * stdout (binary): Audio frames, each prefixed by a header:
@@ -31,6 +33,7 @@
  *                  {"event":"volume_changed","addr":"...","volume":90}
  *                  {"event":"metadata","addr":"...","title":"...","artist":"...","album":"..."}
  *                  {"event":"playback","addr":"...","status":"playing|paused|stopped|seeking|error"}
+ *                  {"event":"connect_failed","addr":"...","status":12}   (outgoing connect)
  *                  {"event":"log","msg":"..."}
  *                  {"event":"error","msg":"..."}
  *                  All string values are JSON-escaped.
@@ -803,11 +806,28 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
 
     case A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED: {
         uint8_t status = a2dp_subevent_signaling_connection_established_get_status(packet);
-        if (status != ERROR_CODE_SUCCESS) break;
-
         uint16_t cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
         bd_addr_t bd;
         a2dp_subevent_signaling_connection_established_get_bd_addr(packet, bd);
+        if (status != ERROR_CODE_SUCCESS) {
+            char addr_s[18];
+            addr_to_str(bd, addr_s);
+            snprintf(evt, sizeof(evt),
+                     "{\"event\":\"connect_failed\",\"addr\":\"%s\",\"status\":%u}",
+                     addr_s, (unsigned)status);
+            emit_event(evt);
+            clear_pending_avrcp_for_addr(bd);
+            break;
+        }
+
+        /* An outgoing connection never passes the approval gate, so an AVRCP
+         * channel the remote opened meanwhile is still parked: accept it now. */
+        pending_avrcp_t *parked = find_pending_avrcp(bd, 1);
+        if (parked) {
+            emit_log("avrcp: accepting parked connection (A2DP established)");
+            avrcp_accept_incoming_connection(parked->l2cap_cid);
+            parked->valid = 0;
+        }
 
         a2dp_conn_t *conn = alloc_conn();
         if (!conn) {
@@ -1295,6 +1315,38 @@ static void process_command(const char *line) {
                 snprintf(msg, sizeof(msg), "player: %s failed (0x%02x)", action, rc);
                 emit_log(msg);
             }
+        }
+    }
+    else if (strcmp(cmd, "connect") == 0) {
+        bd_addr_t bd;
+        if (!sscanf_bd_addr(addr, bd)) {
+            emit_log("connect: invalid address");
+        } else if (find_conn_by_addr(bd)) {
+            emit_log("connect: already connected");
+        } else {
+            uint16_t new_cid = 0;
+            uint8_t rc = a2dp_sink_establish_stream(bd, &new_cid);
+            char msg[80];
+            if (rc == ERROR_CODE_SUCCESS) {
+                snprintf(msg, sizeof(msg), "connecting to %s", addr);
+                emit_log(msg);
+            } else {
+                snprintf(msg, sizeof(msg), "connect to %s failed (0x%02x)", addr, rc);
+                emit_log(msg);
+                snprintf(msg, sizeof(msg),
+                         "{\"event\":\"connect_failed\",\"addr\":\"%s\",\"status\":%u}",
+                         addr, (unsigned)rc);
+                emit_event(msg);
+            }
+        }
+    }
+    else if (strcmp(cmd, "disconnect") == 0) {
+        bd_addr_t bd;
+        a2dp_conn_t *conn = sscanf_bd_addr(addr, bd) ? find_conn_by_addr(bd) : NULL;
+        if (conn) {
+            a2dp_sink_disconnect(conn->a2dp_cid);
+        } else {
+            emit_log("disconnect: no such connection");
         }
     }
     else if (strcmp(cmd, "forget_key") == 0) {

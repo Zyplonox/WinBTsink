@@ -613,6 +613,18 @@ class SettingsDialog(ctk.CTkToplevel):
                           fg_color="#374151", hover_color="#7F1D1D",
                           command=lambda a=addr, n=name: self._forget_device(a, n),
                           ).pack(side="right")
+            auto_var = ctk.BooleanVar(value=bool(info.get("auto_connect")))
+            ctk.CTkCheckBox(
+                row, text="auto-connect", variable=auto_var, width=100,
+                font=ctk.CTkFont(size=11), checkbox_width=16, checkbox_height=16,
+                command=lambda a=addr, v=auto_var: self._set_auto_connect(a, v.get()),
+            ).pack(side="right", padx=(0, 8))
+
+    def _set_auto_connect(self, addr: str, enabled: bool) -> None:
+        self._store.set_auto_connect(addr, enabled)
+        error = self._store.save()
+        if error:
+            self.master._log(f"Could not save device list ({error})")  # type: ignore[attr-defined]
 
     def _forget_device(self, addr: str, name: str) -> None:
         self._store.forget(addr)
@@ -1048,6 +1060,7 @@ class DeviceCard(ctk.CTkFrame):
         on_player=None,   # Callable[[addr: str, action: str], None]
         on_volume=None,   # Callable[[addr: str, percent: int], None]
         on_mute=None,     # Callable[[addr: str, muted: bool], None]
+        on_disconnect=None,  # Callable[[addr: str], None]
         **kwargs,
     ):
         super().__init__(parent, corner_radius=8, **kwargs)
@@ -1056,6 +1069,7 @@ class DeviceCard(ctk.CTkFrame):
         self._on_player = on_player
         self._on_volume = on_volume
         self._on_mute = on_mute
+        self._on_disconnect = on_disconnect
         self.playback_status = ""
         self.muted = False
 
@@ -1086,6 +1100,11 @@ class DeviceCard(ctk.CTkFrame):
             command=self._on_route_selected,
         )
         self._route_menu.pack(side="left")
+        ctk.CTkButton(
+            row1, text="✕", width=26, height=24, font=ctk.CTkFont(size=12),
+            fg_color="#374151", hover_color="#7F1D1D",
+            command=lambda: self._on_disconnect and self._on_disconnect(self._addr),
+        ).pack(side="left", padx=(4, 0))
 
         # ── Row 2: player controls (AVRCP) ─────────────────────────────
         ctl = ctk.CTkFrame(self, fg_color="transparent")
@@ -1378,6 +1397,24 @@ class App(ctk.CTk):
         )
         self._placeholder_lbl.pack(pady=14)
 
+        # "Connect to…" row: sink-initiated connection to a remembered device
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(0, 6))
+        ctk.CTkLabel(row, text="Connect to", font=ctk.CTkFont(size=12),
+                     text_color="#9CA3AF").pack(side="left", padx=(4, 8))
+        self._connect_var = ctk.StringVar(value="no remembered devices")
+        self._connect_choices: dict[str, str] = {}
+        self._connect_menu = ctk.CTkOptionMenu(
+            row, variable=self._connect_var, values=["no remembered devices"],
+            state="disabled", height=26, font=ctk.CTkFont(size=11),
+        )
+        self._connect_menu.pack(side="left", fill="x", expand=True)
+        self._connect_btn = ctk.CTkButton(
+            row, text="Connect", width=80, height=26, state="disabled",
+            fg_color="#374151", hover_color="#4B5563", command=self._connect_selected,
+        )
+        self._connect_btn.pack(side="left", padx=(8, 0))
+
     def _build_level_section(self) -> None:
         """Real-time VU meter progress bar."""
         ctk.CTkLabel(
@@ -1591,6 +1628,37 @@ class App(ctk.CTk):
         if self._backend:
             self._backend.set_device_mute(addr, muted)
 
+    def _on_card_disconnect(self, addr: str) -> None:
+        if self._backend:
+            self._log(f"Disconnecting {self._connected_devices.get(addr, addr)}…")
+            self._backend.disconnect_device(addr)
+
+    # ------------------------------------------------------------------
+    # Sink-initiated connect ("Connect to…" row)
+    # ------------------------------------------------------------------
+
+    def _refresh_connect_row(self) -> None:
+        """Lists remembered devices that are not connected; enabled while running."""
+        choices = [(addr, info.get("name") or addr)
+                   for addr, info in self.device_store.devices.items()
+                   if addr not in self._connected_devices]
+        self._connect_choices = {f"{name}  ({addr})" if name != addr else addr: addr
+                                 for addr, name in choices}
+        labels = list(self._connect_choices) or ["no remembered devices"]
+        self._connect_var.set(labels[0])
+        state = "normal" if (self._running and self._connect_choices) else "disabled"
+        self._connect_menu.configure(values=labels, state=state)
+        self._connect_btn.configure(state=state)
+
+    def _connect_selected(self) -> None:
+        addr = self._connect_choices.get(self._connect_var.get())
+        if addr and self._backend:
+            self._backend.connect_device(addr)
+
+    def _on_connect_failed(self, addr: str) -> None:
+        name = self.device_store.name(addr) or addr
+        self._notify("Connection failed", f"{name} is not reachable.")
+
     def _on_volume_changed_by_source(self, addr: str, vol_127: int) -> None:
         """A source set its absolute volume via AVRCP: follow it on that device's card."""
         addr = addr.upper()
@@ -1769,6 +1837,7 @@ class App(ctk.CTk):
             on_audio_start=self._ui(gen, self._on_audio_start),
             on_pairing_timeout=self._ui(gen, self._on_pairing_timeout),
             on_playback_status=self._ui(gen, self._on_playback_status),
+            on_connect_failed=self._ui(gen, self._on_connect_failed),
         )
         # Pairing switch state is applied by the backend once BTstack is ready
         if self._pairing_switch:
@@ -1776,6 +1845,7 @@ class App(ctk.CTk):
         self._backend.start()
         self._start_media_keys()
         self._title_label.configure(text=settings.device_name)
+        self._refresh_connect_row()
 
     def _stop_backend(self) -> None:
         """Stops the backend on a worker thread and resets the UI to idle."""
@@ -1812,6 +1882,7 @@ class App(ctk.CTk):
         self._placeholder_lbl.pack(pady=14)
         self._level_value = 0.0
         self._on_state_change(SinkState.STOPPED)
+        self._refresh_connect_row()
 
     def _await_stop(self, thread: threading.Thread) -> None:
         """Re-enables Start once the previous engine has fully shut down."""
@@ -1850,6 +1921,7 @@ class App(ctk.CTk):
                 on_player=self._on_player,
                 on_volume=self._on_card_volume,
                 on_mute=self._on_card_mute,
+                on_disconnect=self._on_card_disconnect,
             )
             card.pack(fill="x", padx=4, pady=(0, 4))
             self._device_cards[addr] = card
@@ -1864,6 +1936,7 @@ class App(ctk.CTk):
             self._log("New pairings: blocked (auto)")
         self._notify("Device connected", self._connected_devices[addr])
         self._update_tray_tooltip()
+        self._refresh_connect_row()
 
     def _on_device_disconnected(self, address: str) -> None:
         addr = address.upper()
@@ -1878,6 +1951,7 @@ class App(ctk.CTk):
             self._placeholder_lbl.pack(pady=14)
         self._notify("Device disconnected", name)
         self._update_tray_tooltip()
+        self._refresh_connect_row()
 
     def _poll_level(self) -> None:
         """

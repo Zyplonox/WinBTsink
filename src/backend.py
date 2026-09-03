@@ -430,6 +430,7 @@ class SinkBackend:
         on_audio_start: Optional[Callable[[str, str, dict], None]] = None,    # addr, codec, stream info
         on_pairing_timeout: Optional[Callable[[], None]] = None,
         on_playback_status: Optional[Callable[[str, str], None]] = None,      # addr, playing|paused|stopped|...
+        on_connect_failed: Optional[Callable[[str], None]] = None,            # addr (outgoing connect)
     ):
         # BT / USB parameters
         self._device_name = device_name
@@ -444,6 +445,8 @@ class SinkBackend:
         self._multi_mode = multi_device_mode if multi_device_mode in ("mix", "duck", "solo") else "mix"
         self._duck_level = max(0.0, min(1.0, duck_level))
         self._stream_order: list[str] = []             # streaming devices, most recent last
+        self._connect_queue: list[str] = []            # outgoing connects, one at a time
+        self._connecting: Optional[str] = None
 
         # Audio parameters
         self._latency_ms = latency_ms
@@ -464,6 +467,7 @@ class SinkBackend:
         self._cb_audio_start = on_audio_start
         self._cb_pairing_timeout = on_pairing_timeout
         self._cb_playback_status = on_playback_status
+        self._cb_connect_failed = on_connect_failed
 
         # Feature flags / persistence
         self._debug = debug
@@ -581,6 +585,41 @@ class SinkBackend:
         if addr:
             cmd["addr"] = addr.upper()
         self._send_cmd(cmd)
+
+    # ---- sink-initiated connections -----------------------------------
+
+    def connect_device(self, addr: str) -> None:
+        """
+        Connects to a (remembered) source from our side. Requests are queued
+        and issued one at a time; the next starts when the previous one
+        succeeded or failed.
+        """
+        addr = addr.upper()
+        with self._lock:
+            if addr in self._connected_addrs or addr == self._connecting or addr in self._connect_queue:
+                return
+            self._connect_queue.append(addr)
+        self._connect_next()
+
+    def disconnect_device(self, addr: str) -> None:
+        self._send_cmd({"cmd": "disconnect", "addr": addr.upper()})
+
+    def _connect_next(self) -> None:
+        with self._lock:
+            if self._connecting or not self._connect_queue or self._stopping:
+                return
+            if self._state not in (SinkState.READY, SinkState.CONNECTED):
+                return
+            self._connecting = self._connect_queue.pop(0)
+            addr = self._connecting
+        self._log(f"Connecting to {addr}…")
+        self._send_cmd({"cmd": "connect", "addr": addr})
+
+    def _connect_finished(self, addr: str) -> None:
+        with self._lock:
+            if self._connecting == addr:
+                self._connecting = None
+        self._connect_next()
 
     PLAYER_ACTIONS = ("play", "pause", "stop", "next", "prev")
 
@@ -841,6 +880,15 @@ class SinkBackend:
                     self._send_cmd({"cmd": "forget_key", "addr": forget_addr})
                 if pending:
                     self._save_store()
+                auto = self._store.auto_connect_addrs()
+            for auto_addr in auto:
+                self.connect_device(auto_addr)
+
+        elif evt == "connect_failed":
+            self._log(f"Could not connect to {addr} (status {event.get('status', '?')})")
+            self._connect_finished(addr)
+            if self._cb_connect_failed:
+                self._cb_connect_failed(addr)
 
         elif evt == "l2cap_request":
             self._handle_l2cap_request(addr, int(event.get("cid", 0)))
@@ -862,6 +910,7 @@ class SinkBackend:
             self._set_state(SinkState.CONNECTED)
             if self._cb_connected:
                 self._cb_connected(addr)
+            self._connect_finished(addr)
 
         elif evt == "audio_start":
             sample_rate = int(event.get("sample_rate", 44100))
