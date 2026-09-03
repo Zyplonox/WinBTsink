@@ -142,6 +142,14 @@ _DE: dict[str, str] = {
         "Play/Pause, Weiter, Zurück und Stopp gehen per AVRCP an das Handy, solange der "
         "BT-Stack läuft. Andere Programme bekommen die Tasten währenddessen nicht.",
     "Language": "Sprache",
+    "Check for updates at start-up": "Beim Start nach Updates suchen",
+    "Check now": "Jetzt prüfen",
+    "Update available": "Update verfügbar",
+    "Version {tag} is available – click to open the release page.":
+        "Version {tag} ist verfügbar – klicken, um die Release-Seite zu öffnen.",
+    "⬆ Update {tag} available": "⬆ Update {tag} verfügbar",
+    "You are running the latest version ({v}).": "Du hast die aktuelle Version ({v}).",
+    "Update check failed (offline?).": "Update-Prüfung fehlgeschlagen (offline?).",
     "Auto (Windows language)": "Automatisch (Windows-Sprache)",
     "Takes effect after restarting the app.": "Wirksam nach Neustart der App.",
     "Remembered devices": "Gemerkte Geräte",

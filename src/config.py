@@ -22,6 +22,7 @@ from backend import build_eq_filter
 log = logging.getLogger("bt-sink.config")
 
 APP_NAME = "BT-AudioSink"
+VERSION = "2.1.0"
 
 
 def configure_logging(level: int = logging.INFO) -> None:
@@ -219,6 +220,7 @@ class Settings:
     api_enabled: bool = False              # local HTTP control API (api_server.py)
     api_port: int = 8765
     language: str = "auto"                 # "auto" (Windows UI language), "en" or "de"
+    update_check: bool = True              # ask GitHub for a newer release at start-up
 
     #: Keys persisted in config.json and the JSON types accepted for each.
     _PERSIST: dict[str, tuple[type, ...]] = {
@@ -245,6 +247,7 @@ class Settings:
         "api_enabled":            (bool,),
         "api_port":               (int,),
         "language":               (str,),
+        "update_check":           (bool,),
     }
 
     @property

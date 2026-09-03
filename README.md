@@ -178,6 +178,7 @@ If you already have MSYS2, `bash btstack/do_build.sh` does the clone/patch/build
 | Audio output device | Default | WASAPI output device (per connected device via its card) |
 | Notifications | on | Windows toasts on connect, disconnect and pairing requests |
 | Language | Auto | English or German UI (Auto follows the Windows display language) |
+| Check for updates | on | Asks GitHub for a newer release at start-up; the version label in the header turns into a link when one exists |
 | Recording folder | `~\Music\BT-AudioSink` | Where ⏺ on a device card writes its WAV files (decoded audio, before volume) |
 | Media keys | off | Keyboard Play/Pause/Next/Prev/Stop go to the playing phone |
 | Debug log | off | Verbose protocol logging |

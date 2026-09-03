@@ -41,6 +41,8 @@ from device_store import DeviceStore
 from i18n import tr
 import i18n
 from media_keys import MediaKeyListener
+from update_check import RELEASES_URL, check_for_update, fetch_latest
+from config import VERSION
 
 # Language must be known before the classes below build their option lists.
 settings.load()
@@ -371,6 +373,16 @@ class SettingsDialog(ctk.CTkToplevel):
             variable=self._autostart_var,
         ).pack(anchor="w", padx=20, pady=(8, 0))
 
+        upd_row = ctk.CTkFrame(self._s, fg_color="transparent")
+        upd_row.pack(fill="x", padx=20, pady=(8, 0))
+        self._update_var = ctk.BooleanVar(value=settings.update_check)
+        ctk.CTkCheckBox(upd_row, text="Check for updates at start-up",
+                        variable=self._update_var).pack(side="left")
+        ctk.CTkButton(upd_row, text="Check now", width=90, height=24, font=ctk.CTkFont(size=11),
+                      fg_color="#374151", hover_color="#4B5563",
+                      command=lambda: self.master.check_for_updates(quiet=False),  # type: ignore[attr-defined]
+                      ).pack(side="right")
+
         self._notify_var = ctk.BooleanVar(value=settings.notifications)
         ctk.CTkCheckBox(
             self._s,
@@ -559,6 +571,7 @@ class SettingsDialog(ctk.CTkToplevel):
         settings.notifications = self._notify_var.get()
         settings.language = next(
             (val for lbl, val in self._LANG_OPTIONS if lbl == self._lang_var.get()), "auto")
+        settings.update_check = self._update_var.get()
         settings.api_enabled = self._api_var.get()
         try:
             settings.api_port = max(1024, min(65535, int(self._api_port_var.get())))
@@ -1135,9 +1148,41 @@ class App(ctk.CTk):
         # window is visible but behind other windows.
         self.after(200, self._ensure_tray_icon)
         self.after(300, self._start_api)
+        if settings.update_check:
+            self.after(5000, lambda: self.check_for_updates(quiet=True))
 
         if start_minimized and _TRAY_AVAILABLE:
             self.after(100, self._minimize_to_tray)
+
+    # ------------------------------------------------------------------
+    # Update check (GitHub releases)
+    # ------------------------------------------------------------------
+
+    def check_for_updates(self, quiet: bool = False) -> None:
+        """Runs the network request on a worker thread; quiet = only report a newer release."""
+        def worker() -> None:
+            release = check_for_update(VERSION)
+            latest = release or (None if quiet else fetch_latest())
+            try:
+                self.after(0, self._on_update_result, release, latest, quiet)
+            except (RuntimeError, tk.TclError):
+                pass
+        threading.Thread(target=worker, daemon=True, name="update-check").start()
+
+    def _on_update_result(self, release, latest, quiet: bool) -> None:
+        if release is not None:
+            self._update_url = release.url
+            self._version_label.configure(text=tr("⬆ Update {tag} available").format(tag=release.tag),
+                                          text_color="#F59E0B")
+            self._log(tr("Version {tag} is available – click to open the release page.").format(tag=release.tag))
+            self._notify(tr("Update available"), release.name)
+        elif not quiet:
+            self._log(tr("You are running the latest version ({v}).").format(v=VERSION)
+                      if latest is not None else tr("Update check failed (offline?)."))
+
+    def _open_release_page(self) -> None:
+        import webbrowser
+        webbrowser.open(self._update_url)
 
     # ------------------------------------------------------------------
     # Local HTTP control API
@@ -1233,6 +1278,15 @@ class App(ctk.CTk):
             text_color=STATE_COLORS[SinkState.IDLE], anchor="w",
         )
         self._status_label.pack(fill="x")
+
+        # Version, becomes an "update available" link when a newer release exists
+        self._version_label = ctk.CTkLabel(
+            card, text=f"v{VERSION}", font=ctk.CTkFont(size=11), text_color="#6B7280",
+            cursor="hand2",
+        )
+        self._version_label.pack(side="right", padx=12, anchor="n", pady=12)
+        self._version_label.bind("<Button-1>", lambda _e: self._open_release_page())
+        self._update_url = RELEASES_URL
 
     def _build_dongle_section(self) -> None:
         """Dongle dropdown + Scan button + Install WinUSB link."""
