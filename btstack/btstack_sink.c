@@ -19,7 +19,8 @@
  * stderr (text):   JSON event lines to Python
  *                  {"event":"ready","address":"AA:BB:CC:DD:EE:FF"}
  *                  {"event":"l2cap_request","addr":"...","cid":64}
- *                  {"event":"connected","addr":"...","name":"iPhone"}
+ *                  {"event":"connected","addr":"..."}
+ *                  {"event":"name","addr":"...","name":"iPhone"}     (async, after connected)
  *                  {"event":"disconnected","addr":"..."}
  *                  {"event":"audio_start","addr":"...","sample_rate":44100,"channels":2,"codec":"sbc"}
  *                  {"event":"audio_stop","addr":"..."}
@@ -27,9 +28,22 @@
  *                  {"event":"metadata","addr":"...","title":"...","artist":"...","album":"..."}
  *                  {"event":"log","msg":"..."}
  *                  {"event":"error","msg":"..."}
+ *                  All string values are JSON-escaped.
  *
- * Command-line arguments:
- *   btstack_sink.exe <usb_path> <device_name> <bt_address> <max_bitpool> [debug]
+ * Command-line arguments (all optional, positional):
+ *   btstack_sink.exe <usb_filter> <device_name> <max_bitpool> <debug> <cod_hex> <keystore_path>
+ *     usb_filter     case-insensitive substring of the WinUSB device path that
+ *                    selects the dongle, e.g. "vid_0a12&pid_0001#5&2c1f8b6&0&3#".
+ *                    Empty = first Bluetooth dongle found.
+ *     device_name    advertised Bluetooth name
+ *     max_bitpool    SBC max bitpool advertised in the sink capabilities
+ *     debug          1 = verbose protocol logging
+ *     cod_hex        Class of Device, hex without prefix (e.g. 240418)
+ *     keystore_path  full path of the link-key TLV file. Empty = btstack_keys.db
+ *                    next to this executable.
+ *
+ * Shutting down: send {"cmd":"stop"} or simply close stdin; both power off
+ * HCI and exit the run loop.
  */
 
 #include <stdint.h>
@@ -37,12 +51,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
 #include <process.h>
-#endif
 
 /* BTstack headers */
 #include "btstack.h"
@@ -73,10 +85,10 @@ const hci_cmd_t hci_le_rand = { 0x2018u, "" };
  * Configuration
  * ---------------------------------------------------------------------- */
 
-#define STDIN_BUF_SIZE          512
-#define SBC_STORAGE_SIZE        1024
 #define MAX_CONNECTIONS         4       /* max simultaneous A2DP sources */
 #define META_BUF_SIZE           131     /* AVRCP max attribute size + NUL */
+#define JSON_ESC_FACTOR         6       /* worst case: one byte -> \u00XX */
+#define PRE_APPROVE_TTL_MS      15000   /* how long an AVDTP approval pre-approves AVRCP */
 
 /* -------------------------------------------------------------------------
  * Per-connection state
@@ -96,6 +108,7 @@ typedef struct {
     char     meta_title[META_BUF_SIZE];
     char     meta_artist[META_BUF_SIZE];
     char     meta_album[META_BUF_SIZE];
+    int      name_pending;      /* remote name request still to be issued/answered */
 } a2dp_conn_t;
 
 static a2dp_conn_t g_conns[MAX_CONNECTIONS];
@@ -106,12 +119,8 @@ static uint8_t g_sbc_cfg[MAX_CONNECTIONS][4];
 /* Per-SEP AAC config buffers */
 static uint8_t g_aac_cfg[MAX_CONNECTIONS][6];
 
-/* Local SEIDs assigned to our registered endpoints */
-static uint8_t g_local_seids[MAX_CONNECTIONS];     /* SBC */
-static uint8_t g_aac_seids[MAX_CONNECTIONS];       /* AAC */
-
 /* -------------------------------------------------------------------------
- * Pending L2CAP connections awaiting Python approve/deny
+ * Pending AVDTP L2CAP connections awaiting Python approve/deny
  * ---------------------------------------------------------------------- */
 
 typedef struct {
@@ -122,37 +131,47 @@ typedef struct {
 
 static pending_conn_t g_pending[MAX_CONNECTIONS];
 
-/* AVRCP may connect before AVDTP is accepted (separate L2CAP PSM).
- * Store addr→avrcp_cid pairs here; moved to conn once A2DP establishes. */
-typedef struct { uint8_t addr[6]; uint16_t cid; int valid; } avrcp_early_t;
-static avrcp_early_t g_early_avrcp[MAX_CONNECTIONS];
-
-/* Pending AVRCP connections awaiting AVDTP approval.
+/* -------------------------------------------------------------------------
+ * AVRCP bookkeeping
+ *
+ * AVRCP uses its own L2CAP PSM and may connect before, during, or after the
+ * AVDTP approval round-trip, so two small tables track it:
+ *
+ * g_pending_avrcp[]  AVRCP L2CAP connection gated on the AVDTP decision.
  *   valid=0  empty
- *   valid=1  AVRCP l2cap_cid parked, waiting for AVDTP decision
- *   valid=2  AVDTP approved, AVRCP has not arrived yet (pre-approve) */
+ *   valid=1  AVRCP l2cap_cid parked, waiting for AVDTP approve/deny
+ *   valid=2  AVDTP approved but AVRCP has not arrived yet (pre-approval).
+ *            Expires after PRE_APPROVE_TTL_MS so a stale approval can never
+ *            let a later AVRCP connection bypass the gate.
+ *
+ * g_early_avrcp[]    AVRCP connection *established* while no A2DP connection
+ *                    exists for that address. Promoted into conn->avrcp_cid
+ *                    when A2DP establishes; A2DP release parks it here again.
+ * ---------------------------------------------------------------------- */
+
 typedef struct {
-    int      valid;        /* 0=empty, 1=pending cid, 2=AVDTP-approved await AVRCP */
+    int      valid;
     uint16_t l2cap_cid;
     uint8_t  addr[6];
+    uint32_t created_ms;   /* run-loop time when valid=2 was set */
 } pending_avrcp_t;
 
 static pending_avrcp_t g_pending_avrcp[MAX_CONNECTIONS];
+
+typedef struct { uint8_t addr[6]; uint16_t cid; int valid; } avrcp_early_t;
+static avrcp_early_t g_early_avrcp[MAX_CONNECTIONS];
 
 /* -------------------------------------------------------------------------
  * Global state
  * ---------------------------------------------------------------------- */
 
 static char     g_device_name[64]  = "PC-AudioSink";
-static char     g_bt_address[18]   = "";
-static int      g_usb_path         = 0;
+static char     g_usb_filter[256]  = "";
+static char     g_keystore_path[MAX_PATH] = "";
 static int      g_max_bitpool      = 53;
 static int      g_discoverable     = 0;  /* set via cmd after ready */
 static int      g_debug            = 0;  /* verbose protocol logging when 1 */
 static uint32_t g_cod              = 0x240418; /* Class of Device: Headphones */
-static int      g_sbc_block_length = 16;       /* 4/8/12/16 */
-static int      g_sbc_subbands     = 8;        /* 4 or 8 */
-static int      g_sbc_alloc        = 1;        /* 0=SNR, 1=Loudness */
 
 /* Bonding / link key persistence via Windows TLV store */
 static btstack_tlv_windows_t    g_tlv_context;
@@ -162,23 +181,15 @@ static const btstack_tlv_t     *g_tlv_impl = NULL;
    HCI_STATE_OFF error that would otherwise fire during normal shutdown. */
 static int g_shutdown_requested = 0;
 
-/* SDP records */
+/* SDP records (buffers must outlive sdp_register_service) */
 static uint8_t  g_sdp_a2dp_sink_service[150];
 static uint8_t  g_sdp_avrcp_tg_service[200];   /* AVRCP Target */
 static uint8_t  g_sdp_avrcp_ct_service[200];   /* AVRCP Controller */
-static uint32_t g_sdp_handle_a2dp      = 0;
-static uint32_t g_sdp_handle_avrcp_tg  = 0;
-static uint32_t g_sdp_handle_avrcp_ct  = 0;
 
-/* stdin reader thread */
-#ifdef _WIN32
-static HANDLE g_stdin_thread = NULL;
-static CRITICAL_SECTION g_cs;
-#endif
-
-/* btstack registered data source for stdin wakeup */
+/* stdin reader thread → run loop hand-off */
+static CRITICAL_SECTION      g_cs;
 static btstack_data_source_t g_stdin_ds;
-static HANDLE                g_stdin_event;   /* signalled by reader thread */
+static HANDLE                g_stdin_event;   /* manual-reset, signalled by reader thread */
 
 /* Ring buffer for commands arriving from Python */
 #define CMD_BUF_LINES 16
@@ -186,6 +197,7 @@ static HANDLE                g_stdin_event;   /* signalled by reader thread */
 static char   g_cmd_buf[CMD_BUF_LINES][CMD_LINE_MAX];
 static int    g_cmd_head = 0;
 static int    g_cmd_tail = 0;
+static int    g_cmd_dropped = 0;   /* lines lost to ring-buffer overflow */
 
 /* -------------------------------------------------------------------------
  * JSON emit helpers
@@ -196,8 +208,43 @@ static void emit_event(const char *json) {
     fflush(stderr);
 }
 
+/* Escape src (len bytes, need not be NUL-terminated) as a JSON string body
+ * into dst. dst_size must be >= len * JSON_ESC_FACTOR + 1 to be lossless;
+ * output is truncated on a character boundary otherwise. */
+static void json_escape(char *dst, size_t dst_size, const uint8_t *src, size_t len) {
+    static const char hex[] = "0123456789abcdef";
+    size_t o = 0;
+    for (size_t i = 0; i < len && src[i]; i++) {
+        uint8_t c = src[i];
+        const char *simple = NULL;
+        switch (c) {
+            case '"':  simple = "\\\""; break;
+            case '\\': simple = "\\\\"; break;
+            case '\n': simple = "\\n";  break;
+            case '\r': simple = "\\r";  break;
+            case '\t': simple = "\\t";  break;
+            default: break;
+        }
+        if (simple) {
+            if (o + 2 >= dst_size) break;
+            dst[o++] = simple[0];
+            dst[o++] = simple[1];
+        } else if (c < 0x20) {
+            if (o + 6 >= dst_size) break;
+            dst[o++] = '\\'; dst[o++] = 'u'; dst[o++] = '0'; dst[o++] = '0';
+            dst[o++] = hex[c >> 4]; dst[o++] = hex[c & 0x0F];
+        } else {
+            if (o + 1 >= dst_size) break;
+            dst[o++] = (char)c;
+        }
+    }
+    dst[o] = '\0';
+}
+
 static void emit_log(const char *msg) {
-    fprintf(stderr, "{\"event\":\"log\",\"msg\":\"%s\"}\n", msg);
+    char esc[512];
+    json_escape(esc, sizeof(esc), (const uint8_t *)msg, strlen(msg));
+    fprintf(stderr, "{\"event\":\"log\",\"msg\":\"%s\"}\n", esc);
     fflush(stderr);
 }
 
@@ -207,18 +254,10 @@ static void addr_to_str(const bd_addr_t addr, char *buf) {
              addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 }
 
-/* JSON-safe copy: replace control chars and quotes so the string is safe
- * to embed directly in a JSON value (no full escape, just strip problems). */
-static void copy_json_safe(char *dst, size_t dst_size,
-                            const uint8_t *val, uint8_t len) {
+/* Copy a length-delimited AVRCP attribute into a NUL-terminated buffer. */
+static void copy_attr(char *dst, size_t dst_size, const uint8_t *val, uint8_t len) {
     size_t copy = (len < dst_size - 1) ? len : dst_size - 1;
-    for (size_t i = 0; i < copy; i++) {
-        uint8_t c = val[i];
-        if (c == '"' || c == '\\' || c < 0x20)
-            dst[i] = ' ';
-        else
-            dst[i] = (char)c;
-    }
+    memcpy(dst, val, copy);
     dst[copy] = '\0';
 }
 
@@ -272,12 +311,53 @@ static a2dp_conn_t *alloc_conn(void) {
     return NULL;
 }
 
+/* -------------------------------------------------------------------------
+ * Early-AVRCP table helpers
+ * ---------------------------------------------------------------------- */
+
+static avrcp_early_t *find_early_avrcp_by_addr(const uint8_t *addr) {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (g_early_avrcp[i].valid && memcmp(g_early_avrcp[i].addr, addr, 6) == 0)
+            return &g_early_avrcp[i];
+    }
+    return NULL;
+}
+
+static avrcp_early_t *find_early_avrcp_by_cid(uint16_t cid) {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (g_early_avrcp[i].valid && g_early_avrcp[i].cid == cid)
+            return &g_early_avrcp[i];
+    }
+    return NULL;
+}
+
+/* Remember an established AVRCP cid for an address without an A2DP conn. */
+static void park_early_avrcp(const uint8_t *addr, uint16_t cid) {
+    avrcp_early_t *e = find_early_avrcp_by_addr(addr);
+    if (!e) {
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (!g_early_avrcp[i].valid) { e = &g_early_avrcp[i]; break; }
+        }
+    }
+    if (!e) {
+        emit_log("avrcp: early table full, dropping connection reference");
+        return;
+    }
+    memcpy(e->addr, addr, 6);
+    e->cid   = cid;
+    e->valid = 1;
+}
+
+/* Release an A2DP slot. A still-open AVRCP channel goes back to the early
+ * table so a later A2DP reconnect from the same device finds it again. */
 static void free_conn(a2dp_conn_t *conn) {
-    if (conn) memset(conn, 0, sizeof(*conn));
+    if (!conn) return;
+    if (conn->avrcp_cid) park_early_avrcp(conn->addr, conn->avrcp_cid);
+    memset(conn, 0, sizeof(*conn));
 }
 
 /* -------------------------------------------------------------------------
- * Pending connection helpers
+ * Pending AVDTP connection helpers
  * ---------------------------------------------------------------------- */
 
 static pending_conn_t *alloc_pending(void) {
@@ -296,6 +376,66 @@ static pending_conn_t *find_pending_by_cid(uint16_t cid) {
 }
 
 /* -------------------------------------------------------------------------
+ * Pending AVRCP helpers
+ * ---------------------------------------------------------------------- */
+
+static pending_avrcp_t *find_pending_avrcp(const uint8_t *addr, int state) {
+    uint32_t now = btstack_run_loop_get_time_ms();
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        pending_avrcp_t *p = &g_pending_avrcp[i];
+        if (p->valid == 2 && (now - p->created_ms) > PRE_APPROVE_TTL_MS) {
+            p->valid = 0;   /* expired pre-approval */
+            continue;
+        }
+        if (p->valid == state && memcmp(p->addr, addr, 6) == 0)
+            return p;
+    }
+    return NULL;
+}
+
+static pending_avrcp_t *alloc_pending_avrcp(void) {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (!g_pending_avrcp[i].valid) return &g_pending_avrcp[i];
+    }
+    return NULL;
+}
+
+/* Forget a pre-approval (valid=2) for an address; parked channels are kept. */
+static void clear_preapproval_for_addr(const uint8_t *addr) {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        pending_avrcp_t *p = &g_pending_avrcp[i];
+        if (p->valid == 2 && memcmp(p->addr, addr, 6) == 0) p->valid = 0;
+    }
+}
+
+/* Drop every pending/pre-approved AVRCP entry for an address. Parked
+ * (valid=1) channels are declined so the remote is not left hanging. */
+static void clear_pending_avrcp_for_addr(const uint8_t *addr) {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        pending_avrcp_t *p = &g_pending_avrcp[i];
+        if (!p->valid || memcmp(p->addr, addr, 6) != 0) continue;
+        if (p->valid == 1) {
+            emit_log("avrcp: declining parked connection");
+            avrcp_decline_incoming_connection(p->l2cap_cid);
+        }
+        p->valid = 0;
+    }
+}
+
+/* Remote name requests are serialised by the controller: issue the next
+ * outstanding one, if any. Called after connect and after each completion. */
+static void request_next_remote_name(void) {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        a2dp_conn_t *c = &g_conns[i];
+        if (!c->active || !c->name_pending) continue;
+        if (gap_remote_name_request(c->addr, 0x01 /* page scan repetition mode R1 */, 0)
+                == ERROR_CODE_SUCCESS) {
+            return;   /* one in flight; the rest follow on completion */
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
  * Audio output — writes addr-tagged length-prefixed frames to stdout
  *
  * Frame format (unchanged; Python knows codec from audio_start event):
@@ -307,20 +447,23 @@ static pending_conn_t *find_pending_by_cid(uint16_t cid) {
 static void write_audio_to_stdout(const bd_addr_t addr,
                                    const uint8_t *data, uint16_t len) {
     uint32_t total = 6u + len;
-    fwrite(&total, 4, 1, stdout);
-    fwrite(addr,   1, 6, stdout);
-    fwrite(data,   1, len, stdout);
-    fflush(stdout);
+    if (fwrite(&total, 4, 1, stdout) != 1 ||
+        fwrite(addr,   1, 6, stdout) != 6 ||
+        fwrite(data,   1, len, stdout) != len ||
+        fflush(stdout) != 0) {
+        /* Parent closed the audio pipe — it is gone or shutting down. */
+        if (!g_shutdown_requested) {
+            emit_log("stdout closed by parent, shutting down");
+            g_shutdown_requested = 1;
+            hci_power_control(HCI_POWER_OFF);
+        }
+    }
 }
 
 /* -------------------------------------------------------------------------
- * AVDTP deferred-accept API  (patched into btstack-src/src/classic/avdtp.c)
+ * AVDTP deferred-accept hook  (avdtp_*_incoming_connection() are added to
+ * BTstack by patches/apply_patches.py and declared in classic/avdtp.h)
  * ---------------------------------------------------------------------- */
-
-extern void avdtp_register_incoming_connection_handler(
-    void (*handler)(uint16_t local_cid, bd_addr_t addr));
-extern void avdtp_accept_incoming_connection(uint16_t local_cid);
-extern void avdtp_decline_incoming_connection(uint16_t local_cid);
 
 /* Called by patched avdtp.c BEFORE L2CAP accept — true deferred accept */
 static void on_avdtp_incoming_connection(uint16_t local_cid, bd_addr_t addr) {
@@ -332,12 +475,10 @@ static void on_avdtp_incoming_connection(uint16_t local_cid, bd_addr_t addr) {
      * new L2CAP connection is the MEDIA channel (opened after AVDTP OPEN).
      * Auto-accept it immediately — no Python round-trip, avoids the timing
      * gap that causes strict sources (e.g. Nintendo Switch 2) to time out. */
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (g_conns[i].active && memcmp(g_conns[i].addr, addr, 6) == 0) {
-            emit_log("avdtp: auto-accepting media channel for established connection");
-            avdtp_accept_incoming_connection(local_cid);
-            return;
-        }
+    if (find_conn_by_addr(addr)) {
+        emit_log("avdtp: auto-accepting media channel for established connection");
+        avdtp_accept_incoming_connection(local_cid);
+        return;
     }
 
     /* First connection from this addr — signaling channel.  Gate via Python. */
@@ -351,6 +492,11 @@ static void on_avdtp_incoming_connection(uint16_t local_cid, bd_addr_t addr) {
     p->l2cap_cid = local_cid;
     memcpy(p->addr, addr, 6);
 
+    /* A new gate starts: forget any earlier pre-approval for this address.
+     * An AVRCP channel parked before this request stays parked and is
+     * answered together with the AVDTP decision. */
+    clear_preapproval_for_addr(addr);
+
     char evt[128];
     snprintf(evt, sizeof(evt),
              "{\"event\":\"l2cap_request\",\"addr\":\"%s\",\"cid\":%u}",
@@ -359,49 +505,39 @@ static void on_avdtp_incoming_connection(uint16_t local_cid, bd_addr_t addr) {
 }
 
 /* -------------------------------------------------------------------------
- * AVRCP deferred-accept API  (patched into btstack-src/src/classic/avrcp.c)
+ * AVRCP deferred-accept hook  (avrcp_*_incoming_connection() are added to
+ * BTstack by patches/apply_patches.py and declared in classic/avrcp.h)
  * ---------------------------------------------------------------------- */
-
-extern void avrcp_register_incoming_connection_handler(
-    void (*handler)(uint16_t local_cid, bd_addr_t addr));
-extern void avrcp_accept_incoming_connection(uint16_t local_cid);
-extern void avrcp_decline_incoming_connection(uint16_t local_cid);
 
 /* Called by patched avrcp.c BEFORE L2CAP accept */
 static void on_avrcp_incoming_connection(uint16_t local_cid, bd_addr_t addr) {
     /* Already an established A2DP connection → auto-accept AVRCP */
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (g_conns[i].active && memcmp(g_conns[i].addr, addr, 6) == 0) {
-            emit_log("avrcp: auto-accepting for established A2DP connection");
-            avrcp_accept_incoming_connection(local_cid);
-            return;
-        }
+    if (find_conn_by_addr(addr)) {
+        emit_log("avrcp: auto-accepting for established A2DP connection");
+        avrcp_accept_incoming_connection(local_cid);
+        return;
     }
 
     /* AVDTP already approved this addr (pre-approval slot) → auto-accept */
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (g_pending_avrcp[i].valid == 2 &&
-            memcmp(g_pending_avrcp[i].addr, addr, 6) == 0) {
-            emit_log("avrcp: auto-accepting (AVDTP pre-approved)");
-            g_pending_avrcp[i].valid = 0;
-            avrcp_accept_incoming_connection(local_cid);
-            return;
-        }
+    pending_avrcp_t *pre = find_pending_avrcp(addr, 2);
+    if (pre) {
+        emit_log("avrcp: auto-accepting (AVDTP pre-approved)");
+        pre->valid = 0;
+        avrcp_accept_incoming_connection(local_cid);
+        return;
     }
 
     /* Park until AVDTP is approved/denied */
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (!g_pending_avrcp[i].valid) {
-            g_pending_avrcp[i].valid     = 1;
-            g_pending_avrcp[i].l2cap_cid = local_cid;
-            memcpy(g_pending_avrcp[i].addr, addr, 6);
-            emit_log("avrcp: gated — waiting for AVDTP approval");
-            return;
-        }
+    pending_avrcp_t *p = alloc_pending_avrcp();
+    if (!p) {
+        emit_log("avrcp: too many pending connections, declining");
+        avrcp_decline_incoming_connection(local_cid);
+        return;
     }
-
-    emit_log("avrcp: too many pending connections, declining");
-    avrcp_decline_incoming_connection(local_cid);
+    p->valid     = 1;
+    p->l2cap_cid = local_cid;
+    memcpy(p->addr, addr, 6);
+    emit_log("avrcp: gated — waiting for AVDTP approval");
 }
 
 /* -------------------------------------------------------------------------
@@ -426,31 +562,20 @@ static void on_avrcp_event(uint8_t packet_type, uint16_t channel,
         avrcp_subevent_connection_established_get_bd_addr(packet, bd);
         emit_log("avrcp: connected (audio may still be pending approval)");
 
-        /* Clear any pre-approval slot for this address */
-        for (int i = 0; i < MAX_CONNECTIONS; i++) {
-            if (g_pending_avrcp[i].valid == 2 &&
-                memcmp(g_pending_avrcp[i].addr, bd, 6) == 0) {
-                g_pending_avrcp[i].valid = 0;
-                break;
-            }
-        }
-
         /* Link into established A2DP connection, or park in early table */
         a2dp_conn_t *conn = find_conn_by_addr(bd);
         if (conn) {
-            /* A2DP already established — link avrcp_cid straight to conn */
-            if (conn->avrcp_cid == 0) conn->avrcp_cid = avrcp_cid;
+            if (conn->avrcp_cid != 0 && conn->avrcp_cid != avrcp_cid) {
+                /* A second AVRCP channel from a device we already track.
+                 * Keep the first one; this one gets no notifications. */
+                emit_log("avrcp: duplicate connection for tracked device, ignoring");
+                break;
+            }
+            conn->avrcp_cid = avrcp_cid;
         } else {
             /* A2DP not yet established (AVRCP arrived before AVDTP accept).
              * Park the cid; A2DP handler will pick it up when conn is allocated. */
-            for (int i = 0; i < MAX_CONNECTIONS; i++) {
-                if (!g_early_avrcp[i].valid) {
-                    memcpy(g_early_avrcp[i].addr, bd, 6);
-                    g_early_avrcp[i].cid   = avrcp_cid;
-                    g_early_avrcp[i].valid = 1;
-                    break;
-                }
-            }
+            park_early_avrcp(bd, avrcp_cid);
         }
         /* Volume-change notifications (target role) */
         avrcp_target_support_event(avrcp_cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
@@ -465,13 +590,8 @@ static void on_avrcp_event(uint8_t packet_type, uint16_t channel,
         uint16_t avrcp_cid = avrcp_subevent_connection_released_get_avrcp_cid(packet);
         a2dp_conn_t *conn = find_conn_by_avrcp_cid(avrcp_cid);
         if (conn) conn->avrcp_cid = 0;
-        /* Also clear from early-AVRCP table if it was never promoted */
-        for (int i = 0; i < MAX_CONNECTIONS; i++) {
-            if (g_early_avrcp[i].valid && g_early_avrcp[i].cid == avrcp_cid) {
-                g_early_avrcp[i].valid = 0;
-                break;
-            }
-        }
+        avrcp_early_t *e = find_early_avrcp_by_cid(avrcp_cid);
+        if (e) e->valid = 0;
         break;
     }
 
@@ -502,10 +622,13 @@ static void on_avrcp_target_event(uint8_t packet_type, uint16_t channel,
         /* Acknowledge to the source */
         avrcp_target_volume_changed(avrcp_cid, abs_vol);
         a2dp_conn_t *conn = find_conn_by_avrcp_cid(avrcp_cid);
+        if (!conn) {
+            if (g_debug) emit_log("avrcp: volume change from untracked connection, ignored");
+            break;
+        }
         snprintf(evt, sizeof(evt),
                  "{\"event\":\"volume_changed\",\"addr\":\"%s\",\"volume\":%u}",
-                 conn ? conn->addr_str : "??:??:??:??:??:??",
-                 (unsigned)abs_vol);
+                 conn->addr_str, (unsigned)abs_vol);
         emit_event(evt);
         break;
     }
@@ -543,7 +666,7 @@ static void on_avrcp_controller_event(uint8_t packet_type, uint16_t channel,
         uint8_t  len       = avrcp_subevent_now_playing_title_info_get_value_len(packet);
         const uint8_t *val = avrcp_subevent_now_playing_title_info_get_value(packet);
         a2dp_conn_t *conn  = find_conn_by_avrcp_cid(avrcp_cid);
-        if (conn) copy_json_safe(conn->meta_title, sizeof(conn->meta_title), val, len);
+        if (conn) copy_attr(conn->meta_title, sizeof(conn->meta_title), val, len);
         break;
     }
 
@@ -552,7 +675,7 @@ static void on_avrcp_controller_event(uint8_t packet_type, uint16_t channel,
         uint8_t  len       = avrcp_subevent_now_playing_artist_info_get_value_len(packet);
         const uint8_t *val = avrcp_subevent_now_playing_artist_info_get_value(packet);
         a2dp_conn_t *conn  = find_conn_by_avrcp_cid(avrcp_cid);
-        if (conn) copy_json_safe(conn->meta_artist, sizeof(conn->meta_artist), val, len);
+        if (conn) copy_attr(conn->meta_artist, sizeof(conn->meta_artist), val, len);
         break;
     }
 
@@ -561,7 +684,7 @@ static void on_avrcp_controller_event(uint8_t packet_type, uint16_t channel,
         uint8_t  len       = avrcp_subevent_now_playing_album_info_get_value_len(packet);
         const uint8_t *val = avrcp_subevent_now_playing_album_info_get_value(packet);
         a2dp_conn_t *conn  = find_conn_by_avrcp_cid(avrcp_cid);
-        if (conn) copy_json_safe(conn->meta_album, sizeof(conn->meta_album), val, len);
+        if (conn) copy_attr(conn->meta_album, sizeof(conn->meta_album), val, len);
         break;
     }
 
@@ -570,14 +693,17 @@ static void on_avrcp_controller_event(uint8_t packet_type, uint16_t channel,
         uint16_t avrcp_cid = avrcp_subevent_now_playing_info_done_get_avrcp_cid(packet);
         a2dp_conn_t *conn  = find_conn_by_avrcp_cid(avrcp_cid);
         if (conn) {
-            char evt[700];
+            char title[META_BUF_SIZE * JSON_ESC_FACTOR];
+            char artist[META_BUF_SIZE * JSON_ESC_FACTOR];
+            char album[META_BUF_SIZE * JSON_ESC_FACTOR];
+            json_escape(title,  sizeof(title),  (const uint8_t *)conn->meta_title,  META_BUF_SIZE);
+            json_escape(artist, sizeof(artist), (const uint8_t *)conn->meta_artist, META_BUF_SIZE);
+            json_escape(album,  sizeof(album),  (const uint8_t *)conn->meta_album,  META_BUF_SIZE);
+            char evt[3 * META_BUF_SIZE * JSON_ESC_FACTOR + 96];
             snprintf(evt, sizeof(evt),
                      "{\"event\":\"metadata\",\"addr\":\"%s\","
                      "\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\"}",
-                     conn->addr_str,
-                     conn->meta_title,
-                     conn->meta_artist,
-                     conn->meta_album);
+                     conn->addr_str, title, artist, album);
             emit_event(evt);
         }
         break;
@@ -623,23 +749,24 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
         addr_to_str(bd, conn->addr_str);
 
         /* Promote any AVRCP connection that arrived before AVDTP was accepted */
-        for (int i = 0; i < MAX_CONNECTIONS; i++) {
-            if (g_early_avrcp[i].valid && memcmp(g_early_avrcp[i].addr, bd, 6) == 0) {
-                conn->avrcp_cid        = g_early_avrcp[i].cid;
-                g_early_avrcp[i].valid = 0;
-                break;
-            }
+        avrcp_early_t *early = find_early_avrcp_by_addr(bd);
+        if (early) {
+            conn->avrcp_cid = early->cid;
+            early->valid    = 0;
         }
+        /* From now on AVRCP from this address is auto-accepted via the
+         * active connection, so any pre-approval slot is obsolete. */
+        clear_preapproval_for_addr(bd);
 
         /* Emit connected with address only — name arrives asynchronously */
         snprintf(evt, sizeof(evt),
-                 "{\"event\":\"connected\",\"addr\":\"%s\",\"name\":\"%s\"}",
-                 conn->addr_str, conn->addr_str);
+                 "{\"event\":\"connected\",\"addr\":\"%s\"}", conn->addr_str);
         emit_event(evt);
 
         /* Request the human-readable device name; result via
            HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE in on_hci_event */
-        gap_remote_name_request(bd, 0x01 /* page scan repetition mode R1 */, 0);
+        conn->name_pending = 1;
+        request_next_remote_name();
         break;
     }
 
@@ -729,6 +856,7 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
                      "{\"event\":\"disconnected\",\"addr\":\"%s\"}",
                      conn->addr_str);
             emit_event(evt);
+            clear_preapproval_for_addr(conn->addr);
             free_conn(conn);
         }
         break;
@@ -746,34 +874,40 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
 static void on_a2dp_media_packet(uint8_t seid, uint8_t *packet, uint16_t size) {
     /*
      * BTstack does NOT strip the RTP header before calling this callback.
-     * RTP header is 12 bytes (fixed, CC=0, no extension).
      *
-     * SBC layout:
-     *   [12 bytes RTP header]
-     *   [ 1 byte  A2DP SBC media payload header (num_frames etc.)]
-     *   [ N bytes raw SBC frames]
-     *   → skip 13 bytes total
-     *
-     * AAC (LATM) layout:
-     *   [12 bytes RTP header]
-     *   [ N bytes LATM/AudioMuxElement payload]
-     *   → skip 12 bytes total (no SBC-style extra byte)
+     *   [12 bytes RTP fixed header][4 * CC bytes CSRC][optional extension]
+     *   SBC:  [1 byte A2DP SBC media payload header][N bytes raw SBC frames]
+     *   AAC:  [N bytes LATM/AudioMuxElement payload]
      */
     a2dp_conn_t *conn = find_conn_by_seid(seid);
     if (!conn) return;
+    if (size < 12) return;
 
-    uint16_t skip;
-    uint16_t min_size;
-    if (conn->codec_type == AVDTP_CODEC_MPEG_2_4_AAC) {
-        skip     = 12;
-        min_size = 13;
-    } else {
-        skip     = 13;
-        min_size = 14;
+    uint16_t offset = 12 + 4u * (packet[0] & 0x0F);       /* CSRC list */
+    if (packet[0] & 0x10) {                                 /* header extension */
+        if (size < offset + 4) return;
+        uint16_t ext_words = (uint16_t)((packet[offset + 2] << 8) | packet[offset + 3]);
+        offset = (uint16_t)(offset + 4 + 4u * ext_words);
     }
-    if (size < min_size) return;
 
-    write_audio_to_stdout(conn->addr, packet + skip, size - skip);
+    if (conn->codec_type != AVDTP_CODEC_MPEG_2_4_AAC) {
+        if (size < offset + 1) return;
+        uint8_t sbc_hdr = packet[offset];
+        offset++;
+        if (sbc_hdr & 0x80) {
+            /* Fragmented SBC frame (F bit). FFmpeg's sbc demuxer needs whole
+             * frames; fragments only occur with bitpools beyond the MTU. */
+            static int warned = 0;
+            if (!warned) {
+                warned = 1;
+                emit_log("sbc: fragmented frames not supported, dropping (lower max bitpool)");
+            }
+            return;
+        }
+    }
+
+    if (size <= offset) return;
+    write_audio_to_stdout(conn->addr, packet + offset, (uint16_t)(size - offset));
 }
 
 /* -------------------------------------------------------------------------
@@ -785,7 +919,6 @@ static btstack_packet_callback_registration_t g_hci_event_cb;
 static void on_hci_event(uint8_t packet_type, uint16_t channel,
                           uint8_t *packet, uint16_t size) {
     UNUSED(channel);
-    UNUSED(size);
 
     if (packet_type != HCI_EVENT_PACKET) return;
 
@@ -804,7 +937,7 @@ static void on_hci_event(uint8_t packet_type, uint16_t channel,
             snprintf(evt, sizeof(evt),
                      "{\"event\":\"ready\",\"address\":\"%s\"}", addr_str);
             emit_event(evt);
-            emit_log(g_debug ? "build: aac+avrcp+debug v10" : "build: aac+avrcp v10");
+            emit_log(g_debug ? "build: v11 (debug)" : "build: v11");
 
             /* Apply initial discoverability (off by default, Python will
                send set_discoverable when the GUI toggle is set). */
@@ -814,10 +947,24 @@ static void on_hci_event(uint8_t packet_type, uint16_t channel,
             if (!g_shutdown_requested) {
                 emit_event("{\"event\":\"error\",\"msg\":\"HCI powered off unexpectedly — USB dongle not accessible. Check WinUSB driver (Zadig) and kill any zombie btstack_sink.exe.\"}");
             }
-            btstack_run_loop_trigger_exit();
+            /* BTstack 1.6.1's Windows run loop never checks the exit flag
+             * (btstack_run_loop_trigger_exit() is a no-op there), so leave
+             * the process directly. stderr is the only thing worth flushing. */
+            fflush(stderr);
+            exit(g_shutdown_requested ? 0 : 1);
         }
         break;
     }
+
+    case BTSTACK_EVENT_POWERON_FAILED:
+        /* Transport could not be opened: no matching WinUSB dongle, wrong
+         * driver, or another process holds it. Without this the parent would
+         * wait for "ready" forever. */
+        emit_event("{\"event\":\"error\",\"msg\":\"Could not open the USB dongle. "
+                   "Is it plugged in, does it use the WinUSB driver (Zadig), and is no other "
+                   "btstack_sink.exe running?\"}");
+        fflush(stderr);
+        exit(1);
 
     case HCI_EVENT_PIN_CODE_REQUEST:
         {
@@ -837,19 +984,26 @@ static void on_hci_event(uint8_t packet_type, uint16_t channel,
 
     case HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE: {
         /* packet[2]=status, packet[3..8]=BD_ADDR, packet[9..]=name */
-        if (packet[2] != ERROR_CODE_SUCCESS) break;
+        if (size < 9) break;
         bd_addr_t bd;
         reverse_bd_addr(&packet[3], bd);
+        a2dp_conn_t *named = find_conn_by_addr(bd);
+        if (named) named->name_pending = 0;
+        request_next_remote_name();
+        if (packet[2] != ERROR_CODE_SUCCESS) break;
+
         char addr_s[18];
         addr_to_str(bd, addr_s);
-        /* Name is null-terminated UTF-8, up to 248 bytes */
-        char name_safe[249];
-        strncpy(name_safe, (const char *)&packet[9], 248);
-        name_safe[248] = '\0';
-        char name_evt[320];
+        /* Name is NUL-terminated UTF-8, up to 248 bytes, but only trust what
+         * the event actually carries */
+        size_t name_len = (size_t)size - 9;
+        if (name_len > 248) name_len = 248;
+        char name_esc[248 * JSON_ESC_FACTOR + 1];
+        json_escape(name_esc, sizeof(name_esc), &packet[9], name_len);
+        char name_evt[sizeof(name_esc) + 64];
         snprintf(name_evt, sizeof(name_evt),
                  "{\"event\":\"name\",\"addr\":\"%s\",\"name\":\"%s\"}",
-                 addr_s, name_safe);
+                 addr_s, name_esc);
         emit_event(name_evt);
         break;
     }
@@ -918,56 +1072,43 @@ static void process_command(const char *line) {
 
     if (strcmp(cmd, "approve") == 0) {
         pending_conn_t *p = find_pending_by_cid(cid);
-        if (p) {
+        if (!p) {
+            emit_log("avdtp: approve for unknown/expired cid, ignored");
+        } else {
             uint8_t addr[6];
             memcpy(addr, p->addr, 6);
             emit_log("avdtp: accepting incoming connection");
             avdtp_accept_incoming_connection(p->l2cap_cid);
             p->valid = 0;
 
-            /* Also accept any pending AVRCP for the same address */
-            int avrcp_handled = 0;
-            for (int i = 0; i < MAX_CONNECTIONS; i++) {
-                if (g_pending_avrcp[i].valid == 1 &&
-                    memcmp(g_pending_avrcp[i].addr, addr, 6) == 0) {
-                    emit_log("avrcp: accepting (AVDTP approved)");
-                    avrcp_accept_incoming_connection(g_pending_avrcp[i].l2cap_cid);
-                    g_pending_avrcp[i].valid = 0;
-                    avrcp_handled = 1;
-                    break;
-                }
-            }
-            if (!avrcp_handled) {
-                /* AVRCP hasn't arrived yet — pre-approve when it does */
-                for (int i = 0; i < MAX_CONNECTIONS; i++) {
-                    if (!g_pending_avrcp[i].valid) {
-                        g_pending_avrcp[i].valid = 2;
-                        memcpy(g_pending_avrcp[i].addr, addr, 6);
-                        break;
-                    }
+            /* Also accept any parked AVRCP for the same address, or
+             * pre-approve the one that is still to come. */
+            pending_avrcp_t *parked = find_pending_avrcp(addr, 1);
+            if (parked) {
+                emit_log("avrcp: accepting (AVDTP approved)");
+                avrcp_accept_incoming_connection(parked->l2cap_cid);
+                parked->valid = 0;
+            } else {
+                pending_avrcp_t *pre = alloc_pending_avrcp();
+                if (pre) {
+                    pre->valid      = 2;
+                    pre->created_ms = btstack_run_loop_get_time_ms();
+                    memcpy(pre->addr, addr, 6);
                 }
             }
         }
     }
     else if (strcmp(cmd, "deny") == 0) {
         pending_conn_t *p = find_pending_by_cid(cid);
-        if (p) {
+        if (!p) {
+            emit_log("avdtp: deny for unknown/expired cid, ignored");
+        } else {
             uint8_t addr[6];
             memcpy(addr, p->addr, 6);
             emit_log("avdtp: declining incoming connection");
             avdtp_decline_incoming_connection(p->l2cap_cid);
             p->valid = 0;
-
-            /* Also decline any pending AVRCP for the same address */
-            for (int i = 0; i < MAX_CONNECTIONS; i++) {
-                if (g_pending_avrcp[i].valid == 1 &&
-                    memcmp(g_pending_avrcp[i].addr, addr, 6) == 0) {
-                    emit_log("avrcp: declining (AVDTP denied)");
-                    avrcp_decline_incoming_connection(g_pending_avrcp[i].l2cap_cid);
-                    g_pending_avrcp[i].valid = 0;
-                    break;
-                }
-            }
+            clear_pending_avrcp_for_addr(addr);
         }
     }
     else if (strcmp(cmd, "set_discoverable") == 0) {
@@ -994,17 +1135,40 @@ static void process_command(const char *line) {
         if (!found && g_debug) emit_log("set_volume: no AVRCP connection for addr");
     }
     else if (strcmp(cmd, "stop") == 0) {
-        emit_log("stop command received");
-        g_shutdown_requested = 1;
-        hci_power_control(HCI_POWER_OFF);
+        /* Idempotent: the parent sends "stop" and then closes stdin, which
+         * enqueues a second one. Re-entering hci_power_control() while BTstack
+         * is already halting would cancel its shutdown timers. */
+        if (!g_shutdown_requested) {
+            emit_log("stop command received");
+            g_shutdown_requested = 1;
+            hci_power_control(HCI_POWER_OFF);
+        }
     }
 }
 
 /* -------------------------------------------------------------------------
  * stdin reader thread — reads lines into g_cmd_buf, signals g_stdin_event
+ *
+ * Only this thread touches stdin; it never calls into BTstack. On EOF
+ * (parent closed the pipe or died) it enqueues a synthetic "stop" so the
+ * run loop shuts HCI down cleanly instead of leaving a zombie holding the
+ * WinUSB handle.
  * ---------------------------------------------------------------------- */
 
-#ifdef _WIN32
+static void enqueue_command(const char *line) {
+    EnterCriticalSection(&g_cs);
+    int next = (g_cmd_head + 1) % CMD_BUF_LINES;
+    if (next != g_cmd_tail) {
+        strncpy(g_cmd_buf[g_cmd_head], line, CMD_LINE_MAX - 1);
+        g_cmd_buf[g_cmd_head][CMD_LINE_MAX - 1] = '\0';
+        g_cmd_head = next;
+    } else {
+        g_cmd_dropped++;
+    }
+    LeaveCriticalSection(&g_cs);
+    SetEvent(g_stdin_event);
+}
+
 static unsigned __stdcall stdin_reader_thread(void *arg) {
     UNUSED(arg);
     char line[CMD_LINE_MAX];
@@ -1013,21 +1177,11 @@ static unsigned __stdcall stdin_reader_thread(void *arg) {
         while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
             line[--len] = '\0';
         if (len == 0) continue;
-
-        EnterCriticalSection(&g_cs);
-        int next = (g_cmd_head + 1) % CMD_BUF_LINES;
-        if (next != g_cmd_tail) {
-            strncpy(g_cmd_buf[g_cmd_head], line, CMD_LINE_MAX - 1);
-            g_cmd_buf[g_cmd_head][CMD_LINE_MAX - 1] = '\0';
-            g_cmd_head = next;
-        }
-        LeaveCriticalSection(&g_cs);
-
-        SetEvent(g_stdin_event);
+        enqueue_command(line);
     }
+    enqueue_command("{\"cmd\":\"stop\"}");
     return 0;
 }
-#endif
 
 /* -------------------------------------------------------------------------
  * BTstack data source callback — drains g_cmd_buf in the run loop thread
@@ -1037,12 +1191,21 @@ static void stdin_ds_callback(btstack_data_source_t *ds, btstack_data_source_cal
     UNUSED(ds);
     UNUSED(type);
 
+    /* Reset BEFORE draining: a line enqueued while we drain re-signals the
+     * event and we get called again. Resetting after the drain could clear a
+     * signal for a line we never saw (lost wake-up). */
+    ResetEvent(g_stdin_event);
+
     for (;;) {
         char line[CMD_LINE_MAX];
+        int dropped;
 
         EnterCriticalSection(&g_cs);
+        dropped = g_cmd_dropped;
+        g_cmd_dropped = 0;
         if (g_cmd_tail == g_cmd_head) {
             LeaveCriticalSection(&g_cs);
+            if (dropped) emit_log("stdin: command ring buffer overflow, lines dropped");
             break;
         }
         strncpy(line, g_cmd_buf[g_cmd_tail], CMD_LINE_MAX - 1);
@@ -1050,10 +1213,9 @@ static void stdin_ds_callback(btstack_data_source_t *ds, btstack_data_source_cal
         g_cmd_tail = (g_cmd_tail + 1) % CMD_BUF_LINES;
         LeaveCriticalSection(&g_cs);
 
+        if (dropped) emit_log("stdin: command ring buffer overflow, lines dropped");
         process_command(line);
     }
-
-    ResetEvent(g_stdin_event);
 }
 
 /* -------------------------------------------------------------------------
@@ -1067,7 +1229,7 @@ static void setup_sdp(void) {
                                 sdp_create_service_record_handle(),
                                 AVDTP_SINK_FEATURE_MASK_HEADPHONE,
                                 NULL, NULL);
-    g_sdp_handle_a2dp = sdp_register_service(g_sdp_a2dp_sink_service);
+    sdp_register_service(g_sdp_a2dp_sink_service);
 
     /* AVRCP Target service record */
     memset(g_sdp_avrcp_tg_service, 0, sizeof(g_sdp_avrcp_tg_service));
@@ -1075,7 +1237,7 @@ static void setup_sdp(void) {
                                    sdp_create_service_record_handle(),
                                    AVRCP_FEATURE_MASK_CATEGORY_PLAYER_OR_RECORDER,
                                    NULL, NULL);
-    g_sdp_handle_avrcp_tg = sdp_register_service(g_sdp_avrcp_tg_service);
+    sdp_register_service(g_sdp_avrcp_tg_service);
 
     /* AVRCP Controller service record (allows us to query track metadata) */
     memset(g_sdp_avrcp_ct_service, 0, sizeof(g_sdp_avrcp_ct_service));
@@ -1083,7 +1245,7 @@ static void setup_sdp(void) {
                                        sdp_create_service_record_handle(),
                                        AVRCP_FEATURE_MASK_CATEGORY_MONITOR_OR_AMPLIFIER,
                                        NULL, NULL);
-    g_sdp_handle_avrcp_ct = sdp_register_service(g_sdp_avrcp_ct_service);
+    sdp_register_service(g_sdp_avrcp_ct_service);
 }
 
 /* -------------------------------------------------------------------------
@@ -1091,30 +1253,27 @@ static void setup_sdp(void) {
  * ---------------------------------------------------------------------- */
 
 int main(int argc, char *argv[]) {
-#ifdef _WIN32
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stdin),  _O_TEXT);
-#endif
 
-    if (argc >= 2)  g_usb_path         = atoi(argv[1]);
-    if (argc >= 3)  strncpy(g_device_name, argv[2], sizeof(g_device_name) - 1);
-    if (argc >= 4)  strncpy(g_bt_address,  argv[3], sizeof(g_bt_address) - 1);
-    if (argc >= 5)  g_max_bitpool       = atoi(argv[4]);
-    if (argc >= 6)  g_debug             = atoi(argv[5]);
-    if (argc >= 7)  g_cod               = (uint32_t)strtoul(argv[6], NULL, 16);
-    if (argc >= 8)  g_sbc_block_length  = atoi(argv[7]);
-    if (argc >= 9)  g_sbc_subbands      = atoi(argv[8]);
-    if (argc >= 10) g_sbc_alloc         = atoi(argv[9]);
+    if (argc >= 2)  strncpy(g_usb_filter,    argv[1], sizeof(g_usb_filter) - 1);
+    if (argc >= 3)  strncpy(g_device_name,   argv[2], sizeof(g_device_name) - 1);
+    if (argc >= 4)  g_max_bitpool = atoi(argv[3]);
+    if (argc >= 5)  g_debug       = atoi(argv[4]);
+    if (argc >= 6)  g_cod         = (uint32_t)strtoul(argv[5], NULL, 16);
+    if (argc >= 7)  strncpy(g_keystore_path, argv[6], sizeof(g_keystore_path) - 1);
+    if (g_max_bitpool < 2 || g_max_bitpool > 250) g_max_bitpool = 53;
 
-    /* Compute TLV key-store path next to this executable */
-    char tlv_path[MAX_PATH] = "btstack_keys.db";
-    {
+    /* Default TLV key-store path: next to this executable */
+    if (g_keystore_path[0] == '\0') {
+        strcpy(g_keystore_path, "btstack_keys.db");
         char module_path[MAX_PATH];
         if (GetModuleFileNameA(NULL, module_path, MAX_PATH)) {
             char *last_sep = strrchr(module_path, '\\');
             if (last_sep) {
                 *(last_sep + 1) = '\0';
-                snprintf(tlv_path, sizeof(tlv_path), "%sbtstack_keys.db", module_path);
+                snprintf(g_keystore_path, sizeof(g_keystore_path),
+                         "%sbtstack_keys.db", module_path);
             }
         }
     }
@@ -1123,10 +1282,13 @@ int main(int argc, char *argv[]) {
     btstack_memory_init();
     btstack_run_loop_init(btstack_run_loop_windows_get_instance());
 
+    /* Dongle selection (hci_transport_usb_set_path_filter is added to the
+     * WinUSB transport by patches/apply_patches.py) */
+    if (g_usb_filter[0]) hci_transport_usb_set_path_filter(g_usb_filter);
     hci_init(hci_transport_usb_instance(), NULL);
 
     /* Persistent link-key store */
-    g_tlv_impl = btstack_tlv_windows_init_instance(&g_tlv_context, tlv_path);
+    g_tlv_impl = btstack_tlv_windows_init_instance(&g_tlv_context, g_keystore_path);
     btstack_tlv_set_instance(g_tlv_impl, &g_tlv_context);
     hci_set_link_key_db(btstack_link_key_db_tlv_get_instance(g_tlv_impl, &g_tlv_context));
 
@@ -1159,54 +1321,46 @@ int main(int argc, char *argv[]) {
     a2dp_sink_register_packet_handler(&on_a2dp_sink_event);
     a2dp_sink_register_media_handler(&on_a2dp_media_packet);
 
-    /* Register SBC sink stream endpoints (one per simultaneous source) */
-    {
-        /* Advertise all SBC combinations so any source can connect.
-         * The user's SBC preferences (g_sbc_block_length etc.) are logged
-         * at startup but not enforced here — FFmpeg decodes any combination. */
-        static uint8_t sbc_caps[4] = {
-            0xFF,  /* all sample rates + all channel modes */
-            0xFF,  /* all block lengths, subbands, allocation methods */
-            2,     /* min bitpool */
-            53     /* max bitpool — overwritten below */
-        };
-        sbc_caps[3] = (uint8_t)g_max_bitpool;
-
-        for (int i = 0; i < MAX_CONNECTIONS; i++) {
-            avdtp_stream_endpoint_t *sep = a2dp_sink_create_stream_endpoint(
-                AVDTP_AUDIO, AVDTP_CODEC_SBC,
-                sbc_caps, sizeof(sbc_caps),
-                g_sbc_cfg[i], sizeof(g_sbc_cfg[i]));
-            if (sep) g_local_seids[i] = avdtp_local_seid(sep);
-        }
+    /* Register SBC sink stream endpoints (one per simultaneous source).
+     * Advertise every SBC combination so any source can connect; FFmpeg
+     * decodes whatever the source picks. Only the bitpool ceiling is
+     * user-configurable. The capability buffers must outlive the endpoints. */
+    static uint8_t sbc_caps[4] = {
+        0xFF,  /* all sample rates + all channel modes */
+        0xFF,  /* all block lengths, subbands, allocation methods */
+        2,     /* min bitpool */
+        0,     /* max bitpool, set from g_max_bitpool below */
+    };
+    sbc_caps[3] = (uint8_t)g_max_bitpool;
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        a2dp_sink_create_stream_endpoint(AVDTP_AUDIO, AVDTP_CODEC_SBC,
+                                         sbc_caps, sizeof(sbc_caps),
+                                         g_sbc_cfg[i], sizeof(g_sbc_cfg[i]));
     }
 
-    /* Register AAC sink stream endpoints */
-    {
-        /* Accept MPEG-2 LC + MPEG-4 LC, all common sample rates, stereo+mono */
-        static uint8_t aac_caps[6] = {
-            0xC0,   /* object types: MPEG-2 AAC LC | MPEG-4 AAC LC */
-            0xFF,   /* sampling frequency bitmap high byte (all rates) */
-            0xFC,   /* sampling frequency bitmap low nibble + channels (stereo+mono) */
-            0x00,   /* VBR=no, bitrate high=0 */
-            0x00,
-            0x00,
-        };
-        for (int i = 0; i < MAX_CONNECTIONS; i++) {
-            avdtp_stream_endpoint_t *sep = a2dp_sink_create_stream_endpoint(
-                AVDTP_AUDIO, AVDTP_CODEC_MPEG_2_4_AAC,
-                aac_caps, sizeof(aac_caps),
-                g_aac_cfg[i], sizeof(g_aac_cfg[i]));
-            if (sep) g_aac_seids[i] = avdtp_local_seid(sep);
-        }
+    /* Register AAC sink stream endpoints:
+     * MPEG-2 LC + MPEG-4 LC, all common sample rates, stereo + mono */
+    static const uint8_t aac_caps[6] = {
+        0xC0,   /* object types: MPEG-2 AAC LC | MPEG-4 AAC LC */
+        0xFF,   /* sampling frequency bitmap high byte (all rates) */
+        0xFC,   /* sampling frequency bitmap low nibble + channels (stereo+mono) */
+        0x00,   /* VBR=no, bitrate high=0 */
+        0x00,
+        0x00,
+    };
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        a2dp_sink_create_stream_endpoint(AVDTP_AUDIO, AVDTP_CODEC_MPEG_2_4_AAC,
+                                         aac_caps, sizeof(aac_caps),
+                                         g_aac_cfg[i], sizeof(g_aac_cfg[i]));
     }
 
     /* ---- stdin command reader (Windows thread) ---- */
     InitializeCriticalSection(&g_cs);
     g_stdin_event = CreateEvent(NULL, TRUE, FALSE, NULL);
 
-    g_stdin_thread = (HANDLE)_beginthreadex(
-        NULL, 0, stdin_reader_thread, NULL, 0, NULL);
+    /* The thread runs until process exit; its handle is not needed. */
+    HANDLE reader = (HANDLE)_beginthreadex(NULL, 0, stdin_reader_thread, NULL, 0, NULL);
+    if (reader) CloseHandle(reader);
 
     g_stdin_ds.source.handle = g_stdin_event;
     btstack_run_loop_set_data_source_handler(&g_stdin_ds, &stdin_ds_callback);
@@ -1214,11 +1368,6 @@ int main(int argc, char *argv[]) {
     btstack_run_loop_add_data_source(&g_stdin_ds);
 
     hci_power_control(HCI_POWER_ON);
-    btstack_run_loop_execute();
-
-    WaitForSingleObject(g_stdin_thread, 2000);
-    DeleteCriticalSection(&g_cs);
-    CloseHandle(g_stdin_event);
-
+    btstack_run_loop_execute();   /* does not return; exit() happens in on_hci_event */
     return 0;
 }
