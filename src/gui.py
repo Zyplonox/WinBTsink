@@ -264,6 +264,7 @@ class Settings:
     sbc_allocation: str = "auto"           # "auto", "loudness" or "snr"
     media_keys: bool = False               # forward keyboard media keys via AVRCP
     notifications: bool = True             # Windows toasts on connect/disconnect/pairing
+    offer_aptx: bool = False               # advertise aptX / aptX HD (experimental)
 
     #: Keys persisted in config.json and the JSON types accepted for each.
     _PERSIST: dict[str, tuple[type, ...]] = {
@@ -280,6 +281,7 @@ class Settings:
         "sbc_allocation":         (str,),
         "media_keys":             (bool,),
         "notifications":          (bool,),
+        "offer_aptx":             (bool,),
     }
 
     def load(self) -> None:
@@ -351,6 +353,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self._add_latency_row()
         self._add_bitpool_row()
         self._add_sbc_rows()
+        self._add_codec_row()
         self._add_audio_device_row()
         self._add_checkboxes()
         self._add_devices_rows(parent.device_store)
@@ -482,6 +485,20 @@ class SettingsDialog(ctk.CTkToplevel):
         self._sbc_alloc_var = row(
             "SBC allocation method", [lbl for lbl, _ in self._SBC_ALLOC_OPTIONS], alloc,
             "Loudness = perceptually optimised  ·  SNR = mathematically optimal")
+
+    def _add_codec_row(self) -> None:
+        """Optional vendor codecs offered in addition to SBC and AAC."""
+        self._aptx_var = ctk.BooleanVar(value=settings.offer_aptx)
+        ctk.CTkCheckBox(
+            self._s, text="Offer aptX and aptX HD (experimental)", variable=self._aptx_var,
+        ).pack(anchor="w", padx=20, pady=(12, 0))
+        ctk.CTkLabel(
+            self._s,
+            text="Android phones and many laptops then stream with aptX instead of SBC: "
+                 "better sound, lower latency. iPhones keep using AAC. Turn off if a "
+                 "device refuses to connect.",
+            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF", wraplength=360,
+        ).pack(fill="x", padx=44)
 
     def _add_audio_device_row(self) -> None:
         """Dropdown listing all WASAPI output devices."""
@@ -658,6 +675,7 @@ class SettingsDialog(ctk.CTkToplevel):
         settings.sbc_subbands = int(sub) if sub != "Auto" else 0
         settings.sbc_allocation = next(
             (val for lbl, val in self._SBC_ALLOC_OPTIONS if lbl == self._sbc_alloc_var.get()), "auto")
+        settings.offer_aptx = self._aptx_var.get()
         audio_name = self._audio_var.get()
         settings.audio_device_name = None if audio_name == "Default" else audio_name
         settings.debug_mode = self._debug_var.get()
@@ -1118,7 +1136,7 @@ class DeviceCard(ctk.CTkFrame):
             alloc = "S" if info.get("allocation") == "snr" else "L"
             text = f"SBC {info['block_length']}/{info.get('subbands', '?')}/{alloc} bp{info.get('bitpool', '?')}"
         elif info.get("sample_rate"):
-            text = f"{text} {info['sample_rate'] / 1000:g}k"
+            text = f"{text.replace('_', ' ')} {info['sample_rate'] / 1000:g}k"
         self._codec_badge.configure(text=text, width=max(36, 7 * len(text)))
 
     def set_metadata(self, title: str, artist: str, album: str) -> None:
@@ -1696,6 +1714,7 @@ class App(ctk.CTk):
             sbc_block_length=settings.sbc_block_length,
             sbc_subbands=settings.sbc_subbands,
             sbc_allocation=settings.sbc_allocation,
+            offer_aptx=settings.offer_aptx,
             on_state_change=self._ui(gen, self._on_state_change),
             on_device_connected=self._ui(gen, self._on_device_connected),
             on_device_disconnected=self._ui(gen, self._on_device_disconnected),

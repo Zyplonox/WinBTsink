@@ -282,7 +282,8 @@ Device Manager → `USB devices` → `Bluetooth USB Dongle (WinUSB)` → right-c
 | [pystray](https://github.com/moses-palmer/pystray) | System tray icon |
 | [PyInstaller](https://pyinstaller.org/) | Packages everything into a single .exe |
 
-**Supported codecs:** SBC (mandatory A2DP codec) and AAC
+**Supported codecs:** SBC (mandatory A2DP codec), AAC, and optionally aptX / aptX HD
+(Settings → "Offer aptX", experimental; decoded by FFmpeg)
 
 **Supported devices:** iPhone, Android, Nintendo Switch 2, and any A2DP source
 

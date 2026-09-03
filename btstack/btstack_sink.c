@@ -37,7 +37,7 @@
  *
  * Command-line arguments (all optional, positional):
  *   btstack_sink.exe <usb_filter> <device_name> <max_bitpool> <debug> <cod_hex> <keystore_path>
- *                    <sbc_block_length> <sbc_subbands> <sbc_allocation>
+ *                    <sbc_block_length> <sbc_subbands> <sbc_allocation> <vendor_codecs>
  *     usb_filter     case-insensitive substring of the WinUSB device path that
  *                    selects the dongle, e.g. "vid_0a12&pid_0001#5&2c1f8b6&0&3#".
  *                    Empty = first Bluetooth dongle found.
@@ -50,6 +50,8 @@
  *     sbc_block_length  4, 8, 12, 16 or 0 = offer all (source chooses)
  *     sbc_subbands      4, 8 or 0 = offer all
  *     sbc_allocation    1 = loudness, 2 = SNR, 0 = offer both
+ *     vendor_codecs     bitmask of extra codecs to offer: 1 = aptX, 2 = aptX HD
+ *                       (audio_start then reports codec "aptx" / "aptx_hd")
  *   The SBC settings restrict the capabilities the sink advertises; A2DP
  *   sources must support every SBC block length, subband count and
  *   allocation method, so the source then encodes with exactly these values.
@@ -102,6 +104,23 @@ const hci_cmd_t hci_le_rand = { 0x2018u, "" };
 #define JSON_ESC_FACTOR         6       /* worst case: one byte -> \u00XX */
 #define PRE_APPROVE_TTL_MS      15000   /* how long an AVDTP approval pre-approves AVRCP */
 
+/* Vendor codecs (AVDTP_CODEC_NON_A2DP). Media codec information layout:
+ *   [vendor id, 4 bytes LE][codec id, 2 bytes LE][codec specific]
+ * aptX:    codec specific = 1 byte: sample rate (bits 7..4) | channels (bits 3..0)
+ * aptX HD: same byte followed by 4 reserved bytes */
+#define VENDOR_APTX             1
+#define VENDOR_APTX_HD          2
+#define APTX_VENDOR_ID          0x0000004Fu   /* APT Ltd */
+#define APTX_CODEC_ID           0x0001u
+#define APTX_HD_VENDOR_ID       0x000000D7u   /* Qualcomm Technologies International */
+#define APTX_HD_CODEC_ID        0x0024u
+#define APTX_RATE_16000         0x80
+#define APTX_RATE_32000         0x40
+#define APTX_RATE_44100         0x20
+#define APTX_RATE_48000         0x10
+#define APTX_CH_STEREO          0x02
+#define APTX_CH_MONO            0x01
+
 /* -------------------------------------------------------------------------
  * Per-connection state
  * ---------------------------------------------------------------------- */
@@ -111,7 +130,8 @@ typedef struct {
     uint16_t a2dp_cid;          /* BTstack A2DP connection identifier */
     uint16_t avrcp_cid;         /* BTstack AVRCP connection identifier (0 = not yet) */
     uint8_t  local_seid;        /* local stream endpoint ID used by this conn */
-    uint8_t  codec_type;        /* AVDTP_CODEC_SBC or AVDTP_CODEC_MPEG_2_4_AAC */
+    uint8_t  codec_type;        /* AVDTP_CODEC_SBC, AVDTP_CODEC_MPEG_2_4_AAC or AVDTP_CODEC_NON_A2DP */
+    uint8_t  vendor_codec;      /* VENDOR_APTX / VENDOR_APTX_HD when codec_type is NON_A2DP */
     bd_addr_t addr;             /* remote device address */
     char     addr_str[18];      /* "XX:XX:XX:XX:XX:XX" */
     int      sample_rate;
@@ -135,6 +155,11 @@ static uint8_t g_sbc_cfg[MAX_CONNECTIONS][4];
 
 /* Per-SEP AAC config buffers */
 static uint8_t g_aac_cfg[MAX_CONNECTIONS][6];
+
+/* Per-SEP vendor codec config buffers. BTstack only reports a configuration
+ * when the buffer length equals the codec information length exactly. */
+static uint8_t g_aptx_cfg[MAX_CONNECTIONS][7];
+static uint8_t g_aptxhd_cfg[MAX_CONNECTIONS][11];
 
 /* -------------------------------------------------------------------------
  * Pending AVDTP L2CAP connections awaiting Python approve/deny
@@ -189,6 +214,7 @@ static int      g_max_bitpool      = 53;
 static int      g_sbc_block_length = 0;  /* 4/8/12/16, 0 = offer all */
 static int      g_sbc_subbands     = 0;  /* 4/8, 0 = offer all */
 static int      g_sbc_allocation   = 0;  /* 1 = loudness, 2 = SNR, 0 = offer both */
+static int      g_vendor_codecs    = 0;  /* bitmask: VENDOR_APTX | VENDOR_APTX_HD */
 static int      g_discoverable     = 0;  /* set via cmd after ready */
 static int      g_debug            = 0;  /* verbose protocol logging when 1 */
 static uint32_t g_cod              = 0x240418; /* Class of Device: Headphones */
@@ -861,15 +887,58 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
         break;
     }
 
+    case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CONFIGURATION: {
+        uint16_t cid  = a2dp_subevent_signaling_media_codec_other_configuration_get_a2dp_cid(packet);
+        uint8_t  seid = a2dp_subevent_signaling_media_codec_other_configuration_get_local_seid(packet);
+        uint16_t len  = a2dp_subevent_signaling_media_codec_other_configuration_get_media_codec_information_len(packet);
+        const uint8_t *info = a2dp_subevent_signaling_media_codec_other_configuration_get_media_codec_information(packet);
+        a2dp_conn_t *conn = find_conn_by_cid(cid);
+        if (!conn) break;
+        if (len < 7) {
+            emit_log("vendor codec configuration too short, ignoring");
+            break;
+        }
+        uint32_t vendor_id = little_endian_read_32(info, 0);
+        uint16_t codec_id  = little_endian_read_16(info, 4);
+        uint8_t  params    = info[6];
+        uint8_t  vendor_codec = 0;
+        if (vendor_id == APTX_VENDOR_ID && codec_id == APTX_CODEC_ID)       vendor_codec = VENDOR_APTX;
+        if (vendor_id == APTX_HD_VENDOR_ID && codec_id == APTX_HD_CODEC_ID) vendor_codec = VENDOR_APTX_HD;
+        if (!vendor_codec) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "unknown vendor codec configured: vendor=0x%08x codec=0x%04x",
+                     (unsigned)vendor_id, (unsigned)codec_id);
+            emit_log(msg);
+            break;
+        }
+        conn->local_seid   = seid;
+        conn->codec_type   = AVDTP_CODEC_NON_A2DP;
+        conn->vendor_codec = vendor_codec;
+        conn->sample_rate  = (params & APTX_RATE_48000) ? 48000 :
+                             (params & APTX_RATE_44100) ? 44100 :
+                             (params & APTX_RATE_32000) ? 32000 : 16000;
+        conn->channels     = (params & APTX_CH_MONO) ? 1 : 2;
+        if (g_debug) {
+            char dbg[96];
+            snprintf(dbg, sizeof(dbg), "%s config: seid=%u rate=%d ch=%d",
+                     vendor_codec == VENDOR_APTX_HD ? "aptX HD" : "aptX",
+                     seid, conn->sample_rate, conn->channels);
+            emit_log(dbg);
+        }
+        break;
+    }
+
     case A2DP_SUBEVENT_STREAM_STARTED: {
         uint16_t cid = a2dp_subevent_stream_started_get_a2dp_cid(packet);
         a2dp_conn_t *conn = find_conn_by_cid(cid);
         if (conn) {
-            if (conn->codec_type == AVDTP_CODEC_MPEG_2_4_AAC) {
+            if (conn->codec_type == AVDTP_CODEC_MPEG_2_4_AAC || conn->codec_type == AVDTP_CODEC_NON_A2DP) {
+                const char *codec = conn->codec_type == AVDTP_CODEC_MPEG_2_4_AAC ? "aac" :
+                                    conn->vendor_codec == VENDOR_APTX_HD ? "aptx_hd" : "aptx";
                 snprintf(evt, sizeof(evt),
                          "{\"event\":\"audio_start\",\"addr\":\"%s\","
-                         "\"sample_rate\":%d,\"channels\":%d,\"codec\":\"aac\"}",
-                         conn->addr_str, conn->sample_rate, conn->channels);
+                         "\"sample_rate\":%d,\"channels\":%d,\"codec\":\"%s\"}",
+                         conn->addr_str, conn->sample_rate, conn->channels, codec);
             } else {
                 snprintf(evt, sizeof(evt),
                          "{\"event\":\"audio_start\",\"addr\":\"%s\","
@@ -935,11 +1004,18 @@ static void on_a2dp_media_packet(uint8_t seid, uint8_t *packet, uint16_t size) {
      * BTstack does NOT strip the RTP header before calling this callback.
      *
      *   [12 bytes RTP fixed header][4 * CC bytes CSRC][optional extension]
-     *   SBC:  [1 byte A2DP SBC media payload header][N bytes raw SBC frames]
-     *   AAC:  [N bytes LATM/AudioMuxElement payload]
+     *   SBC:     [1 byte A2DP SBC media payload header][N bytes raw SBC frames]
+     *   AAC:     [N bytes LATM/AudioMuxElement payload]
+     *   aptX HD: [N bytes raw aptX HD samples]
+     *   aptX:    the whole packet is raw aptX samples, there is NO RTP header
      */
     a2dp_conn_t *conn = find_conn_by_seid(seid);
     if (!conn) return;
+
+    if (conn->codec_type == AVDTP_CODEC_NON_A2DP && conn->vendor_codec == VENDOR_APTX) {
+        if (size) write_audio_to_stdout(conn->addr, packet, size);
+        return;
+    }
     if (size < 12) return;
 
     uint16_t offset = 12 + 4u * (packet[0] & 0x0F);       /* CSRC list */
@@ -949,7 +1025,7 @@ static void on_a2dp_media_packet(uint8_t seid, uint8_t *packet, uint16_t size) {
         offset = (uint16_t)(offset + 4 + 4u * ext_words);
     }
 
-    if (conn->codec_type != AVDTP_CODEC_MPEG_2_4_AAC) {
+    if (conn->codec_type == AVDTP_CODEC_SBC) {
         if (size < offset + 1) return;
         uint8_t sbc_hdr = packet[offset];
         offset++;
@@ -1392,6 +1468,7 @@ int main(int argc, char *argv[]) {
     if (argc >= 8)  g_sbc_block_length = atoi(argv[7]);
     if (argc >= 9)  g_sbc_subbands     = atoi(argv[8]);
     if (argc >= 10) g_sbc_allocation   = atoi(argv[9]);
+    if (argc >= 11) g_vendor_codecs    = atoi(argv[10]);
     if (g_max_bitpool < 2 || g_max_bitpool > 250) g_max_bitpool = 53;
 
     /* Default TLV key-store path: next to this executable */
@@ -1490,6 +1567,36 @@ int main(int argc, char *argv[]) {
         a2dp_sink_create_stream_endpoint(AVDTP_AUDIO, AVDTP_CODEC_MPEG_2_4_AAC,
                                          aac_caps, sizeof(aac_caps),
                                          g_aac_cfg[i], sizeof(g_aac_cfg[i]));
+    }
+
+    /* Optional vendor codecs. Sources pick their preferred codec among the
+     * endpoints we expose, and Android prefers aptX over SBC when offered. */
+    static const uint8_t aptx_caps[7] = {
+        APTX_VENDOR_ID & 0xFF, (APTX_VENDOR_ID >> 8) & 0xFF, (APTX_VENDOR_ID >> 16) & 0xFF, (APTX_VENDOR_ID >> 24) & 0xFF,
+        APTX_CODEC_ID & 0xFF, (APTX_CODEC_ID >> 8) & 0xFF,
+        APTX_RATE_44100 | APTX_RATE_48000 | APTX_CH_STEREO,
+    };
+    static const uint8_t aptxhd_caps[11] = {
+        APTX_HD_VENDOR_ID & 0xFF, (APTX_HD_VENDOR_ID >> 8) & 0xFF, (APTX_HD_VENDOR_ID >> 16) & 0xFF, (APTX_HD_VENDOR_ID >> 24) & 0xFF,
+        APTX_HD_CODEC_ID & 0xFF, (APTX_HD_CODEC_ID >> 8) & 0xFF,
+        APTX_RATE_44100 | APTX_RATE_48000 | APTX_CH_STEREO,
+        0, 0, 0, 0,
+    };
+    if (g_vendor_codecs & VENDOR_APTX_HD) {
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            a2dp_sink_create_stream_endpoint(AVDTP_AUDIO, AVDTP_CODEC_NON_A2DP,
+                                             aptxhd_caps, sizeof(aptxhd_caps),
+                                             g_aptxhd_cfg[i], sizeof(g_aptxhd_cfg[i]));
+        }
+        emit_log("codecs: offering aptX HD");
+    }
+    if (g_vendor_codecs & VENDOR_APTX) {
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            a2dp_sink_create_stream_endpoint(AVDTP_AUDIO, AVDTP_CODEC_NON_A2DP,
+                                             aptx_caps, sizeof(aptx_caps),
+                                             g_aptx_cfg[i], sizeof(g_aptx_cfg[i]));
+        }
+        emit_log("codecs: offering aptX");
     }
 
     /* ---- stdin command reader (Windows thread) ---- */

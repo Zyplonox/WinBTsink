@@ -213,14 +213,24 @@ class AudioPipeline:
         except Exception:
             return "unknown"
 
+    #: FFmpeg demuxer per Bluetooth codec. aptX streams are raw sample data,
+    #: so the demuxer has to be told the negotiated rate.
+    _INPUT_ARGS = {
+        "sbc":     ["-f", "sbc"],
+        "aac":     ["-f", "latm"],
+        "aptx":    ["-f", "aptx", "-sample_rate", "{rate}"],
+        "aptx_hd": ["-f", "aptx_hd", "-sample_rate", "{rate}"],
+    }
+
     def _start_ffmpeg(self, sample_rate: int, channels: int) -> subprocess.Popen:
         """Launches FFmpeg with codec-appropriate input and raw s16le PCM output via pipes."""
-        input_fmt = "latm" if self._codec == "aac" else "sbc"
+        input_args = [a.format(rate=sample_rate)
+                      for a in self._INPUT_ARGS.get(self._codec, self._INPUT_ARGS["sbc"])]
         return subprocess.Popen(
             [
                 self._ffmpeg_exe,
                 "-loglevel", "quiet",
-                "-f", input_fmt,    # "sbc" or "latm" (AAC-LATM)
+                *input_args,
                 "-i", "pipe:0",
                 "-f", "s16le",      # Output: signed 16-bit little-endian PCM
                 "-ar", str(sample_rate),
@@ -404,6 +414,7 @@ class SinkBackend:
         sbc_block_length: int = 0,          # 4/8/12/16, 0 = let the source choose
         sbc_subbands: int = 0,              # 4/8, 0 = let the source choose
         sbc_allocation: str = "auto",       # "loudness", "snr" or "auto"
+        offer_aptx: bool = False,           # also advertise aptX and aptX HD endpoints
         # Callbacks
         on_state_change: Optional[Callable[[SinkState], None]] = None,
         on_device_connected: Optional[Callable[[str], None]] = None,          # addr
@@ -427,6 +438,7 @@ class SinkBackend:
         self._sbc_block_length = sbc_block_length if sbc_block_length in (4, 8, 12, 16) else 0
         self._sbc_subbands = sbc_subbands if sbc_subbands in (4, 8) else 0
         self._sbc_allocation = {"loudness": 1, "snr": 2}.get(sbc_allocation, 0)
+        self._vendor_codecs = 3 if offer_aptx else 0   # bit 1 aptX, bit 2 aptX HD
 
         # Audio parameters
         self._latency_ms = latency_ms
@@ -666,6 +678,7 @@ class SinkBackend:
             str(self._sbc_block_length),
             str(self._sbc_subbands),
             str(self._sbc_allocation),
+            str(self._vendor_codecs),
         ]
         self._log(f"Launching BTstack: {exe.name}"
                   + (f" (dongle {self._usb_filter})" if self._usb_filter else ""))
