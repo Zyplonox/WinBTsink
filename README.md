@@ -143,7 +143,7 @@ If you already have MSYS2, `bash btstack/do_build.sh` does the clone/patch/build
 | **Settings** | Device name, latency, audio device, autostart |
 | **USB Dongle** | Dropdown + Scan button: select the WinUSB dongle to use |
 | **Connect to** | Connect to a remembered device from the PC side (the device must be on and in range). Devices with "auto-connect" (Settings) are connected automatically after Start. |
-| Device card | Per device: player controls, volume + mute, audio output, codec badge, ✕ to disconnect |
+| Device card | Per device: player controls, ⏺ record to WAV, volume + mute, audio output, codec badge, stream statistics, ✕ to disconnect |
 | **Volume** | Output volume slider (0–200%) |
 | **Allow new pairings** | Toggle: allow unknown devices to pair (see Security) |
 | **Install WinUSB…** | Download & launch Zadig |
@@ -176,6 +176,7 @@ If you already have MSYS2, `bash btstack/do_build.sh` does the clone/patch/build
 | Offer aptX | off | Also advertise aptX / aptX HD endpoints (experimental) |
 | Audio output device | Default | WASAPI output device (per connected device via its card) |
 | Notifications | on | Windows toasts on connect, disconnect and pairing requests |
+| Recording folder | `~\Music\BT-AudioSink` | Where ⏺ on a device card writes its WAV files (decoded audio, before volume) |
 | Media keys | off | Keyboard Play/Pause/Next/Prev/Stop go to the playing phone |
 | Debug log | off | Verbose protocol logging |
 | Autostart | off | Launch with Windows, minimized to tray |

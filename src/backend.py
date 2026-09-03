@@ -46,6 +46,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import sounddevice as sd
+import wave
 
 from device_store import DeviceStore
 
@@ -75,7 +76,63 @@ class SinkState(Enum):
 
 
 # ---------------------------------------------------------------------------
-# Audio Pipeline  (FFmpeg → sounddevice)  supports SBC and AAC
+# WAV recorder – taps the decoded PCM of one device
+# ---------------------------------------------------------------------------
+
+class WavRecorder:
+    """
+    Writes decoded 16-bit PCM to a .wav file. Fed from the pipeline's PCM
+    reader thread via write(); opened/closed from other threads, hence the
+    lock. Survives pipeline replacements: if the format changes, a new
+    numbered file is started.
+    """
+
+    def __init__(self, base_path: Path):
+        self._base = base_path
+        self._lock = threading.Lock()
+        self._wav: Optional[wave.Wave_write] = None
+        self._fmt: Optional[tuple[int, int]] = None
+        self._part = 0
+        self.path: Optional[Path] = None
+        self.frames = 0
+
+    def open(self, sample_rate: int, channels: int) -> Path:
+        with self._lock:
+            if self._wav is not None and self._fmt == (sample_rate, channels):
+                return self.path  # type: ignore[return-value]
+            self._close_locked()
+            self._part += 1
+            path = self._base if self._part == 1 else self._base.with_name(
+                f"{self._base.stem}_part{self._part}{self._base.suffix}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            w = wave.open(str(path), "wb")
+            w.setnchannels(channels)
+            w.setsampwidth(2)
+            w.setframerate(sample_rate)
+            self._wav, self._fmt, self.path = w, (sample_rate, channels), path
+            return path
+
+    def write(self, pcm: bytes) -> None:
+        with self._lock:
+            if self._wav is not None:
+                self._wav.writeframes(pcm)
+                self.frames += len(pcm) // (2 * self._fmt[1])  # type: ignore[index]
+
+    def close(self) -> None:
+        with self._lock:
+            self._close_locked()
+
+    def _close_locked(self) -> None:
+        if self._wav is not None:
+            try:
+                self._wav.close()
+            except Exception as exc:
+                log.debug("wav close: %s", exc)
+            self._wav = None
+
+
+# ---------------------------------------------------------------------------
+# Audio Pipeline  (FFmpeg → sounddevice)  supports SBC, AAC, aptX
 # ---------------------------------------------------------------------------
 
 class AudioPipeline:
@@ -119,6 +176,11 @@ class AudioPipeline:
         self._channels = 2
         self._volume: float = 1.0  # Linear multiplier; 1.0 = unity, 2.0 = double
         self.underruns = 0         # callbacks that found the PCM queue empty
+        self._pcm_tap: Optional[Callable[[bytes], None]] = None  # e.g. WavRecorder.write
+
+    def set_pcm_tap(self, tap: Optional[Callable[[bytes], None]]) -> None:
+        """Receives every decoded PCM block (before volume) on the reader thread."""
+        self._pcm_tap = tap
 
     @property
     def sample_rate(self) -> int:
@@ -312,6 +374,14 @@ class AudioPipeline:
                 break
             if not raw:
                 break  # FFmpeg process exited / pipe closed
+
+            tap = self._pcm_tap
+            if tap is not None:
+                try:
+                    tap(raw)
+                except Exception as exc:
+                    log.warning("pcm tap failed, detaching: %s", exc)
+                    self._pcm_tap = None
 
             arr = np.frombuffer(raw, dtype=np.int16)
             if len(arr) < expected:
@@ -508,6 +578,7 @@ class SinkBackend:
         self._device_audio_routes: dict[str, Optional[int]] = {}  # addr → sd device index
         self._device_volumes: dict[str, float] = {}        # addr → per-device gain
         self._device_muted: set[str] = set()
+        self._recorders: dict[str, WavRecorder] = {}       # addr → active recording
 
     # ------------------------------------------------------------------
     # Public API
@@ -594,6 +665,51 @@ class SinkBackend:
         if addr:
             cmd["addr"] = addr.upper()
         self._send_cmd(cmd)
+
+    # ---- recording -----------------------------------------------------
+
+    def start_recording(self, addr: str, directory: str, name: str = "") -> Path:
+        """
+        Records the decoded audio of one device to <directory>/<name>_<time>.wav
+        (16-bit PCM, before volume). Recording continues across stream
+        restarts and route changes; a format change starts a new part file.
+        """
+        addr = addr.upper()
+        safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in (name or addr)).strip() or addr
+        base = Path(directory) / f"{safe}_{time.strftime('%Y%m%d-%H%M%S')}.wav"
+        with self._lock:
+            if addr in self._recorders:
+                return self._recorders[addr].path or base
+            rec = WavRecorder(base)
+            self._recorders[addr] = rec
+            pipeline = self._pipelines.get(addr)
+        if pipeline:
+            self._attach_recorder(pipeline, rec)
+        self._log(f"Recording {addr} → {base}")
+        return base
+
+    def stop_recording(self, addr: str) -> Optional[Path]:
+        addr = addr.upper()
+        with self._lock:
+            rec = self._recorders.pop(addr, None)
+            pipeline = self._pipelines.get(addr)
+        if pipeline:
+            pipeline.set_pcm_tap(None)
+        if rec is None:
+            return None
+        rec.close()
+        if rec.path:
+            self._log(f"Recording stopped: {rec.path} ({rec.frames} frames)")
+        return rec.path
+
+    def is_recording(self, addr: str) -> bool:
+        with self._lock:
+            return addr.upper() in self._recorders
+
+    @staticmethod
+    def _attach_recorder(pipeline: AudioPipeline, rec: WavRecorder) -> None:
+        rec.open(pipeline.sample_rate, pipeline.channels)
+        pipeline.set_pcm_tap(rec.write)
 
     # ---- sink-initiated connections -----------------------------------
 
@@ -715,6 +831,8 @@ class SinkBackend:
             t.join(timeout=2.0)
 
         self._stop_all_pipelines()
+        for rec_addr in list(self._recorders):
+            self.stop_recording(rec_addr)
         with self._lock:
             for addr in self._connected_addrs:
                 self._persist_device_volume(addr)
@@ -985,6 +1103,7 @@ class SinkBackend:
 
         elif evt == "disconnected":
             self._log(f"A2DP disconnected: {addr}")
+            self.stop_recording(addr)
             with self._lock:
                 self._persist_device_volume(addr)
                 self._connected_addrs.discard(addr)     # before stopping: blocks a
@@ -1161,6 +1280,13 @@ class SinkBackend:
                     pipeline.stop()
                     return
                 self._pipelines[addr] = pipeline
+                rec = self._recorders.get(addr)
+            if rec:
+                try:
+                    self._attach_recorder(pipeline, rec)
+                except OSError as exc:
+                    self._log(f"Recording error [{addr}]: {exc}")
+                    self.stop_recording(addr)
         self._log(f"Audio pipeline started [{addr}] codec={codec}")
 
     def _stop_pipeline(self, addr: str) -> None:

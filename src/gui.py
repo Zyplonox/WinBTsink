@@ -267,6 +267,7 @@ class Settings:
     offer_aptx: bool = False               # advertise aptX / aptX HD (experimental)
     multi_device_mode: str = "mix"         # "mix" | "duck" | "solo"
     duck_level: int = 25                   # background volume in percent for "duck"
+    recording_dir: str = ""                # "" = ~/Music/BT-AudioSink
 
     #: Keys persisted in config.json and the JSON types accepted for each.
     _PERSIST: dict[str, tuple[type, ...]] = {
@@ -286,7 +287,12 @@ class Settings:
         "offer_aptx":             (bool,),
         "multi_device_mode":      (str,),
         "duck_level":             (int,),
+        "recording_dir":          (str,),
     }
+
+    @property
+    def effective_recording_dir(self) -> str:
+        return self.recording_dir or os.path.join(os.path.expanduser("~"), "Music", "BT-AudioSink")
 
     def load(self) -> None:
         """
@@ -360,6 +366,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self._add_codec_row()
         self._add_multi_device_row()
         self._add_audio_device_row()
+        self._add_recording_row()
         self._add_checkboxes()
         self._add_devices_rows(parent.device_store)
         self._add_clear_keys_row()
@@ -536,6 +543,23 @@ class SettingsDialog(ctk.CTkToplevel):
             text="The device whose stream started last is the foreground device.",
             anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF", wraplength=360,
         ).pack(fill="x", padx=20)
+
+    def _add_recording_row(self) -> None:
+        """Folder for WAV recordings started from a device card."""
+        ctk.CTkLabel(self._s, text="Recording folder", anchor="w").pack(
+            fill="x", padx=20, pady=(12, 0))
+        row = ctk.CTkFrame(self._s, fg_color="transparent")
+        row.pack(fill="x", padx=20)
+        self._recdir_var = ctk.StringVar(value=settings.effective_recording_dir)
+        ctk.CTkEntry(row, textvariable=self._recdir_var).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(row, text="Browse…", width=80, fg_color="#374151", hover_color="#4B5563",
+                      command=self._browse_recdir).pack(side="left", padx=(8, 0))
+
+    def _browse_recdir(self) -> None:
+        from tkinter import filedialog
+        chosen = filedialog.askdirectory(parent=self, initialdir=self._recdir_var.get() or None)
+        if chosen:
+            self._recdir_var.set(chosen)
 
     def _add_audio_device_row(self) -> None:
         """Dropdown listing all WASAPI output devices."""
@@ -728,6 +752,8 @@ class SettingsDialog(ctk.CTkToplevel):
         settings.multi_device_mode = next(
             (val for lbl, val in self._MULTI_OPTIONS if lbl == self._multi_var.get()), "mix")
         settings.duck_level = int(self._duck_var.get())
+        recdir = self._recdir_var.get().strip()
+        settings.recording_dir = "" if recdir == settings.effective_recording_dir and not settings.recording_dir else recdir
         audio_name = self._audio_var.get()
         settings.audio_device_name = None if audio_name == "Default" else audio_name
         settings.debug_mode = self._debug_var.get()
@@ -1061,6 +1087,7 @@ class DeviceCard(ctk.CTkFrame):
         on_volume=None,   # Callable[[addr: str, percent: int], None]
         on_mute=None,     # Callable[[addr: str, muted: bool], None]
         on_disconnect=None,  # Callable[[addr: str], None]
+        on_record=None,      # Callable[[addr: str], None]  (toggle)
         **kwargs,
     ):
         super().__init__(parent, corner_radius=8, **kwargs)
@@ -1070,6 +1097,8 @@ class DeviceCard(ctk.CTkFrame):
         self._on_volume = on_volume
         self._on_mute = on_mute
         self._on_disconnect = on_disconnect
+        self._on_record = on_record
+        self.recording = False
         self.playback_status = ""
         self.muted = False
 
@@ -1117,6 +1146,10 @@ class DeviceCard(ctk.CTkFrame):
         self._play_btn.pack(side="left", padx=(0, 4))
         ctk.CTkButton(ctl, text="⏭", command=lambda: self._player("next"), **btn_style
                       ).pack(side="left", padx=(0, 8))
+        self._rec_btn = ctk.CTkButton(
+            ctl, text="⏺", command=lambda: self._on_record and self._on_record(self._addr),
+            **btn_style)
+        self._rec_btn.pack(side="left", padx=(0, 8))
         self._status_label = ctk.CTkLabel(
             ctl, text="", font=ctk.CTkFont(size=11), text_color="#9CA3AF", anchor="w",
         )
@@ -1167,6 +1200,11 @@ class DeviceCard(ctk.CTkFrame):
         self.playback_status = status
         self._play_btn.configure(text="⏸" if status == "playing" else "▶")
         self._status_label.configure(text=self._STATUS_TEXT.get(status, status))
+
+    def set_recording(self, recording: bool) -> None:
+        self.recording = recording
+        self._rec_btn.configure(fg_color="#B91C1C" if recording else "#374151",
+                                hover_color="#991B1B" if recording else "#4B5563")
 
     def _volume_dragged(self, value: float) -> None:
         pct = int(value)
@@ -1648,6 +1686,22 @@ class App(ctk.CTk):
         if self._backend:
             self._backend.set_device_mute(addr, muted)
 
+    def _on_card_record(self, addr: str) -> None:
+        """Toggles WAV recording of one device into the configured folder."""
+        card = self._device_cards.get(addr)
+        if not self._backend or not card:
+            return
+        if self._backend.is_recording(addr):
+            self._backend.stop_recording(addr)
+            card.set_recording(False)
+            return
+        try:
+            self._backend.start_recording(addr, settings.effective_recording_dir,
+                                          self._connected_devices.get(addr, addr))
+            card.set_recording(True)
+        except OSError as exc:
+            self._log(f"Cannot record: {exc}")
+
     def _on_card_disconnect(self, addr: str) -> None:
         if self._backend:
             self._log(f"Disconnecting {self._connected_devices.get(addr, addr)}…")
@@ -1948,6 +2002,7 @@ class App(ctk.CTk):
                 on_volume=self._on_card_volume,
                 on_mute=self._on_card_mute,
                 on_disconnect=self._on_card_disconnect,
+                on_record=self._on_card_record,
             )
             card.pack(fill="x", padx=4, pady=(0, 4))
             self._device_cards[addr] = card
