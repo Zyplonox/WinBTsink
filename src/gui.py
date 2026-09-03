@@ -49,6 +49,15 @@ from config import VERSION
 settings.load()
 i18n.set_language(settings.language)
 i18n.install()
+
+if sys.platform == "win32":
+    # Own AppUserModelID: taskbar grouping and toast notifications then show
+    # "BT-AudioSink" instead of "Python" when running from source.
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Zyplonox.BT-AudioSink")
+    except Exception:
+        pass
 from usb_devices import list_bluetooth_dongles
 from winusb_installer import download_and_run_zadig, list_native_bt_devices
 
