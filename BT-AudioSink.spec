@@ -1,68 +1,67 @@
 # BT-AudioSink.spec – PyInstaller configuration
 # ================================================
-# Builds a standalone Windows .exe with a bundled FFmpeg binary
-# and btstack_sink.exe (the C BTstack subprocess).
+# Builds a standalone one-file Windows .exe containing the Python GUI,
+# btstack_sink.exe (the C BTstack engine) and one FFmpeg binary.
 #
 # Usage:
-#   pyinstaller BT-AudioSink.spec
+#   python -m PyInstaller BT-AudioSink.spec
 #
 # Prerequisites:
-#   Run btstack/build.ps1 first to produce btstack/build/btstack_sink.exe.
+#   Run btstack\build.ps1 first to produce btstack\build\btstack_sink.exe.
 
 import os
-import sys
-from PyInstaller.utils.hooks import collect_all, collect_data_files
+import shutil
+from PyInstaller.utils.hooks import collect_all
 
-# Locate the FFmpeg binary provided by imageio-ffmpeg
-try:
-    import imageio_ffmpeg
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-except Exception:
-    ffmpeg_exe = None
+SPEC_DIR = os.path.dirname(os.path.abspath(SPEC))
 
-# Locate btstack_sink.exe built by btstack/build.ps1
-btstack_exe = os.path.join(os.path.dirname(os.path.abspath(SPEC)),
-                           'btstack', 'build', 'btstack_sink.exe')
+# ---------------------------------------------------------------------------
+# btstack_sink.exe built by btstack/build.ps1
+# ---------------------------------------------------------------------------
+btstack_exe = os.path.join(SPEC_DIR, 'btstack', 'build', 'btstack_sink.exe')
 if not os.path.exists(btstack_exe):
     raise FileNotFoundError(
-        f"btstack_sink.exe not found at {btstack_exe}\n"
-        "Run btstack/build.ps1 first."
+        f"btstack_sink.exe not found at {btstack_exe}\nRun btstack\\build.ps1 first."
     )
+
+# ---------------------------------------------------------------------------
+# FFmpeg: take the binary imageio-ffmpeg downloaded, but ship it exactly once
+# under the fixed name gui._get_ffmpeg() looks for (ffmpeg.exe in _MEIPASS).
+# imageio-ffmpeg's own PyInstaller hook would add a second ~80 MB copy under
+# imageio_ffmpeg/binaries/, so that is filtered out below.
+# ---------------------------------------------------------------------------
+import imageio_ffmpeg
+ffmpeg_src = imageio_ffmpeg.get_ffmpeg_exe()
+ffmpeg_stage = os.path.join(SPEC_DIR, 'build', 'ffmpeg.exe')
+os.makedirs(os.path.dirname(ffmpeg_stage), exist_ok=True)
+shutil.copy2(ffmpeg_src, ffmpeg_stage)
 
 # ---------------------------------------------------------------------------
 # CustomTkinter: needs everything (themes, images, font data)
 # ---------------------------------------------------------------------------
 ctk_datas, ctk_binaries, ctk_hiddenimports = collect_all('customtkinter')
 
-# ---------------------------------------------------------------------------
-# Bundled binaries
-# ---------------------------------------------------------------------------
-bundled_binaries = ctk_binaries + [(btstack_exe, '.')]
-if ffmpeg_exe and os.path.exists(ffmpeg_exe):
-    bundled_binaries.append((ffmpeg_exe, '.'))
-
 a = Analysis(
     ['src/gui.py'],
-    pathex=['.'],
-    binaries=bundled_binaries,
+    pathex=['src'],
+    binaries=ctk_binaries + [(btstack_exe, '.'), (ffmpeg_stage, '.')],
     datas=ctk_datas,
     hiddenimports=[
-        # App dependencies
-        'sounddevice', 'numpy', 'PIL', 'PIL._tkinter_finder',
-        'customtkinter', 'pystray', 'backend', 'winusb_installer',
+        'PIL._tkinter_finder',   # loaded dynamically by Pillow's ImageTk
+        'pystray._win32',        # pystray picks its backend at runtime
     ] + ctk_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[
-        # Bumble is no longer used
-        'bumble',
-        # Unused stdlib
-        'sqlite3', 'unittest',
-        'grpc', 'grpcio',
-    ],
+    excludes=['sqlite3', 'unittest'],
     noarchive=False,
 )
+
+# Drop the duplicate FFmpeg that hook-imageio_ffmpeg collects.
+a.datas = [d for d in a.datas if 'imageio_ffmpeg' not in d[0].replace('\\', '/')
+           or '/binaries/' not in d[0].replace('\\', '/')]
+a.binaries = [b for b in a.binaries if 'imageio_ffmpeg' not in b[0].replace('\\', '/')
+              or '/binaries/' not in b[0].replace('\\', '/')]
 
 pyz = PYZ(a.pure)
 

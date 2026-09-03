@@ -9,6 +9,7 @@ Devices such as a Nintendo Switch 2, phone, or tablet pair with your PC and stre
 <img width="480" height="750" alt="gui1" src="https://github.com/user-attachments/assets/803581cd-3f2a-4d14-8c22-3abd1a3f5112" />
 <img width="415" height="689" alt="gui2" src="https://github.com/user-attachments/assets/79230c87-235e-473f-889d-0b8a111baf97" />
 
+> The application, its executable and its data folder are still called **BT-AudioSink**; WinBTsink is the project name.
 
 ---
 
@@ -26,26 +27,26 @@ which has its own advantages:
 This program works by:
 
 1. Installing the **WinUSB driver** for your dongle (via Zadig https://github.com/pbatard/libwdi)
-2. Using **BTstack** (a C Bluetooth stack compiled to `WinBTsink.exe`) to access the dongle directly via USB – bypassing Windows entirely
+2. Using **BTstack** (a C Bluetooth stack compiled to `btstack_sink.exe`) to access the dongle directly via USB – bypassing Windows entirely
 3. Advertising the PC as a Bluetooth speaker
-4. Decoding incoming SBC audio frames with **FFmpeg** (bundled)
+4. Decoding incoming SBC or AAC audio with **FFmpeg** (bundled)
 5. Playing the audio through your PC speakers via **sounddevice** (WASAPI)
 
 ```
 BT device (Switch / phone / tablet)
-    │  Bluetooth A2DP / SBC
+    │  Bluetooth A2DP / SBC or AAC
     ▼
-USB dongle ──(WinUSB / libusb)──▶  WinBTsink.exe  (C, BTstack)
-                                         │  SBC frames (per-device, tagged)
-                                         ▼
-                                    FFmpeg (decoder, bundled)
-                                         │  PCM audio
-                                         ▼
-                                   sounddevice → speakers
+USB dongle ──(WinUSB)──▶  btstack_sink.exe  (C, BTstack)
+                                │  audio frames (per-device, tagged)
+                                ▼
+                           FFmpeg (decoder, bundled)
+                                │  PCM audio
+                                ▼
+                          sounddevice → speakers
 ```
 
 > **Why WinUSB?**  Windows automatically installs its own HCI driver for the dongle.
-> `WinBTsink.exe` needs direct USB access – the Windows driver must be replaced with **WinUSB**.
+> `btstack_sink.exe` needs direct USB access – the Windows driver must be replaced with **WinUSB**.
 > WinUSB is a Microsoft inbox driver (included in Windows, signed by Microsoft) –
 > no third-party kernel drivers are involved.
 
@@ -55,31 +56,32 @@ USB dongle ──(WinUSB / libusb)──▶  WinBTsink.exe  (C, BTstack)
 
 ### Option A – Pre-built EXE
 
-1. Download `WinBTsink.exe` from the [Releases](../../releases) page
+1. Download `BT-AudioSink.exe` from the [Releases](../../releases) page
 2. Run it
-3. Install the WinUSB driver once: **Settings → Install WinUSB…**
+3. Install the WinUSB driver once: **Install WinUSB…**
 4. Click **Start** → pair your device → done
 
-> **Note:** The EXE is ~94 MB. This is expected — it bundles a full FFmpeg binary (~83 MB)
-> needed to decode Bluetooth SBC audio. There is no lighter alternative.
+> **Note:** The EXE is large (~50 MB) because it bundles a full FFmpeg binary
+> needed to decode Bluetooth SBC/AAC audio.
 
 ### Option B – Run from source
 
 ```powershell
-# One-time setup (installs Python packages and ffmpeg)
+# One-time setup (installs the Python packages; FFmpeg comes with them)
 powershell -ExecutionPolicy Bypass -File setup\install.ps1
+
+# One-time build of the Bluetooth engine (installs MSYS2/MinGW if missing)
+powershell -ExecutionPolicy Bypass -File btstack\build.ps1
 
 # Launch the GUI
 python src\gui.py
 ```
 
-> **Note:** Running from source also requires building `WinBTsink.exe` once — see [Building WinBTsink.exe](#building-WinBTsinkexe) below.
-
 ### Option C – Build the EXE yourself
 
 ```powershell
-.\build.ps1
-# → dist\WinBTsink.exe
+powershell -ExecutionPolicy Bypass -File build.ps1
+# → dist\BT-AudioSink.exe
 ```
 
 ---
@@ -99,6 +101,11 @@ powershell -ExecutionPolicy Bypass -File setup\install.ps1
 
 ### Step 3 – Install the WinUSB driver
 
+Easiest: click **Install WinUSB…** in the app. It lists the attached Bluetooth
+dongles that still use the Windows driver and downloads and launches Zadig for you.
+
+Manually:
+
 1. Plug in your Bluetooth dongle
 2. Download **Zadig**: https://zadig.akeo.ie/
 3. Run Zadig **as Administrator**
@@ -110,17 +117,18 @@ powershell -ExecutionPolicy Bypass -File setup\install.ps1
 > (mouse, keyboard, Windows Settings). Use your built-in Bluetooth for that,
 > or a second dongle.
 
-### Building WinBTsink.exe
+### Building btstack_sink.exe
 
-`WinBTsink.exe` is the C-based Bluetooth engine. The pre-built EXE includes it automatically. When running from source you need to build it once:
+`btstack_sink.exe` is the C-based Bluetooth engine. The pre-built EXE includes it. When running from source you need to build it once:
 
 ```powershell
-# Requires MSYS2/MinGW (installed automatically if missing)
-cd btstack
-bash do_build.sh
+powershell -ExecutionPolicy Bypass -File btstack\build.ps1
 ```
 
-The resulting binary lands at `btstack\build\WinBTsink.exe`.
+The script installs MSYS2 with the MinGW-w64 toolchain if needed, clones BTstack v1.6.1
+into `btstack\btstack-src`, applies the patches from `btstack\patches`, and builds.
+The resulting binary lands at `btstack\build\btstack_sink.exe`.
+If you already have MSYS2, `bash btstack/do_build.sh` does the clone/patch/build steps only.
 
 ---
 
@@ -133,7 +141,7 @@ The resulting binary lands at `btstack\build\WinBTsink.exe`.
 | **Start** | Start the BT stack and activate the dongle |
 | **Stop** | Stop everything cleanly |
 | **Settings** | Device name, latency, audio device, autostart |
-| **USB Dongle** | Dropdown + Scan button: select the WinUSB dongle |
+| **USB Dongle** | Dropdown + Scan button: select the WinUSB dongle to use |
 | **Volume** | Output volume slider (0–200%) |
 | **Allow new pairings** | Toggle: allow unknown devices to pair (see Security) |
 | **Install WinUSB…** | Download & launch Zadig |
@@ -157,13 +165,15 @@ The resulting binary lands at `btstack\build\WinBTsink.exe`.
 | Option | Default | Description |
 |--------|---------|-------------|
 | Device name | `PC-AudioSink` | Name shown to other BT devices |
-| Bluetooth address | `F0:F1:F2:F3:F4:F5` | Local BT address used by BTstack |
+| Class of Device | Headphones | How the PC presents itself (headphones, speaker, car audio, …) |
+| Discoverable timeout | `0` (off) | Automatically block new pairings after N seconds |
 | Buffer latency | `50 ms` | Audio buffer size; increase if audio stutters |
 | Max SBC bitpool | `53` | Quality ceiling; higher = better quality, more bandwidth |
-| Audio output device | Default | WASAPI output device |
+| Audio output device | Default | WASAPI output device (per connected device via its card) |
+| Debug log | off | Verbose protocol logging |
 | Autostart | off | Launch with Windows, minimized to tray |
 
-Settings are saved at: `%APPDATA%\WinBTsink\config.json`
+Settings are saved at: `%APPDATA%\BT-AudioSink\config.json`
 
 ---
 
@@ -171,12 +181,12 @@ Settings are saved at: `%APPDATA%\WinBTsink\config.json`
 
 ### Pairing confirmation
 
-When an unknown device tries to pair, a dialog appears showing the device name and
+When an unknown device tries to connect, a dialog appears showing its
 MAC address. You can:
 
-- **Allow** – accept for this session only (device must re-pair next time)
+- **Allow** – accept for this session only (device must be confirmed again next time)
 - **Allow** + **Remember this device** – accept and save the device permanently
-- **Deny** – reject the pairing request
+- **Deny** – reject the connection
 
 If the dialog is not answered within 30 seconds it auto-denies.
 
@@ -186,14 +196,14 @@ The **Allow new pairings** switch in the main window controls whether unknown de
 can initiate a pairing at all:
 
 - **On** (default) – unknown devices trigger the confirmation dialog
-- **Off** – only previously bonded devices can connect; all others are silently rejected
+- **Off** – only previously remembered devices can connect; all others are silently rejected
 
-Recommended workflow: enable the toggle when adding a new device, then disable it
-again for day-to-day use.
+The switch turns itself off as soon as a device connects, and optionally after the
+configured discoverable timeout.
 
 ### Notes on Bluetooth security
 
-- Already known devices reconnect automatically without a dialog.
+- Remembered devices reconnect automatically without a dialog.
 - MITM protection is not available because Secure Connections must be disabled for
   Nintendo Switch compatibility. This is a Bluetooth protocol limitation.
 - A2DP audio streams are not encrypted by the protocol.
@@ -202,14 +212,13 @@ again for day-to-day use.
 
 Paired devices (iPhone, Android, Nintendo Switch 2) are remembered when you choose
 **Remember this device** in the pairing dialog.
-On the next session the device reconnects without re-pairing as long as the app is running.
 
-Bonding keys are managed by `WinBTsink.exe` and stored in:
-`btstack\build\btstack_keys.db` (next to the C binary)
+Everything lives in `%APPDATA%\BT-AudioSink\`:
 
-Remembered device list (MACs): `%APPDATA%\WinBTsink\allowed_macs.json`
+- `allowed_macs.json` – the remembered device list used by the confirmation gate
+- `btstack_keys.db` – the Bluetooth bonding keys managed by `btstack_sink.exe`
 
-To reset all pairings: delete both files and restart the app.
+To reset all pairings use **Settings → Forget all paired devices** (or delete both files).
 
 ---
 
@@ -217,6 +226,7 @@ To reset all pairings: delete both files and restart the app.
 
 Clicking the **–** button hides the window to the system tray instead of closing the app.
 Right-click the tray icon for the menu: **Show Window / Start BT / Stop BT / Quit**.
+Closing the window with **X** quits the app.
 
 When **Autostart** is enabled the app launches directly minimized to the tray on login.
 
@@ -224,16 +234,22 @@ When **Autostart** is enabled the app launches directly minimized to the tray on
 
 ## Troubleshooting
 
-### "Transport error" / Dongle not found
+### "No WinUSB dongle found"
 
-- Is the dongle plugged in?
+- Is the dongle plugged in? The list only shows attached devices.
 - Is the WinUSB driver installed? → Click "Install WinUSB…" in the main window
 - Click Scan to re-detect dongles
 
+### "exited unexpectedly" / "HCI powered off unexpectedly"
+
+- Another program (or a stale `btstack_sink.exe`) may hold the dongle. Stop and start again.
+- Re-check the WinUSB driver in Device Manager.
+
 ### Device has to re-pair every time
 
-- Did you check **Remember this device** in the pairing dialog? Without it the key is not saved.
-- Check that `btstack\build\btstack_keys.db` exists and is writable.
+- Did you check **Remember this device** in the pairing dialog? Without it the device is
+  only allowed for the current session.
+- Check that `%APPDATA%\BT-AudioSink\btstack_keys.db` exists and is writable.
 
 ### No audio / device not found
 
@@ -243,6 +259,7 @@ When **Autostart** is enabled the app launches directly minimized to the tray on
 ### Audio stutters / dropouts
 
 - Settings → Buffer latency → increase to 200 ms or higher
+- Lower the max SBC bitpool if the log reports fragmented SBC frames
 - Check CPU load
 
 ### Restore dongle for normal Windows Bluetooth use
@@ -256,17 +273,19 @@ Device Manager → `USB devices` → `Bluetooth USB Dongle (WinUSB)` → right-c
 
 | Component | Purpose |
 |-----------|---------|
-| [BTstack](https://github.com/bluekitchen/btstack) | C Bluetooth stack – implements HCI / L2CAP / AVDTP / A2DP; compiled to `WinBTsink.exe` |
+| [BTstack](https://github.com/bluekitchen/btstack) | C Bluetooth stack – implements HCI / L2CAP / AVDTP / A2DP / AVRCP; compiled to `btstack_sink.exe` |
 | [Zadig](https://github.com/pbatard/libwdi) | USB driver replacement for direct WinUSB access |
-| [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) | Bundles FFmpeg automatically |
+| [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) | Provides the FFmpeg binary |
 | [sounddevice](https://python-sounddevice.readthedocs.io/) | WASAPI audio output |
 | [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) | Modern dark-mode GUI |
 | [pystray](https://github.com/moses-palmer/pystray) | System tray icon |
 | [PyInstaller](https://pyinstaller.org/) | Packages everything into a single .exe |
 
-**Supported codecs:** SBC (mandatory A2DP codec)
+**Supported codecs:** SBC (mandatory A2DP codec) and AAC
 
 **Supported devices:** iPhone, Android, Nintendo Switch 2, and any A2DP source
+
+**AVRCP:** absolute volume in both directions and now-playing metadata (title / artist / album)
 
 ---
 
@@ -274,30 +293,33 @@ Device Manager → `USB devices` → `Bluetooth USB Dongle (WinUSB)` → right-c
 
 ```
 WinBTsink/
-├── dist\WinBTsink.exe   ← Built Windows EXE (after running build.ps1)
-├── build.ps1               ← Build script (one click)
-├── WinBTsink.spec       ← PyInstaller configuration
+├── dist\BT-AudioSink.exe   ← Built Windows EXE (after running build.ps1)
+├── build.ps1               ← Full build: C engine + PyInstaller
+├── BT-AudioSink.spec       ← PyInstaller configuration
 ├── requirements.txt        ← Python dependencies
 ├── start.bat               ← Launches the GUI via Python
 ├── src/
 │   ├── gui.py              ← CustomTkinter GUI (entry point)
-│   ├── backend.py          ← Bluetooth + audio backend (launches WinBTsink.exe)
-│   └── winusb_installer.py ← Zadig helper
+│   ├── backend.py          ← Bluetooth + audio backend (launches btstack_sink.exe)
+│   ├── usb_devices.py      ← Attached USB Bluetooth dongles via SetupAPI
+│   └── winusb_installer.py ← Zadig download / launch helper
 ├── btstack/
-│   ├── WinBTsink.c      ← C Bluetooth engine (HCI / AVDTP / A2DP sink)
-│   ├── CMakeLists.txt      ← Build configuration
+│   ├── btstack_sink.c      ← C Bluetooth engine (HCI / AVDTP / A2DP / AVRCP sink)
 │   ├── btstack_config.h    ← BTstack feature flags
-│   ├── do_build.sh         ← Build script (MSYS2/MinGW)
-│   ├── btstack-src/        ← BTstack library source (submodule)
-│   └── build/
-│       ├── WinBTsink.exe ← Compiled BT engine
-│       └── btstack_keys.db  ← Bonding keys (auto-created)
+│   ├── CMakeLists.txt      ← Build configuration
+│   ├── build.ps1           ← Toolchain install + clone + patch + build
+│   ├── do_build.sh         ← Clone + patch + build from an MSYS2 shell
+│   ├── patches/apply_patches.py ← BTstack source patches (deferred accept, dongle filter)
+│   ├── btstack-src/        ← BTstack source (cloned by build.ps1, git-ignored)
+│   └── build/btstack_sink.exe ← Compiled BT engine (git-ignored)
 └── setup/
-    └── install.ps1         ← One-time setup script
+    └── install.ps1         ← One-time Python setup script
 
-%APPDATA%\WinBTsink\     ← Created automatically on first launch
+%APPDATA%\BT-AudioSink\     ← Created automatically on first launch
 ├── config.json             ← Saved settings
-└── allowed_macs.json       ← Remembered device addresses
+├── allowed_macs.json       ← Remembered device addresses
+├── btstack_keys.db         ← Bluetooth bonding keys
+└── zadig.exe               ← Cached Zadig download (after "Install WinUSB…")
 ```
 
 ---

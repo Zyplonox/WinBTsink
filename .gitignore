@@ -17,14 +17,7 @@ __pycache__/
 venv/
 env/
 
-# Cached Zadig download (placed next to .exe at runtime)
-zadig.exe
-
-# User config / bonding keys (written to %APPDATA% at runtime, not source)
-config.json
-keys.json
-
-# BTstack downloaded source and compiled output (fetched by do_build.sh / build.ps1)
+# BTstack downloaded source and compiled output (fetched by btstack/build.ps1)
 btstack/btstack-src/
 btstack/build/
 

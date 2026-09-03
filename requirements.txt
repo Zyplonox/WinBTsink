@@ -1,18 +1,17 @@
 # Python dependencies for BT-AudioSink
 #
 # Installation:
-#   pip install -r requirements.txt
-
-# ── Bluetooth stack ───────────────────────────────────────────────────────────
-# BTstack (C) handles Bluetooth via btstack_sink.exe subprocess.
-# Run btstack/build.ps1 to build it (requires MSYS2/MinGW, auto-installed).
-# pyusb is kept for USB dongle enumeration in the UI (winusb_installer.py).
+#   python -m pip install -r requirements.txt
+#
+# Bluetooth itself is handled by btstack_sink.exe (C, BTstack), built with
+# btstack\build.ps1. USB dongle enumeration uses the Windows SetupAPI via
+# ctypes (src/usb_devices.py), so no USB package is needed.
 
 # ── Audio ─────────────────────────────────────────────────────────────────────
 sounddevice>=0.4.6
 numpy>=1.24.0
 
-# Bundles FFmpeg automatically (no winget / manual installation required)
+# Provides the FFmpeg binary used to decode SBC/AAC (bundled into the EXE)
 imageio-ffmpeg>=0.4.9
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -21,7 +20,3 @@ Pillow>=10.0.0
 
 # System tray icon (minimize to tray)
 pystray>=0.19.4
-
-# ── Optional ──────────────────────────────────────────────────────────────────
-# USB device enumeration (debugging / dongle detection)
-pyusb>=1.2.1
