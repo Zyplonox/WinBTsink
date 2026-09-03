@@ -414,6 +414,7 @@ class SinkBackend:
         on_metadata: Optional[Callable[[str, dict], None]] = None,            # addr, {title,artist,album}
         on_audio_start: Optional[Callable[[str, str, dict], None]] = None,    # addr, codec, stream info
         on_pairing_timeout: Optional[Callable[[], None]] = None,
+        on_playback_status: Optional[Callable[[str, str], None]] = None,      # addr, playing|paused|stopped|...
     ):
         # BT / USB parameters
         self._device_name = device_name
@@ -443,6 +444,7 @@ class SinkBackend:
         self._cb_metadata = on_metadata
         self._cb_audio_start = on_audio_start
         self._cb_pairing_timeout = on_pairing_timeout
+        self._cb_playback_status = on_playback_status
 
         # Feature flags / persistence
         self._debug = debug
@@ -491,6 +493,14 @@ class SinkBackend:
     def notify_volume_changed(self, vol_0_127: int) -> None:
         """Tell all connected sources our volume via AVRCP absolute volume."""
         self._send_cmd({"cmd": "set_volume", "volume": int(max(0, min(127, vol_0_127)))})
+
+    PLAYER_ACTIONS = ("play", "pause", "stop", "next", "prev")
+
+    def player_control(self, addr: str, action: str) -> None:
+        """Sends an AVRCP player command (play/pause/stop/next/prev) to a source."""
+        if action not in self.PLAYER_ACTIONS:
+            raise ValueError(f"unknown player action {action!r}")
+        self._send_cmd({"cmd": "player", "addr": addr.upper(), "action": action})
 
     def set_pairing_mode(self, allowed: bool) -> None:
         """
@@ -784,6 +794,10 @@ class SinkBackend:
         elif evt == "volume_changed":
             if self._cb_volume_changed:
                 self._cb_volume_changed(addr, int(event.get("volume", 0)))
+
+        elif evt == "playback":
+            if self._cb_playback_status:
+                self._cb_playback_status(addr, str(event.get("status", "")))
 
         elif evt == "metadata":
             if self._cb_metadata:

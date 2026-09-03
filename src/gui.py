@@ -29,6 +29,7 @@ import sounddevice as sd
 from PIL import Image, ImageDraw
 
 from backend import SinkBackend, SinkState
+from media_keys import MediaKeyListener
 from usb_devices import list_bluetooth_dongles
 from winusb_installer import download_and_run_zadig, list_native_bt_devices
 
@@ -260,6 +261,7 @@ class Settings:
     sbc_block_length: int = 0              # 4/8/12/16, 0 = Auto (source chooses)
     sbc_subbands: int = 0                  # 4/8, 0 = Auto
     sbc_allocation: str = "auto"           # "auto", "loudness" or "snr"
+    media_keys: bool = False               # forward keyboard media keys via AVRCP
 
     #: Keys persisted in config.json and the JSON types accepted for each.
     _PERSIST: dict[str, tuple[type, ...]] = {
@@ -274,6 +276,7 @@ class Settings:
         "sbc_block_length":       (int,),
         "sbc_subbands":           (int,),
         "sbc_allocation":         (str,),
+        "media_keys":             (bool,),
     }
 
     def load(self) -> None:
@@ -504,6 +507,19 @@ class SettingsDialog(ctk.CTkToplevel):
             variable=self._autostart_var,
         ).pack(anchor="w", padx=20, pady=(8, 0))
 
+        self._media_keys_var = ctk.BooleanVar(value=settings.media_keys)
+        ctk.CTkCheckBox(
+            self._s,
+            text="Keyboard media keys control the playing device",
+            variable=self._media_keys_var,
+        ).pack(anchor="w", padx=20, pady=(8, 0))
+        ctk.CTkLabel(
+            self._s,
+            text="Play/Pause, Next, Previous and Stop keys are sent to the phone via AVRCP "
+                 "while the BT stack runs. Other apps do not receive them meanwhile.",
+            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF", wraplength=360,
+        ).pack(fill="x", padx=44)
+
     def _add_clear_keys_row(self) -> None:
         """Button that forgets every paired device (approval list + bonding keys)."""
         ctk.CTkButton(
@@ -600,6 +616,7 @@ class SettingsDialog(ctk.CTkToplevel):
         audio_name = self._audio_var.get()
         settings.audio_device_name = None if audio_name == "Default" else audio_name
         settings.debug_mode = self._debug_var.get()
+        settings.media_keys = self._media_keys_var.get()
         settings.autostart = self._autostart_var.get()
         _set_autostart(settings.autostart)  # Sync registry immediately
         settings.save()
@@ -908,9 +925,15 @@ class DeviceCard(ctk.CTkFrame):
 
     Layout (inside a CTkScrollableFrame):
       Row 1:  device name (bold) · codec badge (SBC/AAC) · audio output dropdown
-      Row 2:  Now-playing metadata line  (hidden when empty)
-      Row 3:  MAC address in small grey text
+      Row 2:  player controls (prev / play-pause / next) · playback status
+      Row 3:  Now-playing metadata line  (hidden when empty)
+      Row 4:  MAC address in small grey text
     """
+
+    _STATUS_TEXT = {
+        "playing": "▶ playing", "paused": "⏸ paused", "stopped": "■ stopped",
+        "seeking": "⏩ seeking", "error": "player error", "": "",
+    }
 
     def __init__(
         self,
@@ -918,11 +941,14 @@ class DeviceCard(ctk.CTkFrame):
         name: str,
         addr: str,
         on_route_change,  # Callable[[addr: str, device_index: Optional[int]], None]
+        on_player=None,   # Callable[[addr: str, action: str], None]
         **kwargs,
     ):
         super().__init__(parent, corner_radius=8, **kwargs)
         self._addr = addr
         self._on_route_change = on_route_change
+        self._on_player = on_player
+        self.playback_status = ""
 
         # ── Row 1: name + codec + audio route ──────────────────────────
         row1 = ctk.CTkFrame(self, fg_color="transparent")
@@ -952,20 +978,49 @@ class DeviceCard(ctk.CTkFrame):
         )
         self._route_menu.pack(side="left")
 
-        # ── Row 2: metadata ────────────────────────────────────────────
+        # ── Row 2: player controls (AVRCP) ─────────────────────────────
+        ctl = ctk.CTkFrame(self, fg_color="transparent")
+        ctl.pack(fill="x", padx=8, pady=(4, 0))
+        btn_style = dict(width=34, height=24, font=ctk.CTkFont(size=13),
+                         fg_color="#374151", hover_color="#4B5563")
+        ctk.CTkButton(ctl, text="⏮", command=lambda: self._player("prev"), **btn_style
+                      ).pack(side="left", padx=(0, 4))
+        self._play_btn = ctk.CTkButton(ctl, text="▶", command=self._toggle_play, **btn_style)
+        self._play_btn.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(ctl, text="⏭", command=lambda: self._player("next"), **btn_style
+                      ).pack(side="left", padx=(0, 8))
+        self._status_label = ctk.CTkLabel(
+            ctl, text="", font=ctk.CTkFont(size=11), text_color="#9CA3AF", anchor="w",
+        )
+        self._status_label.pack(side="left", fill="x", expand=True)
+
+        # ── Row 3: metadata ────────────────────────────────────────────
         self._meta_label = ctk.CTkLabel(
             self, text="",
             font=ctk.CTkFont(size=11), text_color="#9CA3AF", anchor="w",
         )
         self._meta_label.pack(fill="x", padx=8, pady=(2, 0))
 
-        # ── Row 3: MAC address (always shown) ──────────────────────────
+        # ── Row 4: MAC address (always shown) ──────────────────────────
         ctk.CTkLabel(
             self, text=addr,
             font=ctk.CTkFont(size=10), text_color="#6B7280", anchor="w",
         ).pack(fill="x", padx=8, pady=(1, 6))
 
     # ------------------------------------------------------------------
+
+    def _player(self, action: str) -> None:
+        if self._on_player:
+            self._on_player(self._addr, action)
+
+    def _toggle_play(self) -> None:
+        self._player("pause" if self.playback_status == "playing" else "play")
+
+    def set_playback(self, status: str) -> None:
+        """Updates the play/pause button and status text from an AVRCP notification."""
+        self.playback_status = status
+        self._play_btn.configure(text="⏸" if status == "playing" else "▶")
+        self._status_label.configure(text=self._STATUS_TEXT.get(status, status))
 
     def set_name(self, name: str) -> None:
         """Updates the device name label once the remote name is resolved."""
@@ -1038,6 +1093,8 @@ class App(ctk.CTk):
         self._autostart_bt = start_minimized  # Start BT after dongle scan on autostart
         self._pairing_switch: Optional[ctk.CTkSwitch] = None
         self._last_avrcp_volume = -1    # last absolute volume sent to sources
+        self._active_stream_addr = ""   # device whose stream started most recently
+        self._media_keys: Optional[MediaKeyListener] = None
 
         self._build_ui()
         self._log("Ready – scanning USB dongles…")
@@ -1405,9 +1462,59 @@ class App(ctk.CTk):
 
     def _on_audio_start(self, addr: str, codec: str, info: dict) -> None:
         """Updates the codec badge on the device card when streaming starts."""
+        self._active_stream_addr = addr.upper()   # media keys go to the latest stream
         card = self._device_cards.get(addr.upper())
         if card and card.winfo_exists():
             card.set_codec(codec, info)
+
+    def _on_playback_status(self, addr: str, status: str) -> None:
+        card = self._device_cards.get(addr.upper())
+        if card and card.winfo_exists():
+            card.set_playback(status)
+
+    def _on_player(self, addr: str, action: str) -> None:
+        """Card button pressed: forward the AVRCP command to the source."""
+        if self._backend:
+            self._backend.player_control(addr, action)
+
+    # ------------------------------------------------------------------
+    # Keyboard media keys → AVRCP
+    # ------------------------------------------------------------------
+
+    def _start_media_keys(self) -> None:
+        if self._media_keys is not None or not settings.media_keys:
+            return
+        listener = MediaKeyListener(self._on_media_key)
+        if listener.start():
+            self._media_keys = listener
+            self._log("Media keys: forwarded to the playing device.")
+        else:
+            self._log("Media keys: could not register hotkeys (another app holds them?).")
+
+    def _stop_media_keys(self) -> None:
+        if self._media_keys is not None:
+            self._media_keys.stop()
+            self._media_keys = None
+
+    def _on_media_key(self, key: str) -> None:
+        """Called on the listener thread."""
+        try:
+            self.after(0, self._handle_media_key, key)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _handle_media_key(self, key: str) -> None:
+        if not self._backend or not self._device_cards:
+            return
+        addr = self._active_stream_addr
+        if addr not in self._device_cards:
+            addr = next(iter(self._device_cards))
+        card = self._device_cards[addr]
+        if key == "play_pause":
+            action = "pause" if card.playback_status == "playing" else "play"
+        else:
+            action = key   # next / prev / stop
+        self._backend.player_control(addr, action)
 
     def _on_device_name(self, addr: str, name: str) -> None:
         """Called when the remote Bluetooth name is resolved for a connected device."""
@@ -1477,11 +1584,13 @@ class App(ctk.CTk):
             on_metadata=self._ui(gen, self._on_metadata),
             on_audio_start=self._ui(gen, self._on_audio_start),
             on_pairing_timeout=self._ui(gen, self._on_pairing_timeout),
+            on_playback_status=self._ui(gen, self._on_playback_status),
         )
         # Pairing switch state is applied by the backend once BTstack is ready
         if self._pairing_switch:
             self._backend.set_pairing_mode(bool(self._pairing_switch.get()))
         self._backend.start()
+        self._start_media_keys()
         self._title_label.configure(text=settings.device_name)
 
     def _stop_backend(self) -> None:
@@ -1494,6 +1603,7 @@ class App(ctk.CTk):
             hover_color=["#2563EB", "#1E40AF"],
         )
         self._scan_dongle_btn.configure(state="normal")
+        self._stop_media_keys()
         backend, self._backend = self._backend, None
         if backend:
             self._log("Stopping BT stack…")
@@ -1548,6 +1658,7 @@ class App(ctk.CTk):
             card = DeviceCard(
                 self._device_scroll, self._connected_devices[addr], addr,
                 on_route_change=self._on_route_selected,
+                on_player=self._on_player,
             )
             card.pack(fill="x", padx=4, pady=(0, 4))
             self._device_cards[addr] = card
@@ -1725,6 +1836,7 @@ class App(ctk.CTk):
         engine releases the dongle) and destroy the window once that is done.
         """
         settings.save()   # volume changes on the main window are only saved here
+        self._stop_media_keys()
         if self._tray_icon is not None:
             try:
                 self._tray_icon.stop()  # type: ignore[union-attr]

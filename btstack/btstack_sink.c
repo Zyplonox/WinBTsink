@@ -9,6 +9,7 @@
  *                  {"cmd":"deny","addr":"XX:XX:XX:XX:XX:XX","cid":64}
  *                  {"cmd":"set_discoverable","enabled":true}
  *                  {"cmd":"set_volume","addr":"XX:XX:XX:XX:XX:XX","volume":90}
+ *                  {"cmd":"player","addr":"XX:XX:XX:XX:XX:XX","action":"play|pause|stop|next|prev"}
  *                  {"cmd":"stop"}
  *
  * stdout (binary): Audio frames, each prefixed by a header:
@@ -28,6 +29,7 @@
  *                  {"event":"audio_stop","addr":"..."}
  *                  {"event":"volume_changed","addr":"...","volume":90}
  *                  {"event":"metadata","addr":"...","title":"...","artist":"...","album":"..."}
+ *                  {"event":"playback","addr":"...","status":"playing|paused|stopped|seeking|error"}
  *                  {"event":"log","msg":"..."}
  *                  {"event":"error","msg":"..."}
  *                  All string values are JSON-escaped.
@@ -599,6 +601,8 @@ static void on_avrcp_event(uint8_t packet_type, uint16_t channel,
         /* Track-change notifications (controller role) — metadata arrives on event */
         avrcp_controller_enable_notification(avrcp_cid,
             AVRCP_NOTIFICATION_EVENT_TRACK_CHANGED);
+        avrcp_controller_enable_notification(avrcp_cid,
+            AVRCP_NOTIFICATION_EVENT_PLAYBACK_STATUS_CHANGED);
         avrcp_controller_get_now_playing_info(avrcp_cid);
         break;
     }
@@ -675,6 +679,28 @@ static void on_avrcp_controller_event(uint8_t packet_type, uint16_t channel,
         avrcp_controller_enable_notification(avrcp_cid,
             AVRCP_NOTIFICATION_EVENT_TRACK_CHANGED);
         avrcp_controller_get_now_playing_info(avrcp_cid);
+        break;
+    }
+
+    case AVRCP_SUBEVENT_NOTIFICATION_PLAYBACK_STATUS_CHANGED: {
+        uint16_t avrcp_cid = avrcp_subevent_notification_playback_status_changed_get_avrcp_cid(packet);
+        uint8_t  status    = avrcp_subevent_notification_playback_status_changed_get_play_status(packet);
+        a2dp_conn_t *conn  = find_conn_by_avrcp_cid(avrcp_cid);
+        if (!conn) break;
+        const char *name;
+        switch (status) {
+            case AVRCP_PLAYBACK_STATUS_PLAYING:  name = "playing"; break;
+            case AVRCP_PLAYBACK_STATUS_PAUSED:   name = "paused";  break;
+            case AVRCP_PLAYBACK_STATUS_STOPPED:  name = "stopped"; break;
+            case AVRCP_PLAYBACK_STATUS_FWD_SEEK:
+            case AVRCP_PLAYBACK_STATUS_REV_SEEK: name = "seeking"; break;
+            default:                             name = "error";   break;
+        }
+        char evt[96];
+        snprintf(evt, sizeof(evt),
+                 "{\"event\":\"playback\",\"addr\":\"%s\",\"status\":\"%s\"}",
+                 conn->addr_str, name);
+        emit_event(evt);
         break;
     }
 
@@ -1067,14 +1093,16 @@ static void json_extract_str(const char *line, const char *key,
 }
 
 static void process_command(const char *line) {
-    char cmd[64]  = "";
-    char addr[18] = "";
-    int enabled   = -1;
-    int volume    = -1;
-    uint16_t cid  = 0;
+    char cmd[64]    = "";
+    char addr[18]   = "";
+    char action[16] = "";
+    int enabled     = -1;
+    int volume      = -1;
+    uint16_t cid    = 0;
 
-    json_extract_str(line, "\"cmd\"",  cmd,  sizeof(cmd));
-    json_extract_str(line, "\"addr\"", addr, sizeof(addr));
+    json_extract_str(line, "\"cmd\"",    cmd,    sizeof(cmd));
+    json_extract_str(line, "\"addr\"",   addr,   sizeof(addr));
+    json_extract_str(line, "\"action\"", action, sizeof(action));
 
     {
         const char *p = strstr(line, "\"enabled\"");
@@ -1165,6 +1193,32 @@ static void process_command(const char *line) {
             }
         }
         if (!found && g_debug) emit_log("set_volume: no AVRCP connection for addr");
+    }
+    else if (strcmp(cmd, "player") == 0) {
+        /* AVRCP controller pass-through command to the source's player */
+        a2dp_conn_t *conn = NULL;
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (g_conns[i].active && strcmp(g_conns[i].addr_str, addr) == 0) {
+                conn = &g_conns[i];
+                break;
+            }
+        }
+        if (!conn || conn->avrcp_cid == 0) {
+            emit_log("player: no AVRCP connection for that device");
+        } else {
+            uint8_t rc;
+            if      (strcmp(action, "play")  == 0) rc = avrcp_controller_play(conn->avrcp_cid);
+            else if (strcmp(action, "pause") == 0) rc = avrcp_controller_pause(conn->avrcp_cid);
+            else if (strcmp(action, "stop")  == 0) rc = avrcp_controller_stop(conn->avrcp_cid);
+            else if (strcmp(action, "next")  == 0) rc = avrcp_controller_forward(conn->avrcp_cid);
+            else if (strcmp(action, "prev")  == 0) rc = avrcp_controller_backward(conn->avrcp_cid);
+            else { emit_log("player: unknown action"); rc = ERROR_CODE_SUCCESS; }
+            if (rc != ERROR_CODE_SUCCESS) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "player: %s failed (0x%02x)", action, rc);
+                emit_log(msg);
+            }
+        }
     }
     else if (strcmp(cmd, "stop") == 0) {
         /* Idempotent: the parent sends "stop" and then closes stdin, which
