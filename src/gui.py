@@ -262,6 +262,7 @@ class Settings:
     sbc_subbands: int = 0                  # 4/8, 0 = Auto
     sbc_allocation: str = "auto"           # "auto", "loudness" or "snr"
     media_keys: bool = False               # forward keyboard media keys via AVRCP
+    notifications: bool = True             # Windows toasts on connect/disconnect/pairing
 
     #: Keys persisted in config.json and the JSON types accepted for each.
     _PERSIST: dict[str, tuple[type, ...]] = {
@@ -277,6 +278,7 @@ class Settings:
         "sbc_subbands":           (int,),
         "sbc_allocation":         (str,),
         "media_keys":             (bool,),
+        "notifications":          (bool,),
     }
 
     def load(self) -> None:
@@ -507,6 +509,13 @@ class SettingsDialog(ctk.CTkToplevel):
             variable=self._autostart_var,
         ).pack(anchor="w", padx=20, pady=(8, 0))
 
+        self._notify_var = ctk.BooleanVar(value=settings.notifications)
+        ctk.CTkCheckBox(
+            self._s,
+            text="Show notifications (connect, disconnect, pairing request)",
+            variable=self._notify_var,
+        ).pack(anchor="w", padx=20, pady=(8, 0))
+
         self._media_keys_var = ctk.BooleanVar(value=settings.media_keys)
         ctk.CTkCheckBox(
             self._s,
@@ -617,6 +626,7 @@ class SettingsDialog(ctk.CTkToplevel):
         settings.audio_device_name = None if audio_name == "Default" else audio_name
         settings.debug_mode = self._debug_var.get()
         settings.media_keys = self._media_keys_var.get()
+        settings.notifications = self._notify_var.get()
         settings.autostart = self._autostart_var.get()
         _set_autostart(settings.autostart)  # Sync registry immediately
         settings.save()
@@ -942,13 +952,18 @@ class DeviceCard(ctk.CTkFrame):
         addr: str,
         on_route_change,  # Callable[[addr: str, device_index: Optional[int]], None]
         on_player=None,   # Callable[[addr: str, action: str], None]
+        on_volume=None,   # Callable[[addr: str, percent: int], None]
+        on_mute=None,     # Callable[[addr: str, muted: bool], None]
         **kwargs,
     ):
         super().__init__(parent, corner_radius=8, **kwargs)
         self._addr = addr
         self._on_route_change = on_route_change
         self._on_player = on_player
+        self._on_volume = on_volume
+        self._on_mute = on_mute
         self.playback_status = ""
+        self.muted = False
 
         # ── Row 1: name + codec + audio route ──────────────────────────
         row1 = ctk.CTkFrame(self, fg_color="transparent")
@@ -994,6 +1009,17 @@ class DeviceCard(ctk.CTkFrame):
         )
         self._status_label.pack(side="left", fill="x", expand=True)
 
+        # per-device volume (right-aligned): mute button + slider + percent
+        self._vol_pct = ctk.CTkLabel(ctl, text="100%", width=38,
+                                     font=ctk.CTkFont(size=11), text_color="#9CA3AF")
+        self._vol_pct.pack(side="right")
+        self._vol_var = ctk.DoubleVar(value=100)
+        ctk.CTkSlider(ctl, from_=0, to=100, number_of_steps=100, width=90, height=14,
+                      variable=self._vol_var, command=self._volume_dragged,
+                      ).pack(side="right", padx=(2, 4))
+        self._mute_btn = ctk.CTkButton(ctl, text="🔊", command=self._toggle_mute, **btn_style)
+        self._mute_btn.pack(side="right", padx=(0, 4))
+
         # ── Row 3: metadata ────────────────────────────────────────────
         self._meta_label = ctk.CTkLabel(
             self, text="",
@@ -1021,6 +1047,28 @@ class DeviceCard(ctk.CTkFrame):
         self.playback_status = status
         self._play_btn.configure(text="⏸" if status == "playing" else "▶")
         self._status_label.configure(text=self._STATUS_TEXT.get(status, status))
+
+    def _volume_dragged(self, value: float) -> None:
+        pct = int(value)
+        self._vol_pct.configure(text=f"{pct}%")
+        if self._on_volume:
+            self._on_volume(self._addr, pct)
+
+    def set_volume_pct(self, pct: int) -> None:
+        """Reflects a volume the source set via AVRCP (does not echo it back)."""
+        self._vol_var.set(float(pct))
+        self._vol_pct.configure(text=f"{pct}%")
+
+    @property
+    def volume_pct(self) -> int:
+        return int(self._vol_var.get())
+
+    def _toggle_mute(self) -> None:
+        self.muted = not self.muted
+        self._mute_btn.configure(text="🔇" if self.muted else "🔊",
+                                 fg_color="#7F1D1D" if self.muted else "#374151")
+        if self._on_mute:
+            self._on_mute(self._addr, self.muted)
 
     def set_name(self, name: str) -> None:
         """Updates the device name label once the remote name is resolved."""
@@ -1092,7 +1140,7 @@ class App(ctk.CTk):
         self._pairing_dialogs: dict[str, PairingDialog] = {}  # addr_upper → open dialog
         self._autostart_bt = start_minimized  # Start BT after dongle scan on autostart
         self._pairing_switch: Optional[ctk.CTkSwitch] = None
-        self._last_avrcp_volume = -1    # last absolute volume sent to sources
+        self._sent_avrcp_volume: dict[str, int] = {}   # addr → last absolute volume sent
         self._active_stream_addr = ""   # device whose stream started most recently
         self._media_keys: Optional[MediaKeyListener] = None
 
@@ -1104,6 +1152,9 @@ class App(ctk.CTk):
         self.bind("<Map>", self._on_map)       # Window restored → reset flag
         self.after(400, self._scan_dongles)
         self.after(self.LEVEL_POLL_MS, self._poll_level)
+        # The tray icon exists from the start so notifications work while the
+        # window is visible but behind other windows.
+        self.after(200, self._ensure_tray_icon)
 
         if start_minimized and _TRAY_AVAILABLE:
             self.after(100, self._minimize_to_tray)
@@ -1423,32 +1474,38 @@ class App(ctk.CTk):
     # Volume
     # ------------------------------------------------------------------
 
-    def _set_volume_ui(self, pct: int) -> None:
-        self._vol_var.set(float(pct))
-        self._vol_pct_label.configure(text=f"{pct}%")
-        settings.volume = pct / 100.0
-
     def _on_volume_change(self, value: float) -> None:
-        """Called by the volume slider (mouse only); updates pipeline volume and sources."""
+        """Master slider (mouse only): local gain on top of every device's own volume."""
         pct = int(value)
         self._vol_pct_label.configure(text=f"{pct}%")
         settings.volume = pct / 100.0
         if self._backend:
             self._backend.set_volume(settings.volume)
-            # AVRCP absolute volume is 0..127 and cannot express gain above 100 %
-            vol_127 = min(127, round(pct * 127 / 100))
-            if vol_127 != self._last_avrcp_volume:
-                self._last_avrcp_volume = vol_127
-                self._backend.notify_volume_changed(vol_127)
+
+    def _on_card_volume(self, addr: str, pct: int) -> None:
+        """Per-device slider: local gain plus AVRCP absolute volume to that phone."""
+        if not self._backend:
+            return
+        self._backend.set_device_volume(addr, pct / 100.0)
+        vol_127 = round(pct * 127 / 100)
+        if vol_127 != self._sent_avrcp_volume.get(addr):
+            self._sent_avrcp_volume[addr] = vol_127
+            self._backend.notify_volume_changed(vol_127, addr)
+
+    def _on_card_mute(self, addr: str, muted: bool) -> None:
+        if self._backend:
+            self._backend.set_device_mute(addr, muted)
 
     def _on_volume_changed_by_source(self, addr: str, vol_127: int) -> None:
-        """Called when a source device sets the absolute volume via AVRCP."""
-        self._last_avrcp_volume = vol_127
-        # CTkSlider only fires its command on mouse input, so setting the
-        # variable here does not echo the value back to the source.
-        self._set_volume_ui(min(100, round(vol_127 * 100 / 127)))
+        """A source set its absolute volume via AVRCP: follow it on that device's card."""
+        addr = addr.upper()
+        pct = min(100, round(vol_127 * 100 / 127))
+        self._sent_avrcp_volume[addr] = vol_127
+        card = self._device_cards.get(addr)
+        if card and card.winfo_exists():
+            card.set_volume_pct(pct)   # does not fire the slider command
         if self._backend:
-            self._backend.set_volume(settings.volume)
+            self._backend.set_device_volume(addr, pct / 100.0)
 
     def _on_metadata(self, addr: str, meta: dict) -> None:
         """Called when AVRCP now-playing metadata arrives for a connected device."""
@@ -1524,6 +1581,35 @@ class App(ctk.CTk):
         # Also update the stored display name so disconnect log shows the real name
         if addr.upper() in self._connected_devices:
             self._connected_devices[addr.upper()] = name
+        self._update_tray_tooltip()
+
+    # ------------------------------------------------------------------
+    # Notifications (Windows toasts via the tray icon) and tray tooltip
+    # ------------------------------------------------------------------
+
+    def _notify(self, title: str, message: str) -> None:
+        """Shows a system notification if enabled and a tray icon exists."""
+        if not settings.notifications or self._tray_icon is None:
+            return
+        try:
+            self._tray_icon.notify(message, f"BT-AudioSink – {title}")  # type: ignore[union-attr]
+        except Exception as exc:
+            log.debug("notification failed: %s", exc)
+
+    def _update_tray_tooltip(self) -> None:
+        if self._tray_icon is None:
+            return
+        if not self._running:
+            text = "BT-AudioSink – stopped"
+        elif self._connected_devices:
+            names = ", ".join(self._connected_devices.values())
+            text = f"BT-AudioSink – {len(self._connected_devices)} device(s): {names}"
+        else:
+            text = "BT-AudioSink – waiting for device"
+        try:
+            self._tray_icon.title = text[:127]  # type: ignore[union-attr]  (tooltip limit)
+        except Exception as exc:
+            log.debug("tray tooltip failed: %s", exc)
 
     def _on_route_selected(self, addr: str, device_index) -> None:
         """Called when the user picks a different audio output for a device."""
@@ -1553,7 +1639,7 @@ class App(ctk.CTk):
         self._running = True
         self._backend_gen += 1
         gen = self._backend_gen
-        self._last_avrcp_volume = -1
+        self._sent_avrcp_volume.clear()
         self._start_btn.configure(text="■  Stop", fg_color="#EF4444", hover_color="#DC2626")
         self._scan_dongle_btn.configure(state="disabled")
 
@@ -1604,6 +1690,7 @@ class App(ctk.CTk):
         )
         self._scan_dongle_btn.configure(state="normal")
         self._stop_media_keys()
+        self._update_tray_tooltip()
         backend, self._backend = self._backend, None
         if backend:
             self._log("Stopping BT stack…")
@@ -1645,6 +1732,9 @@ class App(ctk.CTk):
         self._status_label.configure(
             text=f"● {STATE_LABELS[state]}", text_color=STATE_COLORS[state]
         )
+        if state == SinkState.ERROR:
+            self._notify("Error", "The Bluetooth stack stopped with an error. See the log.")
+        self._update_tray_tooltip()
 
     def _on_device_connected(self, address: str) -> None:
         addr = address.upper()
@@ -1659,6 +1749,8 @@ class App(ctk.CTk):
                 self._device_scroll, self._connected_devices[addr], addr,
                 on_route_change=self._on_route_selected,
                 on_player=self._on_player,
+                on_volume=self._on_card_volume,
+                on_mute=self._on_card_mute,
             )
             card.pack(fill="x", padx=4, pady=(0, 4))
             self._device_cards[addr] = card
@@ -1669,6 +1761,8 @@ class App(ctk.CTk):
             if self._backend:
                 self._backend.set_pairing_mode(False)
             self._log("New pairings: blocked (auto)")
+        self._notify("Device connected", self._connected_devices[addr])
+        self._update_tray_tooltip()
 
     def _on_device_disconnected(self, address: str) -> None:
         addr = address.upper()
@@ -1681,6 +1775,8 @@ class App(ctk.CTk):
         if not self._connected_devices:
             self._level_value = 0.0
             self._placeholder_lbl.pack(pady=14)
+        self._notify("Device disconnected", name)
+        self._update_tray_tooltip()
 
     def _poll_level(self) -> None:
         """
@@ -1700,6 +1796,7 @@ class App(ctk.CTk):
         if existing and existing.winfo_exists():
             return   # the backend merges retries into the open question
         self._log(f"Pairing request from: {addr}")
+        self._notify("Pairing request", f"{addr} wants to connect – answer within 30 s.")
 
         def answer(approved: bool, remember: bool) -> None:
             self._pairing_dialogs.pop(addr, None)
@@ -1759,28 +1856,34 @@ class App(ctk.CTk):
             return
         self._in_tray = True
 
-        if not _TRAY_AVAILABLE:
+        # Create the tray icon first: if that fails the window must stay reachable
+        if not self._ensure_tray_icon():
+            self._in_tray = False
             self.iconify()
             return
 
-        # Create the tray icon first: if that fails the window must stay reachable
-        if self._tray_icon is None:
-            try:
-                icon = _pystray.Icon(
-                    "BT-AudioSink",
-                    self._make_tray_image(64),
-                    "BT-AudioSink",
-                    self._build_tray_menu(),
-                )
-                icon.run_detached()  # Non-blocking; icon runs on its own thread
-                self._tray_icon = icon
-            except Exception as exc:
-                self._in_tray = False
-                self._log(f"Tray icon unavailable ({exc}); minimizing to taskbar instead.")
-                self.iconify()
-                return
-
         self.withdraw()
+
+    def _ensure_tray_icon(self) -> bool:
+        """Creates the tray icon once (also used for notifications). False if unavailable."""
+        if self._tray_icon is not None:
+            return True
+        if not _TRAY_AVAILABLE:
+            return False
+        try:
+            icon = _pystray.Icon(
+                "BT-AudioSink",
+                self._make_tray_image(64),
+                "BT-AudioSink",
+                self._build_tray_menu(),
+            )
+            icon.run_detached()  # Non-blocking; icon runs on its own thread
+            self._tray_icon = icon
+            self._update_tray_tooltip()
+            return True
+        except Exception as exc:
+            self._log(f"Tray icon unavailable ({exc}).")
+            return False
 
     def _build_tray_menu(self) -> "_pystray.Menu":
         """Constructs the right-click context menu for the tray icon."""

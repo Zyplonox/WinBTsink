@@ -473,6 +473,8 @@ class SinkBackend:
         self._connected_addrs: set[str] = set()
         self._codec_types: dict[str, str] = {}             # addr → "sbc" or "aac"
         self._device_audio_routes: dict[str, Optional[int]] = {}  # addr → sd device index
+        self._device_volumes: dict[str, float] = {}        # addr → per-device gain
+        self._device_muted: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -482,17 +484,55 @@ class SinkBackend:
     def state(self) -> SinkState:
         return self._state
 
-    def set_volume(self, volume: float) -> None:
-        """Updates the output volume (linear multiplier, 0.0–2.0)."""
-        self._volume = max(0.0, min(2.0, volume))
-        with self._lock:
-            pipelines = list(self._pipelines.values())
-        for p in pipelines:
-            p.set_volume(self._volume)
+    # ---- volume: master gain × per-device gain × mute ----------------
 
-    def notify_volume_changed(self, vol_0_127: int) -> None:
-        """Tell all connected sources our volume via AVRCP absolute volume."""
-        self._send_cmd({"cmd": "set_volume", "volume": int(max(0, min(127, vol_0_127)))})
+    def set_volume(self, volume: float) -> None:
+        """Updates the master output volume (linear multiplier, 0.0–2.0)."""
+        self._volume = max(0.0, min(2.0, volume))
+        self._apply_gains()
+
+    def set_device_volume(self, addr: str, volume: float) -> None:
+        """Per-device gain (0.0–2.0), multiplied with the master volume."""
+        addr = addr.upper()
+        with self._lock:
+            self._device_volumes[addr] = max(0.0, min(2.0, volume))
+        self._apply_gains(addr)
+
+    def set_device_mute(self, addr: str, muted: bool) -> None:
+        addr = addr.upper()
+        with self._lock:
+            if muted:
+                self._device_muted.add(addr)
+            else:
+                self._device_muted.discard(addr)
+        self._apply_gains(addr)
+
+    def device_volume(self, addr: str) -> float:
+        with self._lock:
+            return self._device_volumes.get(addr.upper(), 1.0)
+
+    def _effective_gain(self, addr: str) -> float:
+        """Caller holds self._lock."""
+        if addr in self._device_muted:
+            return 0.0
+        return self._volume * self._device_volumes.get(addr, 1.0)
+
+    def _apply_gains(self, only_addr: Optional[str] = None) -> None:
+        with self._lock:
+            targets = [(a, p, self._effective_gain(a)) for a, p in self._pipelines.items()
+                       if only_addr is None or a == only_addr]
+        for _, pipeline, gain in targets:
+            pipeline.set_volume(gain)
+
+    def notify_volume_changed(self, vol_0_127: int, addr: str = "") -> None:
+        """
+        Tell a source (or all sources when addr is empty) our volume via
+        AVRCP absolute volume, so the phone's own slider follows.
+        """
+        cmd = {"cmd": "set_volume", "volume": int(max(0, min(127, vol_0_127)))}
+        if addr:
+            cmd["addr"] = addr.upper()
+        self._send_cmd(cmd)
 
     PLAYER_ACTIONS = ("play", "pause", "stop", "next", "prev")
 
@@ -971,7 +1011,8 @@ class SinkBackend:
                 device_index=device_index,
                 on_level=self._cb_level,
             )
-            pipeline.set_volume(self._volume)
+            with self._lock:
+                pipeline.set_volume(self._effective_gain(addr))
             try:
                 pipeline.start(sample_rate, channels)
             except Exception as exc:
