@@ -6,9 +6,11 @@ Entry-point for PyInstaller (see BT-AudioSink.spec).
 
 Callback threading model
 ------------------------
-All SinkBackend callbacks arrive on the backend daemon thread.
-The GUI schedule every callback through root.after(0, fn, arg) so Tkinter
-state is only ever mutated from the mainloop thread.
+SinkBackend callbacks arrive on backend threads.  App._ui() wraps each one
+so it is scheduled onto the Tk mainloop via after(0, …) and dropped when it
+belongs to a backend that has since been stopped.  The audio level is the
+exception: the sounddevice thread just stores a float that a 50 ms timer
+on the mainloop reads, so the real-time audio thread never waits for Tk.
 """
 
 from __future__ import annotations
@@ -18,20 +20,19 @@ import logging
 import os
 import sys
 import threading
+import tkinter as tk
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 import customtkinter as ctk
 import sounddevice as sd
 from PIL import Image, ImageDraw
 
 from backend import SinkBackend, SinkState
+from usb_devices import list_bluetooth_dongles
+from winusb_installer import download_and_run_zadig, list_native_bt_devices
 
-try:
-    from winusb_installer import list_native_bt_devices, download_and_run_zadig
-    _WINUSB_AVAILABLE = sys.platform == "win32"
-except ImportError:
-    _WINUSB_AVAILABLE = False
+_WINUSB_AVAILABLE = sys.platform == "win32"
 
 try:
     import pystray as _pystray
@@ -52,8 +53,9 @@ def _appdata_dir() -> str:
 def _config_file() -> str:
     return os.path.join(_appdata_dir(), "config.json")
 
-def _keys_file() -> str:
-    return os.path.join(_appdata_dir(), "keys.json")
+def _keystore_file() -> str:
+    """BTstack link-key store (bonding keys), written by btstack_sink.exe."""
+    return os.path.join(_appdata_dir(), "btstack_keys.db")
 
 def _allowed_macs_file() -> str:
     return os.path.join(_appdata_dir(), "allowed_macs.json")
@@ -63,107 +65,57 @@ def _allowed_macs_file() -> str:
 # USB dongle enumeration
 # ---------------------------------------------------------------------------
 
-#: USB class triple that identifies a Bluetooth HCI transport.
-def scan_bt_dongles() -> list[tuple[int, str]]:
+def scan_bt_dongles() -> list[tuple[str, str]]:
     """
-    Enumerate USB Bluetooth HCI dongles that have WinUSB as their active
-    driver. Returns (btstack_index, label) pairs for use as usb:N transport.
-
-    Reads HKLM\\SYSTEM\\CurrentControlSet\\Enum\\USB from the registry —
-    fast, no DLL calls that can block.
+    Enumerates the attached USB Bluetooth dongles that use the WinUSB driver.
+    Returns (path_filter, label) pairs; the filter is passed to
+    btstack_sink.exe so it opens exactly that dongle.
     """
-    import winreg
-    import re
-
-    # Bluetooth device class GUID (standard Windows)
-    BT_CLASS_GUID = "{E0CBF06C-CD8B-4647-BB8A-263B43F0F974}"
-
-    results: list[tuple[int, str]] = []
-    bt_idx = 0
-
     try:
-        usb_root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                                  r"SYSTEM\CurrentControlSet\Enum\USB")
-    except OSError:
+        return [(d.path_filter, d.label) for d in list_bluetooth_dongles() if d.uses_winusb]
+    except Exception as exc:
+        log.warning("Dongle scan failed: %s", exc)
         return []
 
-    with usb_root:
-        i = 0
-        while True:
-            try:
-                dev_id = winreg.EnumKey(usb_root, i)
-            except OSError:
-                break
-            i += 1
 
-            try:
-                dev_key = winreg.OpenKey(usb_root, dev_id)
-            except OSError:
+# ---------------------------------------------------------------------------
+# Audio output device enumeration (shared by settings dialog and device cards)
+# ---------------------------------------------------------------------------
+
+def enumerate_output_devices() -> tuple[list[str], list[Optional[int]]]:
+    """
+    Returns (display_names, device_indices) for the WASAPI output devices,
+    with "Default" (index None) first.  Only the WASAPI host API is listed
+    because sounddevice reports every device once per host API, and names
+    are what gets persisted.
+    """
+    names: list[str] = ["Default"]
+    indices: list[Optional[int]] = [None]
+    try:
+        wasapi = next((i for i, api in enumerate(sd.query_hostapis())
+                       if "WASAPI" in api["name"].upper()), None)
+        for i, dev in enumerate(sd.query_devices()):
+            if dev["max_output_channels"] <= 0:  # type: ignore[index]
                 continue
+            if wasapi is not None and dev["hostapi"] != wasapi:  # type: ignore[index]
+                continue
+            names.append(dev["name"])  # type: ignore[index]
+            indices.append(i)
+    except Exception as exc:
+        log.warning("Audio device enumeration failed: %s", exc)
+    return names, indices
 
-            with dev_key:
-                j = 0
-                while True:
-                    try:
-                        instance = winreg.EnumKey(dev_key, j)
-                    except OSError:
-                        break
-                    j += 1
 
-                    try:
-                        inst_key = winreg.OpenKey(dev_key, instance)
-                    except OSError:
-                        continue
-
-                    with inst_key:
-                        # Must have WinUSB as service
-                        try:
-                            service = winreg.QueryValueEx(inst_key, "Service")[0]
-                        except OSError:
-                            continue
-                        if service.upper() != "WINUSB":
-                            continue
-
-                        # Identify as Bluetooth: class GUID, hardware ID, or friendly name
-                        is_bt = False
-                        try:
-                            cg = winreg.QueryValueEx(inst_key, "ClassGUID")[0].upper()
-                            is_bt = cg == BT_CLASS_GUID
-                        except OSError:
-                            pass
-
-                        if not is_bt:
-                            try:
-                                hw = winreg.QueryValueEx(inst_key, "HardwareID")[0]
-                                hw_str = (" ".join(hw) if isinstance(hw, list) else hw).upper()
-                                is_bt = "CLASS_E0" in hw_str or "SUBCLASS_01" in hw_str
-                            except OSError:
-                                pass
-
-                        if not is_bt:
-                            try:
-                                fn = winreg.QueryValueEx(inst_key, "FriendlyName")[0].upper()
-                                is_bt = "BLUETOOTH" in fn
-                            except OSError:
-                                pass
-
-                        if not is_bt:
-                            continue
-
-                        try:
-                            friendly = winreg.QueryValueEx(inst_key, "FriendlyName")[0]
-                        except OSError:
-                            friendly = "Bluetooth HCI"
-
-                        m = re.search(r"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})",
-                                      dev_id, re.I)
-                        vid_pid = (f"  [VID:{m.group(1).upper()} PID:{m.group(2).upper()}]"
-                                   if m else "")
-
-                        results.append((bt_idx, f"usb:{bt_idx}  {friendly}{vid_pid}"))
-                        bt_idx += 1
-
-    return results
+def resolve_output_device_index(name: Optional[str]) -> Optional[int]:
+    """Maps a persisted device name to the current sounddevice index (None = default)."""
+    if not name:
+        return None
+    names, indices = enumerate_output_devices()
+    try:
+        return indices[names.index(name)]
+    except ValueError:
+        log.warning("Audio device '%s' not found, using default", name)
+        return None
 
 
 def _get_ffmpeg() -> str:
@@ -193,18 +145,29 @@ _AUTOSTART_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _AUTOSTART_REG_NAME = "BT-AudioSink"
 
 
+def _autostart_command() -> str:
+    """The registry value that launches this app minimized on login."""
+    exe = sys.executable
+    if getattr(sys, "frozen", False):
+        return f'"{exe}" --minimized'
+    # From source: use pythonw.exe so no console window appears at login
+    pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if os.path.exists(pythonw):
+        exe = pythonw
+    return f'"{exe}" "{os.path.abspath(__file__)}" --minimized'
+
+
 def _get_autostart() -> bool:
-    """Returns True when the autostart registry entry exists."""
+    """True when the autostart entry exists and points at an existing executable."""
     if sys.platform != "win32":
         return False
     try:
         import winreg
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY, 0, winreg.KEY_QUERY_VALUE
-        )
-        winreg.QueryValueEx(key, _AUTOSTART_REG_NAME)
-        winreg.CloseKey(key)
-        return True
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY, 0,
+                            winreg.KEY_QUERY_VALUE) as key:
+            value, _ = winreg.QueryValueEx(key, _AUTOSTART_REG_NAME)
+        exe = value.split('"')[1] if value.startswith('"') else value.split(" ")[0]
+        return os.path.exists(exe)
     except Exception:
         return False
 
@@ -224,12 +187,8 @@ def _set_autostart(enabled: bool) -> None:
             winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY, 0, winreg.KEY_SET_VALUE
         )
         if enabled:
-            exe = sys.executable
-            if getattr(sys, "frozen", False):
-                value = f'"{exe}" --minimized'
-            else:
-                value = f'"{exe}" "{os.path.abspath(__file__)}" --minimized'
-            winreg.SetValueEx(key, _AUTOSTART_REG_NAME, 0, winreg.REG_SZ, value)
+            winreg.SetValueEx(key, _AUTOSTART_REG_NAME, 0, winreg.REG_SZ,
+                              _autostart_command())
         else:
             try:
                 winreg.DeleteValue(key, _AUTOSTART_REG_NAME)
@@ -289,38 +248,54 @@ class Settings:
     """
 
     device_name: str = "PC-AudioSink"
-    bt_address: str = "F0:F1:F2:F3:F4:F5"
-    transport: str = "usb:0"       # Determined at runtime via scan, not persisted
+    usb_filter: str = ""                   # Selected dongle; chosen at runtime, not persisted
     latency_ms: int = 50
     max_bitpool: int = 53
-    audio_device_index: Optional[int] = None
+    audio_device_name: Optional[str] = None  # WASAPI output device; None = system default
     debug_mode: bool = False
     autostart: bool = False
     volume: float = 1.0
     discoverable_timeout_s: int = 0        # 0 = never auto-off
     class_of_device: int = 0x240418        # Headphones by default
-    sbc_block_length: int = 16             # 4/8/12/16
-    sbc_subbands: int = 8                  # 4 or 8
-    sbc_allocation: str = "loudness"       # "loudness" or "snr"
 
-    #: Keys written to / read from config.json.  'transport' is excluded.
-    _PERSIST = (
-        "device_name", "bt_address", "latency_ms", "max_bitpool",
-        "audio_device_index", "debug_mode", "volume",
-        "discoverable_timeout_s", "class_of_device",
-        "sbc_block_length", "sbc_subbands", "sbc_allocation",
-    )
+    #: Keys persisted in config.json and the JSON types accepted for each.
+    _PERSIST: dict[str, tuple[type, ...]] = {
+        "device_name":            (str,),
+        "latency_ms":             (int,),
+        "max_bitpool":            (int,),
+        "audio_device_name":      (str, type(None)),
+        "debug_mode":             (bool,),
+        "volume":                 (int, float),
+        "discoverable_timeout_s": (int,),
+        "class_of_device":        (int,),
+    }
 
     def load(self) -> None:
-        """Loads persisted values from config.json and autostart state from registry."""
+        """
+        Loads persisted values from config.json and autostart state from the
+        registry.  Unreadable files and wrongly typed values fall back to the
+        defaults instead of crashing the app at startup.
+        """
+        data: dict = {}
         try:
             with open(_config_file(), encoding="utf-8") as f:
-                data = json.load(f)
-            for key in self._PERSIST:
-                if key in data:
-                    setattr(self, key, data[key])
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass  # First launch or corrupted file – keep defaults
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except FileNotFoundError:
+            pass  # First launch
+        except Exception as e:
+            log.warning("Config unreadable, using defaults: %s", e)
+
+        for key, types in self._PERSIST.items():
+            if key not in data:
+                continue
+            value = data[key]
+            # bool is a subclass of int; keep it out of int-only fields
+            if isinstance(value, bool) and bool not in types:
+                continue
+            if isinstance(value, types):
+                setattr(self, key, value)
         self.autostart = _get_autostart()
 
     def save(self) -> None:
@@ -342,30 +317,27 @@ settings = Settings()
 
 class SettingsDialog(ctk.CTkToplevel):
     """
-    Modal settings window.  Changes are only applied when the user clicks
-    Save; Cancel leaves all settings unchanged.
+    Modal settings window.  Settings are only applied when the user clicks
+    Save; Cancel leaves them unchanged.  The one exception is the
+    "Clear remembered devices" button, which acts immediately.
     """
 
     def __init__(self, parent: "App"):
         super().__init__(parent)
         self.title("Settings")
-        self.geometry("420x600")
+        self.geometry("420x560")
         self.resizable(False, False)
         self.grab_set()  # Block interaction with the main window
-
-        self._device_indices: list[Optional[int]] = []  # parallel to audio dropdown
 
         # All settings rows go inside this scrollable area
         self._s = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self._s.pack(fill="both", expand=True)
 
         self._add_device_name_row()
-        self._add_bt_address_row()
         self._add_cod_row()
         self._add_discoverable_timeout_row()
         self._add_latency_row()
         self._add_bitpool_row()
-        self._add_sbc_advanced_row()
         self._add_audio_device_row()
         self._add_checkboxes()
         self._add_clear_keys_row()
@@ -386,21 +358,6 @@ class SettingsDialog(ctk.CTkToplevel):
         ctk.CTkEntry(self._s, textvariable=self._name_var).pack(
             fill="x", padx=20, pady=0
         )
-
-    def _add_bt_address_row(self) -> None:
-        """Text entry for the local Bluetooth address."""
-        ctk.CTkLabel(self._s, text="Bluetooth address", anchor="w").pack(
-            fill="x", padx=20, pady=8
-        )
-        self._btaddr_var = ctk.StringVar(value=settings.bt_address)
-        ctk.CTkEntry(self._s, textvariable=self._btaddr_var).pack(
-            fill="x", padx=20, pady=0
-        )
-        ctk.CTkLabel(
-            self._s,
-            text="Format: AA:BB:CC:DD:EE:FF  (change if address conflicts with another device)",
-            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
-        ).pack(fill="x", padx=20)
 
     # CoD display names and their corresponding integer CoD values
     _COD_OPTIONS: list[tuple[str, int]] = [
@@ -482,55 +439,16 @@ class SettingsDialog(ctk.CTkToplevel):
         )
         self._bitpool_label.pack(fill="x", padx=20)
 
-    def _add_sbc_advanced_row(self) -> None:
-        """Dropdowns for fine-grained SBC encoder parameters."""
-        ctk.CTkLabel(self._s, text="SBC block length", anchor="w").pack(
-            fill="x", padx=20, pady=(8, 0)
-        )
-        self._sbc_block_var = ctk.StringVar(value=str(settings.sbc_block_length))
-        ctk.CTkOptionMenu(
-            self._s, values=["4", "8", "12", "16"], variable=self._sbc_block_var,
-        ).pack(fill="x", padx=20, pady=0)
-        ctk.CTkLabel(
-            self._s, text="4 = lowest latency (gaming)  ·  16 = best quality (music)",
-            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
-        ).pack(fill="x", padx=20)
-
-        ctk.CTkLabel(self._s, text="SBC subbands", anchor="w").pack(
-            fill="x", padx=20, pady=(8, 0)
-        )
-        self._sbc_sub_var = ctk.StringVar(value=str(settings.sbc_subbands))
-        ctk.CTkOptionMenu(
-            self._s, values=["4", "8"], variable=self._sbc_sub_var,
-        ).pack(fill="x", padx=20, pady=0)
-        ctk.CTkLabel(
-            self._s, text="4 = faster/lower latency  ·  8 = better frequency resolution",
-            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
-        ).pack(fill="x", padx=20)
-
-        ctk.CTkLabel(self._s, text="SBC allocation method", anchor="w").pack(
-            fill="x", padx=20, pady=(8, 0)
-        )
-        alloc_label = "Loudness" if settings.sbc_allocation == "loudness" else "SNR"
-        self._sbc_alloc_var = ctk.StringVar(value=alloc_label)
-        ctk.CTkOptionMenu(
-            self._s, values=["Loudness", "SNR"], variable=self._sbc_alloc_var,
-        ).pack(fill="x", padx=20, pady=0)
-        ctk.CTkLabel(
-            self._s, text="Loudness = perceptually optimised  ·  SNR = mathematically optimal",
-            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF",
-        ).pack(fill="x", padx=20)
-
     def _add_audio_device_row(self) -> None:
         """Dropdown listing all WASAPI output devices."""
         ctk.CTkLabel(self._s, text="Audio output device", anchor="w").pack(
             fill="x", padx=20, pady=8
         )
-        display_names, self._device_indices = self._enumerate_output_devices()
-        current_idx = self._index_of_current_device(self._device_indices)
-        self._audio_var = ctk.StringVar(value=display_names[current_idx])
+        names, _ = enumerate_output_devices()
+        current = settings.audio_device_name if settings.audio_device_name in names else names[0]
+        self._audio_var = ctk.StringVar(value=current)
         ctk.CTkOptionMenu(
-            self._s, values=display_names, variable=self._audio_var
+            self._s, values=names, variable=self._audio_var
         ).pack(fill="x", padx=20, pady=0)
 
     def _add_checkboxes(self) -> None:
@@ -550,18 +468,26 @@ class SettingsDialog(ctk.CTkToplevel):
         ).pack(anchor="w", padx=20, pady=(8, 0))
 
     def _add_clear_keys_row(self) -> None:
-        """Button to wipe all saved bonding keys."""
+        """Button that forgets every paired device (approval list + bonding keys)."""
         ctk.CTkButton(
             self._s,
-            text="Clear saved devices (delete keys.json)",
+            text="Forget all paired devices",
             fg_color="#374151", hover_color="#6B7280",
             command=self._clear_keys,
-        ).pack(fill="x", padx=20, pady=(20, 8))
+        ).pack(fill="x", padx=20, pady=(20, 0))
+        ctk.CTkLabel(
+            self._s,
+            text="Deletes the remembered-device list and the Bluetooth bonding keys. "
+                 "Every device has to pair again. Takes effect immediately.",
+            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF", wraplength=360,
+        ).pack(fill="x", padx=20, pady=(0, 8))
 
     def _clear_keys(self) -> None:
+        # The dialog can only be opened while the backend is stopped, so
+        # nothing holds these files open.
         deleted = []
         errors = []
-        for path in (_keys_file(), _allowed_macs_file()):
+        for path in (_keystore_file(), _allowed_macs_file()):
             try:
                 if os.path.exists(path):
                     os.remove(path)
@@ -569,19 +495,13 @@ class SettingsDialog(ctk.CTkToplevel):
             except Exception as exc:
                 errors.append(f"{os.path.basename(path)}: {exc}")
 
-        # Also wipe the in-memory allowed-MACs set in the running backend
-        if hasattr(self.master, "_backend") and self.master._backend:
-            self.master._backend.clear_allowed_macs()
-
         if errors:
-            msg = "Error clearing devices: " + ", ".join(errors)
+            msg = "Error forgetting devices: " + ", ".join(errors)
         elif deleted:
-            msg = f"Saved devices cleared ({', '.join(deleted)}) – all devices must re-pair."
+            msg = f"Paired devices forgotten ({', '.join(deleted)}) – all devices must pair again."
         else:
-            msg = "No saved devices found (nothing to delete)."
-
-        if hasattr(self.master, "_log"):
-            self.master._log(msg)
+            msg = "No paired devices stored (nothing to delete)."
+        self.master._log(msg)  # type: ignore[attr-defined]
 
     def _add_buttons(self) -> None:
         """Cancel / Save button row at the bottom of the dialog."""
@@ -615,52 +535,12 @@ class SettingsDialog(ctk.CTkToplevel):
         self._bitpool_label.configure(text=self._bitpool_text(int(value)))
 
     # ------------------------------------------------------------------
-    # Audio device helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _enumerate_output_devices() -> tuple[list[str], list[Optional[int]]]:
-        """
-        Returns (display_names, device_indices) lists for all available
-        WASAPI output devices.  The first entry is always "Default" (index None).
-        """
-        names: list[str] = ["Default"]
-        indices: list[Optional[int]] = [None]
-        for i, dev in enumerate(sd.query_devices()):
-            if dev["max_output_channels"] > 0:  # type: ignore[index]
-                names.append(f"{i}: {dev['name']}")  # type: ignore[index]
-                indices.append(i)
-        return names, indices
-
-    @staticmethod
-    def _index_of_current_device(indices: list[Optional[int]]) -> int:
-        """Returns the position of the currently configured audio device in *indices*."""
-        if settings.audio_device_index is not None:
-            try:
-                return indices.index(settings.audio_device_index)
-            except ValueError:
-                pass
-        return 0  # Fall back to "Default"
-
-    def _resolve_audio_device_index(self, selected_label: str) -> Optional[int]:
-        """
-        Maps the selected dropdown label back to a sounddevice device index.
-        Returns None (system default) when the label is not found.
-        """
-        display_names, indices = self._enumerate_output_devices()
-        try:
-            return indices[display_names.index(selected_label)]
-        except (ValueError, IndexError):
-            return None
-
-    # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
 
     def _save(self) -> None:
         """Writes all dialog values back to the Settings object and persists them."""
         settings.device_name = self._name_var.get().strip() or "PC-AudioSink"
-        settings.bt_address = self._btaddr_var.get().strip() or "F0:F1:F2:F3:F4:F5"
         # CoD: map label back to int value
         selected_cod_label = self._cod_var.get()
         for label, val in self._COD_OPTIONS:
@@ -674,21 +554,8 @@ class SettingsDialog(ctk.CTkToplevel):
             settings.discoverable_timeout_s = 0
         settings.latency_ms = int(self._latency_var.get())
         settings.max_bitpool = int(self._bitpool_var.get())
-        # SBC advanced
-        try:
-            settings.sbc_block_length = int(self._sbc_block_var.get())
-        except ValueError:
-            settings.sbc_block_length = 16
-        try:
-            settings.sbc_subbands = int(self._sbc_sub_var.get())
-        except ValueError:
-            settings.sbc_subbands = 8
-        settings.sbc_allocation = (
-            "loudness" if self._sbc_alloc_var.get() == "Loudness" else "snr"
-        )
-        settings.audio_device_index = self._resolve_audio_device_index(
-            self._audio_var.get()
-        )
+        audio_name = self._audio_var.get()
+        settings.audio_device_name = None if audio_name == "Default" else audio_name
         settings.debug_mode = self._debug_var.get()
         settings.autostart = self._autostart_var.get()
         _set_autostart(settings.autostart)  # Sync registry immediately
@@ -813,6 +680,16 @@ class WinUSBDialog(ctk.CTkToplevel):
         if self._on_close_cb:
             self._on_close_cb()
 
+    def _post(self, fn: Callable, *args) -> None:
+        """Runs fn on the mainloop unless the dialog has been closed meanwhile."""
+        def guarded():
+            if self.winfo_exists():
+                fn(*args)
+        try:
+            self.after(0, guarded)
+        except RuntimeError:
+            pass  # mainloop is gone (app quitting)
+
     def _scan(self) -> None:
         """Starts a background thread to enumerate dongles without WinUSB."""
         self._scan_btn.configure(state="disabled", text="…")
@@ -820,11 +697,12 @@ class WinUSBDialog(ctk.CTkToplevel):
         threading.Thread(target=self._do_scan, daemon=True).start()
 
     def _do_scan(self) -> None:
-        devs = list_native_bt_devices()
         try:
-            self.after(0, self._on_scan_done, devs)
-        except Exception:
-            pass  # Dialog may have been closed while scanning
+            devs = list_native_bt_devices()
+        except Exception as exc:
+            log.warning("WinUSB scan failed: %s", exc)
+            devs = []
+        self._post(self._on_scan_done, devs)
 
     def _on_scan_done(self, devices: list) -> None:
         self._scan_btn.configure(state="normal", text="Scan")
@@ -845,7 +723,8 @@ class WinUSBDialog(ctk.CTkToplevel):
 
         for dev in devices:
             ctk.CTkLabel(
-                self._device_frame, text=f"  {dev}", anchor="w", text_color="#D1D5DB",
+                self._device_frame, text=f"  {dev.label}  (driver: {dev.service or 'none'})",
+                anchor="w", text_color="#D1D5DB",
             ).pack(anchor="w", padx=8, pady=2)
 
         self._status_label.configure(
@@ -859,8 +738,9 @@ class WinUSBDialog(ctk.CTkToplevel):
         self._scan_btn.configure(state="disabled")
         self._status_label.configure(text="Connecting to GitHub…", text_color="#F59E0B")
         download_and_run_zadig(
-            on_status=lambda msg: self.after(0, self._on_zadig_status, msg),
-            on_done=lambda ok, msg: self.after(0, self._on_zadig_done, ok, msg),
+            cache_dir=_appdata_dir(),
+            on_status=lambda msg: self._post(self._on_zadig_status, msg),
+            on_done=lambda ok, msg: self._post(self._on_zadig_done, ok, msg),
         )
 
     def _on_zadig_status(self, msg: str) -> None:
@@ -886,13 +766,18 @@ class PairingDialog(ctk.CTkToplevel):
 
     Calls resolve(approved, remember) exactly once:
       - approved: True = allow, False = deny
-      - remember: True = persist bonding key to disk
-    Auto-denies after TIMEOUT seconds if the user does not respond.
+      - remember: True = add the address to the remembered-device list so it
+                  is approved without a dialog next time
+    Auto-denies after TIMEOUT seconds if the user does not respond.  The
+    backend has its own, longer safety timeout, so this one is authoritative.
+
+    The remote name is not known yet at this point: Bluetooth only lets us
+    read it after the connection we are being asked about is accepted.
     """
 
     TIMEOUT = 30
 
-    def __init__(self, parent, name: str, address: str, resolve):
+    def __init__(self, parent, address: str, resolve):
         super().__init__(parent)
         self._resolve = resolve
         self._answered = False
@@ -910,7 +795,8 @@ class PairingDialog(ctk.CTkToplevel):
             font=ctk.CTkFont(size=18, weight="bold"),
         ).pack(pady=(22, 6))
 
-        ctk.CTkLabel(self, text=name, font=ctk.CTkFont(size=13)).pack()
+        ctk.CTkLabel(self, text="Unknown device wants to connect",
+                     font=ctk.CTkFont(size=13)).pack()
         ctk.CTkLabel(
             self, text=address,
             font=ctk.CTkFont(size=11), text_color="#9CA3AF",
@@ -1013,7 +899,8 @@ class DeviceCard(ctk.CTkFrame):
         )
         self._codec_badge.pack(side="left", padx=(4, 4))
 
-        names, self._out_indices = self._enum_outputs()
+        names, self._out_indices = enumerate_output_devices()
+        self._out_names = names
         self._route_var = ctk.StringVar(value=names[0])
         self._route_menu = ctk.CTkOptionMenu(
             row1, values=names, variable=self._route_var,
@@ -1050,21 +937,9 @@ class DeviceCard(ctk.CTkFrame):
         parts = [p.strip() for p in (title, artist, album) if p.strip()]
         self._meta_label.configure(text="  ·  ".join(parts))
 
-    @staticmethod
-    def _enum_outputs() -> tuple[list[str], list]:
-        """Returns (display_names, device_indices) for all WASAPI output devices."""
-        names: list[str] = ["Default"]
-        indices: list = [None]
-        for i, dev in enumerate(sd.query_devices()):
-            if dev["max_output_channels"] > 0:  # type: ignore[index]
-                names.append(f"{i}: {dev['name']}")  # type: ignore[index]
-                indices.append(i)
-        return names, indices
-
     def _on_route_selected(self, label: str) -> None:
-        names, indices = self._enum_outputs()
         try:
-            idx = indices[names.index(label)]
+            idx = self._out_indices[self._out_names.index(label)]
         except (ValueError, IndexError):
             idx = None
         self._on_route_change(self._addr, idx)
@@ -1080,8 +955,12 @@ class App(ctk.CTk):
 
     When start_minimized=True (set by the --minimized CLI flag used by
     Windows autostart), the window is hidden and a tray icon shown instead.
-    The only way to quit is via the tray icon's Quit menu item.
+    Closing the window (X) quits the app; the minimize button hides it to
+    the tray.
     """
+
+    #: How often the VU meter reads the level stored by the audio thread.
+    LEVEL_POLL_MS = 50
 
     def __init__(self, start_minimized: bool = False):
         super().__init__()
@@ -1096,17 +975,19 @@ class App(ctk.CTk):
         self.resizable(False, True)
 
         self._backend: Optional[SinkBackend] = None
+        self._backend_gen = 0           # bumped on every start/stop; stale callbacks are dropped
         self._running = False
-        self._current_state = SinkState.IDLE
+        self._level_value = 0.0         # written by the audio thread, read by _poll_level
         self._level_smooth = 0.0
-        self._available_dongles: list[tuple[int, str]] = []
+        self._available_dongles: list[tuple[str, str]] = []   # (path_filter, label)
         self._tray_icon: Optional[object] = None
         self._in_tray = False  # Guards against recursive tray transitions
         self._connected_devices: dict[str, str] = {}  # addr_upper → display name
         self._device_cards: dict[str, DeviceCard] = {}  # addr_upper → card widget
+        self._pairing_dialogs: dict[str, PairingDialog] = {}  # addr_upper → open dialog
         self._autostart_bt = start_minimized  # Start BT after dongle scan on autostart
         self._pairing_switch: Optional[ctk.CTkSwitch] = None
-        self._volume_from_source = False  # Suppress feedback when syncing volume
+        self._last_avrcp_volume = -1    # last absolute volume sent to sources
 
         self._build_ui()
         self._log("Ready – scanning USB dongles…")
@@ -1115,9 +996,36 @@ class App(ctk.CTk):
         self.bind("<Unmap>", self._on_unmap)  # Minimize button → tray
         self.bind("<Map>", self._on_map)       # Window restored → reset flag
         self.after(400, self._scan_dongles)
+        self.after(self.LEVEL_POLL_MS, self._poll_level)
 
         if start_minimized and _TRAY_AVAILABLE:
             self.after(100, self._minimize_to_tray)
+
+    # ------------------------------------------------------------------
+    # Backend → mainloop marshalling
+    # ------------------------------------------------------------------
+
+    def _ui(self, gen: Optional[int], fn: Callable) -> Callable:
+        """
+        Wraps a backend callback so it runs on the Tk mainloop.  With a
+        generation number the call is dropped when that backend has since
+        been stopped (gen=None keeps it, used for log lines).
+        """
+        def wrapper(*args):
+            try:
+                self.after(0, self._dispatch, gen, fn, args)
+            except (RuntimeError, tk.TclError):
+                pass  # mainloop already gone (app is quitting)
+        return wrapper
+
+    def _dispatch(self, gen: Optional[int], fn: Callable, args: tuple) -> None:
+        if gen is not None and gen != self._backend_gen:
+            return
+        fn(*args)
+
+    def _set_level(self, level: float) -> None:
+        """Called on the sounddevice thread; must not touch Tk."""
+        self._level_value = level
 
     # ------------------------------------------------------------------
     # UI construction (split into per-section helpers for readability)
@@ -1359,9 +1267,12 @@ class App(ctk.CTk):
     def _do_scan_dongles(self) -> None:
         """Runs scan_bt_dongles() on a worker thread; posts result to mainloop."""
         dongles = scan_bt_dongles()
-        self.after(0, self._on_dongles_scanned, dongles)
+        try:
+            self.after(0, self._on_dongles_scanned, dongles)
+        except RuntimeError:
+            pass  # app quit during the scan
 
-    def _on_dongles_scanned(self, dongles: list[tuple[int, str]]) -> None:
+    def _on_dongles_scanned(self, dongles: list[tuple[str, str]]) -> None:
         """Updates the dongle dropdown and enables/disables Start based on results."""
         self._scan_dongle_btn.configure(state="normal", text="Scan")
         self._available_dongles = dongles
@@ -1374,55 +1285,61 @@ class App(ctk.CTk):
                 text_color="#EF4444",
             )
             self._start_btn.configure(state="disabled")
+            settings.usb_filter = ""
             self._log("No BT dongle with WinUSB found. Install driver then scan again.")
             return
 
         labels = [label for _, label in dongles]
-        self._dongle_var.set(labels[0])
+        # Keep the user's choice across rescans when that dongle is still present
+        current = self._dongle_var.get()
+        choice = current if current in labels else labels[0]
+        self._dongle_var.set(choice)
         self._dongle_menu.configure(values=labels, state="normal")
-        settings.transport = f"usb:{dongles[0][0]}"
+        self._on_dongle_selected(choice)
         self._dongle_status.configure(
             text=f"{len(dongles)} dongle(s) found – ready", text_color="#10B981"
         )
         self._start_btn.configure(state="normal")
-        self._log(f"Dongle found: {labels[0]}")
+        self._log(f"Dongle found: {choice}")
 
         if self._autostart_bt:
             self._autostart_bt = False
             self._start_backend()
 
     def _on_dongle_selected(self, label: str) -> None:
-        """Updates settings.transport when the user picks a different dongle."""
-        for idx, lbl in self._available_dongles:
-            if lbl == label:
-                settings.transport = f"usb:{idx}"
-                break
+        """Records the selected dongle's device-path filter."""
+        settings.usb_filter = next(
+            (flt for flt, lbl in self._available_dongles if lbl == label), ""
+        )
 
     # ------------------------------------------------------------------
     # Volume
     # ------------------------------------------------------------------
 
+    def _set_volume_ui(self, pct: int) -> None:
+        self._vol_var.set(float(pct))
+        self._vol_pct_label.configure(text=f"{pct}%")
+        settings.volume = pct / 100.0
+
     def _on_volume_change(self, value: float) -> None:
-        """Called by the volume slider; updates label and live pipeline volume."""
+        """Called by the volume slider (mouse only); updates pipeline volume and sources."""
         pct = int(value)
         self._vol_pct_label.configure(text=f"{pct}%")
-        vol = value / 100.0
-        settings.volume = vol
-        if self._backend and not self._volume_from_source:
-            self._backend.set_volume(vol)
-            # Sync AVRCP absolute volume to all connected sources (capped at 127)
+        settings.volume = pct / 100.0
+        if self._backend:
+            self._backend.set_volume(settings.volume)
+            # AVRCP absolute volume is 0..127 and cannot express gain above 100 %
             vol_127 = min(127, round(pct * 127 / 100))
-            self._backend.notify_volume_changed(vol_127)
+            if vol_127 != self._last_avrcp_volume:
+                self._last_avrcp_volume = vol_127
+                self._backend.notify_volume_changed(vol_127)
 
     def _on_volume_changed_by_source(self, addr: str, vol_127: int) -> None:
         """Called when a source device sets the absolute volume via AVRCP."""
-        vol_pct = min(100, round(vol_127 * 100 / 127))
-        # Update slider without triggering feedback to the source
-        self._volume_from_source = True
-        self._vol_var.set(float(vol_pct))
-        self._volume_from_source = False
-        self._vol_pct_label.configure(text=f"{vol_pct}%")
-        settings.volume = vol_pct / 100.0
+        self._last_avrcp_volume = vol_127
+        # CTkSlider only fires its command on mouse input, so setting the
+        # variable here does not echo the value back to the source.
+        self._set_volume_ui(min(100, round(vol_127 * 100 / 127)))
         if self._backend:
             self._backend.set_volume(settings.volume)
 
@@ -1469,67 +1386,75 @@ class App(ctk.CTk):
 
     def _start_backend(self) -> None:
         """Creates and starts a SinkBackend with the current settings."""
-        # Resolve transport from the currently selected dropdown item
-        selected = self._dongle_var.get()
-        for idx, label in self._available_dongles:
-            if label == selected:
-                settings.transport = f"usb:{idx}"
-                break
+        if self._running:
+            return
+        self._on_dongle_selected(self._dongle_var.get())
+        if not settings.usb_filter:
+            self._log("No WinUSB dongle selected – scan first.")
+            return
 
         self._running = True
+        self._backend_gen += 1
+        gen = self._backend_gen
+        self._last_avrcp_volume = -1
         self._start_btn.configure(text="■  Stop", fg_color="#EF4444", hover_color="#DC2626")
         self._scan_dongle_btn.configure(state="disabled")
 
         self._backend = SinkBackend(
             device_name=settings.device_name,
-            bt_address=settings.bt_address,
-            transport=settings.transport,
+            usb_filter=settings.usb_filter,
             latency_ms=settings.latency_ms,
             max_bitpool=settings.max_bitpool,
             volume=settings.volume,
-            audio_device_index=settings.audio_device_index,
+            audio_device_index=resolve_output_device_index(settings.audio_device_name),
             ffmpeg_exe=_get_ffmpeg(),
             debug=settings.debug_mode,
-            keystore_path=_keys_file(),
+            keystore_path=_keystore_file(),
             allowed_macs_path=_allowed_macs_file(),
             discoverable_timeout_s=settings.discoverable_timeout_s,
             class_of_device=settings.class_of_device,
-            sbc_block_length=settings.sbc_block_length,
-            sbc_subbands=settings.sbc_subbands,
-            sbc_allocation=settings.sbc_allocation,
-            # Route all callbacks through after() to stay on the mainloop thread
-            on_state_change=lambda s: self.after(0, self._on_state_change, s),
-            on_device_connected=lambda n, a: self.after(0, self._on_device_connected, n, a),
-            on_device_disconnected=lambda n: self.after(0, self._on_device_disconnected, n),
-            on_audio_level=lambda l: self.after(0, self._on_audio_level, l),
-            on_log=lambda m: self.after(0, self._log, m),
-            on_pairing_request=lambda n, a, r: self.after(0, self._on_pairing_request, n, a, r),
-            on_volume_changed=lambda a, v: self.after(0, self._on_volume_changed_by_source, a, v),
-            on_metadata=lambda a, m: self.after(0, self._on_metadata, a, m),
-            on_audio_start=lambda a, c: self.after(0, self._on_audio_start, a, c),
-            on_pairing_timeout=lambda: self.after(0, self._on_pairing_timeout),
-            on_device_name=lambda a, n: self.after(0, self._on_device_name, a, n),
+            on_state_change=self._ui(gen, self._on_state_change),
+            on_device_connected=self._ui(gen, self._on_device_connected),
+            on_device_disconnected=self._ui(gen, self._on_device_disconnected),
+            on_device_name=self._ui(gen, self._on_device_name),
+            on_audio_level=self._set_level,           # audio thread, polled by _poll_level
+            on_log=self._ui(None, self._log),         # keep log lines from a stopping backend
+            on_pairing_request=self._ui(gen, self._on_pairing_request),
+            on_volume_changed=self._ui(gen, self._on_volume_changed_by_source),
+            on_metadata=self._ui(gen, self._on_metadata),
+            on_audio_start=self._ui(gen, self._on_audio_start),
+            on_pairing_timeout=self._ui(gen, self._on_pairing_timeout),
         )
-        # Sync the pairing switch state into the new backend before it starts,
-        # so the "ready" event sends the correct set_discoverable command.
+        # Pairing switch state is applied by the backend once BTstack is ready
         if self._pairing_switch:
             self._backend.set_pairing_mode(bool(self._pairing_switch.get()))
         self._backend.start()
         self._title_label.configure(text=settings.device_name)
 
     def _stop_backend(self) -> None:
-        """Signals the backend to stop and resets UI to the idle state."""
+        """Stops the backend on a worker thread and resets the UI to idle."""
         self._running = False
+        self._backend_gen += 1        # drop callbacks still queued from this backend
         self._start_btn.configure(
             text="▶  Start",
             fg_color=["#3B82F6", "#1D4ED8"],
             hover_color=["#2563EB", "#1E40AF"],
         )
         self._scan_dongle_btn.configure(state="normal")
-        if self._backend:
-            self._log("BT stack stopped.")
-            threading.Thread(target=self._backend.stop, daemon=True).start()
-            self._backend = None
+        backend, self._backend = self._backend, None
+        if backend:
+            self._log("Stopping BT stack…")
+            t = threading.Thread(target=backend.stop, daemon=True, name="bt-stop")
+            t.start()
+            # The engine needs a few seconds to release the dongle; a Start
+            # before that would fail, so keep the button disabled meanwhile.
+            self._start_btn.configure(state="disabled")
+            self._await_stop(t)
+        # Close pairing dialogs (their answer is ignored by a stopping backend)
+        for dialog in list(self._pairing_dialogs.values()):
+            if dialog.winfo_exists():
+                dialog.destroy()
+        self._pairing_dialogs.clear()
         # Destroy all device cards and show placeholder
         for card in list(self._device_cards.values()):
             if card.winfo_exists():
@@ -1537,22 +1462,30 @@ class App(ctk.CTk):
         self._device_cards.clear()
         self._connected_devices.clear()
         self._placeholder_lbl.pack(pady=14)
-        self._level_bar.set(0)
+        self._level_value = 0.0
         self._on_state_change(SinkState.STOPPED)
 
+    def _await_stop(self, thread: threading.Thread) -> None:
+        """Re-enables Start once the previous engine has fully shut down."""
+        if thread.is_alive():
+            self.after(100, self._await_stop, thread)
+            return
+        if not self._running and self._available_dongles:
+            self._start_btn.configure(state="normal")
+        self._log("BT stack stopped.")
+
     # ------------------------------------------------------------------
-    # Backend callbacks (always called from mainloop thread via after())
+    # Backend callbacks (always called from mainloop thread via _ui())
     # ------------------------------------------------------------------
 
     def _on_state_change(self, state: SinkState) -> None:
-        self._current_state = state
         self._status_label.configure(
             text=f"● {STATE_LABELS[state]}", text_color=STATE_COLORS[state]
         )
 
-    def _on_device_connected(self, name: str, address: str) -> None:
+    def _on_device_connected(self, address: str) -> None:
         addr = address.upper()
-        self._connected_devices[addr] = name
+        self._connected_devices.setdefault(addr, addr)   # name arrives later
 
         # Hide placeholder
         self._placeholder_lbl.pack_forget()
@@ -1560,7 +1493,7 @@ class App(ctk.CTk):
         # Create card if not already present (avoid duplicates on reconnect)
         if addr not in self._device_cards:
             card = DeviceCard(
-                self._device_scroll, name, addr,
+                self._device_scroll, self._connected_devices[addr], addr,
                 on_route_change=self._on_route_selected,
             )
             card.pack(fill="x", padx=4, pady=(0, 4))
@@ -1573,32 +1506,42 @@ class App(ctk.CTk):
                 self._backend.set_pairing_mode(False)
             self._log("New pairings: blocked (auto)")
 
-    def _on_device_disconnected(self, name: str) -> None:
-        addr_to_remove = next(
-            (a for a, n in self._connected_devices.items() if n == name), None
-        )
-        if addr_to_remove:
-            self._connected_devices.pop(addr_to_remove, None)
-            card = self._device_cards.pop(addr_to_remove, None)
-            if card and card.winfo_exists():
-                card.destroy()
+    def _on_device_disconnected(self, address: str) -> None:
+        addr = address.upper()
+        name = self._connected_devices.pop(addr, addr)
+        self._log(f"Disconnected: {name}")
+        card = self._device_cards.pop(addr, None)
+        if card and card.winfo_exists():
+            card.destroy()
 
         if not self._connected_devices:
-            self._level_bar.set(0)
+            self._level_value = 0.0
             self._placeholder_lbl.pack(pady=14)
 
-    def _on_audio_level(self, level: float) -> None:
+    def _poll_level(self) -> None:
         """
-        Updates the VU meter with exponential smoothing so it doesn't flicker.
-        The × 4 pre-scale maps typical RMS values (≈0.25 peak) to full bar width.
+        Updates the VU meter from the level the audio thread last stored,
+        with exponential smoothing so it doesn't flicker.  The × 4 pre-scale
+        maps typical RMS values (≈0.25 peak) to full bar width.
         """
+        level = self._level_value if self._running else 0.0
         self._level_smooth = 0.7 * self._level_smooth + 0.3 * min(level * 4, 1.0)
         self._level_bar.set(self._level_smooth)
+        self.after(self.LEVEL_POLL_MS, self._poll_level)
 
-    def _on_pairing_request(self, name: str, address: str, resolve) -> None:
+    def _on_pairing_request(self, address: str, resolve) -> None:
         """Shows a confirmation dialog when an unknown device wants to pair."""
-        self._log(f"Pairing request from: {name} ({address})")
-        PairingDialog(self, name, address, resolve)
+        addr = address.upper()
+        existing = self._pairing_dialogs.get(addr)
+        if existing and existing.winfo_exists():
+            return   # the backend merges retries into the open question
+        self._log(f"Pairing request from: {addr}")
+
+        def answer(approved: bool, remember: bool) -> None:
+            self._pairing_dialogs.pop(addr, None)
+            resolve(approved, remember)
+
+        self._pairing_dialogs[addr] = PairingDialog(self, addr, answer)
 
     def _on_pairing_toggle(self) -> None:
         """Relays the pairing mode switch state to the backend."""
@@ -1633,6 +1576,9 @@ class App(ctk.CTk):
 
     def _open_winusb_dialog(self) -> None:
         """Opens the WinUSB install dialog; re-scans dongles when it closes."""
+        if self._running:
+            self._log("Stop the BT stack before changing the USB driver.")
+            return
         WinUSBDialog(self, on_close=self._scan_dongles)
 
     # ------------------------------------------------------------------
@@ -1653,17 +1599,24 @@ class App(ctk.CTk):
             self.iconify()
             return
 
-        self.withdraw()
-
-        # Create the tray icon only once; subsequent minimize calls reuse it
+        # Create the tray icon first: if that fails the window must stay reachable
         if self._tray_icon is None:
-            self._tray_icon = _pystray.Icon(
-                "BT-AudioSink",
-                self._make_tray_image(64),
-                "BT-AudioSink",
-                self._build_tray_menu(),
-            )
-            self._tray_icon.run_detached()  # Non-blocking; icon runs on its own thread
+            try:
+                icon = _pystray.Icon(
+                    "BT-AudioSink",
+                    self._make_tray_image(64),
+                    "BT-AudioSink",
+                    self._build_tray_menu(),
+                )
+                icon.run_detached()  # Non-blocking; icon runs on its own thread
+                self._tray_icon = icon
+            except Exception as exc:
+                self._in_tray = False
+                self._log(f"Tray icon unavailable ({exc}); minimizing to taskbar instead.")
+                self.iconify()
+                return
+
+        self.withdraw()
 
     def _build_tray_menu(self) -> "_pystray.Menu":
         """Constructs the right-click context menu for the tray icon."""
@@ -1672,7 +1625,7 @@ class App(ctk.CTk):
             _pystray.MenuItem(
                 "Start BT",
                 self._tray_start,
-                enabled=lambda _: not self._running,
+                enabled=lambda _: not self._running and bool(self._available_dongles),
             ),
             _pystray.MenuItem(
                 "Stop BT",
@@ -1713,21 +1666,34 @@ class App(ctk.CTk):
         self.after(0, self._do_quit)
 
     def _do_quit(self) -> None:
-        """Full application exit: stop backend, destroy tray icon, close window."""
-        self._cleanup()
-        self.destroy()
-
-    def _cleanup(self) -> None:
-        """Stops the backend and tray icon; safe to call from any context."""
-        if self._backend:
-            self._backend.stop()
-            self._backend = None
+        """
+        Full application exit: persist settings, stop the tray icon, stop the
+        backend on a worker thread (it blocks for a few seconds while the
+        engine releases the dongle) and destroy the window once that is done.
+        """
+        settings.save()   # volume changes on the main window are only saved here
         if self._tray_icon is not None:
             try:
                 self._tray_icon.stop()  # type: ignore[union-attr]
             except Exception:
                 pass
             self._tray_icon = None
+        backend, self._backend = self._backend, None
+        self._backend_gen += 1
+        self._running = False
+        if backend is None:
+            self.destroy()
+            return
+        self.withdraw()
+        t = threading.Thread(target=backend.stop, daemon=True, name="bt-stop")
+        t.start()
+        self._destroy_when_done(t)
+
+    def _destroy_when_done(self, thread: threading.Thread) -> None:
+        if thread.is_alive():
+            self.after(100, self._destroy_when_done, thread)
+        else:
+            self.destroy()
 
     # ------------------------------------------------------------------
     # Window close → tray  (X button and OS close signal)
