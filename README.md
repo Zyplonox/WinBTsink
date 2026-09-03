@@ -177,6 +177,7 @@ If you already have MSYS2, `bash btstack/do_build.sh` does the clone/patch/build
 | Offer aptX | off | Also advertise aptX / aptX HD endpoints (experimental) |
 | Audio output device | Default | WASAPI output device (per connected device via its card) |
 | Notifications | on | Windows toasts on connect, disconnect and pairing requests |
+| Language | Auto | English or German UI (Auto follows the Windows display language) |
 | Recording folder | `~\Music\BT-AudioSink` | Where ⏺ on a device card writes its WAV files (decoded audio, before volume) |
 | Media keys | off | Keyboard Play/Pause/Next/Prev/Stop go to the playing phone |
 | Debug log | off | Verbose protocol logging |

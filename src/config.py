@@ -218,6 +218,7 @@ class Settings:
     eq_treble: int = 0
     api_enabled: bool = False              # local HTTP control API (api_server.py)
     api_port: int = 8765
+    language: str = "auto"                 # "auto" (Windows UI language), "en" or "de"
 
     #: Keys persisted in config.json and the JSON types accepted for each.
     _PERSIST: dict[str, tuple[type, ...]] = {
@@ -243,6 +244,7 @@ class Settings:
         "eq_treble":              (int,),
         "api_enabled":            (bool,),
         "api_port":               (int,),
+        "language":               (str,),
     }
 
     @property

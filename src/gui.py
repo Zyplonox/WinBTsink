@@ -38,7 +38,14 @@ from config import (
     settings,
 )
 from device_store import DeviceStore
+from i18n import tr
+import i18n
 from media_keys import MediaKeyListener
+
+# Language must be known before the classes below build their option lists.
+settings.load()
+i18n.set_language(settings.language)
+i18n.install()
 from usb_devices import list_bluetooth_dongles
 from winusb_installer import download_and_run_zadig, list_native_bt_devices
 
@@ -88,12 +95,12 @@ STATE_COLORS = {
 }
 
 STATE_LABELS = {
-    SinkState.IDLE:      "Ready",
-    SinkState.STARTING:  "Starting…",
-    SinkState.READY:     "Waiting for device…",
-    SinkState.CONNECTED: "Connected",
-    SinkState.ERROR:     "Error",
-    SinkState.STOPPED:   "Stopped",
+    SinkState.IDLE:      tr("Ready"),
+    SinkState.STARTING:  tr("Starting…"),
+    SinkState.READY:     tr("Waiting for device…"),
+    SinkState.CONNECTED: tr("Connected"),
+    SinkState.ERROR:     tr("Error"),
+    SinkState.STOPPED:   tr("Stopped"),
 }
 
 
@@ -129,6 +136,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self._add_multi_device_row()
         self._add_audio_device_row()
         self._add_recording_row()
+        self._add_language_row()
         self._add_checkboxes()
         self._add_devices_rows(parent.device_store)
         self._add_clear_keys_row()
@@ -152,10 +160,10 @@ class SettingsDialog(ctk.CTkToplevel):
 
     # CoD display names and their corresponding integer CoD values
     _COD_OPTIONS: list[tuple[str, int]] = [
-        ("Headphones (0x240418)",           0x240418),
-        ("Speaker / Loudspeaker (0x240414)", 0x240414),
-        ("Car Audio (0x240420)",             0x240420),
-        ("Wearable Headset (0x240404)",      0x240404),
+        (tr("Headphones (0x240418)"),           0x240418),
+        (tr("Speaker / Loudspeaker (0x240414)"), 0x240414),
+        (tr("Car Audio (0x240420)"),             0x240420),
+        (tr("Wearable Headset (0x240404)"),      0x240404),
     ]
 
     def _add_cod_row(self) -> None:
@@ -275,10 +283,22 @@ class SettingsDialog(ctk.CTkToplevel):
         ).pack(fill="x", padx=44)
 
     _MULTI_OPTIONS = [
-        ("Mix – all devices play together", "mix"),
-        ("Duck – others get quieter while the latest plays", "duck"),
-        ("Solo – only the latest device is audible", "solo"),
+        (tr("Mix – all devices play together"), "mix"),
+        (tr("Duck – others get quieter while the latest plays"), "duck"),
+        (tr("Solo – only the latest device is audible"), "solo"),
     ]
+
+    _LANG_OPTIONS = [(tr("Auto (Windows language)"), "auto"), ("English", "en"), ("Deutsch", "de")]
+
+    def _add_language_row(self) -> None:
+        ctk.CTkLabel(self._s, text="Language", anchor="w").pack(fill="x", padx=20, pady=(12, 0))
+        current = next((lbl for lbl, val in self._LANG_OPTIONS if val == settings.language),
+                       self._LANG_OPTIONS[0][0])
+        self._lang_var = ctk.StringVar(value=current)
+        ctk.CTkOptionMenu(self._s, values=[lbl for lbl, _ in self._LANG_OPTIONS],
+                          variable=self._lang_var).pack(fill="x", padx=20)
+        ctk.CTkLabel(self._s, text="Takes effect after restarting the app.", anchor="w",
+                     font=ctk.CTkFont(size=11), text_color="#9CA3AF").pack(fill="x", padx=20)
 
     def _add_multi_device_row(self) -> None:
         """How simultaneous streams from several devices are combined."""
@@ -407,7 +427,7 @@ class SettingsDialog(ctk.CTkToplevel):
         for addr, info in sorted(self._store.devices.items(), key=lambda kv: kv[1].get("name") or kv[0]):
             row = ctk.CTkFrame(self._devices_frame, fg_color="transparent")
             row.pack(fill="x", pady=1)
-            name = info.get("name") or "Unknown device"
+            name = info.get("name") or tr("Unknown device")
             ctk.CTkLabel(row, text=name, anchor="w", font=ctk.CTkFont(size=12)).pack(side="left")
             ctk.CTkLabel(row, text=f"  {addr}", anchor="w", font=ctk.CTkFont(size=10),
                          text_color="#6B7280").pack(side="left")
@@ -486,13 +506,13 @@ class SettingsDialog(ctk.CTkToplevel):
 
     @staticmethod
     def _latency_text(ms: int) -> str:
-        note = "  ⚠ may cause audio dropouts" if ms < 50 else \
-               "  (BT radio latency ~60 ms is not configurable)"
+        note = tr("  ⚠ may cause audio dropouts") if ms < 50 else \
+               tr("  (BT radio latency ~60 ms is not configurable)")
         return f"{ms} ms{note}"
 
     @staticmethod
     def _bitpool_text(bp: int) -> str:
-        return f"{bp}  (higher = better audio quality, more bandwidth)"
+        return tr("{bp}  (higher = better audio quality, more bandwidth)").format(bp=bp)
 
     def _on_latency_change(self, value: float) -> None:
         self._latency_label.configure(text=self._latency_text(int(value)))
@@ -537,6 +557,8 @@ class SettingsDialog(ctk.CTkToplevel):
         settings.debug_mode = self._debug_var.get()
         settings.media_keys = self._media_keys_var.get()
         settings.notifications = self._notify_var.get()
+        settings.language = next(
+            (val for lbl, val in self._LANG_OPTIONS if lbl == self._lang_var.get()), "auto")
         settings.api_enabled = self._api_var.get()
         try:
             settings.api_port = max(1024, min(65535, int(self._api_port_var.get())))
@@ -713,7 +735,7 @@ class WinUSBDialog(ctk.CTkToplevel):
             ).pack(anchor="w", padx=8, pady=2)
 
         self._status_label.configure(
-            text=f"{len(devices)} device(s) without WinUSB – select in Zadig and install driver.",
+            text=tr("{n} device(s) without WinUSB – select in Zadig and install driver.").format(n=len(devices)),
             text_color="#9CA3AF",
         )
 
@@ -820,7 +842,7 @@ class PairingDialog(ctk.CTkToplevel):
         if self._remaining <= 0:
             self._deny()
             return
-        self._countdown_var.set(f"Auto-deny in {self._remaining}s")
+        self._countdown_var.set(tr("Auto-deny in {s}s").format(s=self._remaining))
         self._remaining -= 1
         self.after(1000, self._tick)
 
@@ -856,8 +878,8 @@ class DeviceCard(ctk.CTkFrame):
     """
 
     _STATUS_TEXT = {
-        "playing": "▶ playing", "paused": "⏸ paused", "stopped": "■ stopped",
-        "seeking": "⏩ seeking", "error": "player error", "": "",
+        "playing": tr("▶ playing"), "paused": tr("⏸ paused"), "stopped": tr("■ stopped"),
+        "seeking": tr("⏩ seeking"), "error": tr("player error"), "": "",
     }
 
     def __init__(
@@ -890,7 +912,7 @@ class DeviceCard(ctk.CTkFrame):
         row1.pack(fill="x", padx=8, pady=(6, 0))
 
         # Show "Unknown Device" when the name hasn't been resolved yet
-        display_name = name if name != addr else "Unknown Device"
+        display_name = name if name != addr else tr("Unknown Device")
         self._name_label = ctk.CTkLabel(
             row1, text=display_name,
             font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
@@ -1232,9 +1254,9 @@ class App(ctk.CTk):
         selector_row = ctk.CTkFrame(self, fg_color="transparent")
         selector_row.pack(fill="x", padx=16, pady=(0, 2))
 
-        self._dongle_var = ctk.StringVar(value="Scanning…")
+        self._dongle_var = ctk.StringVar(value=tr("Scanning…"))
         self._dongle_menu = ctk.CTkOptionMenu(
-            selector_row, variable=self._dongle_var, values=["Scanning…"],
+            selector_row, variable=self._dongle_var, values=[tr("Scanning…")],
             state="disabled", command=self._on_dongle_selected,
         )
         self._dongle_menu.pack(side="left", fill="x", expand=True)
@@ -1274,10 +1296,10 @@ class App(ctk.CTk):
         row.pack(fill="x", padx=16, pady=(0, 6))
         ctk.CTkLabel(row, text="Connect to", font=ctk.CTkFont(size=12),
                      text_color="#9CA3AF").pack(side="left", padx=(4, 8))
-        self._connect_var = ctk.StringVar(value="no remembered devices")
+        self._connect_var = ctk.StringVar(value=tr("no remembered devices"))
         self._connect_choices: dict[str, str] = {}
         self._connect_menu = ctk.CTkOptionMenu(
-            row, variable=self._connect_var, values=["no remembered devices"],
+            row, variable=self._connect_var, values=[tr("no remembered devices")],
             state="disabled", height=26, font=ctk.CTkFont(size=11),
         )
         self._connect_menu.pack(side="left", fill="x", expand=True)
@@ -1488,8 +1510,8 @@ class App(ctk.CTk):
         self._available_dongles = dongles
 
         if not dongles:
-            self._dongle_var.set("No WinUSB dongle found")
-            self._dongle_menu.configure(values=["No WinUSB dongle found"], state="disabled")
+            self._dongle_var.set(tr("No WinUSB dongle found"))
+            self._dongle_menu.configure(values=[tr("No WinUSB dongle found")], state="disabled")
             self._dongle_status.configure(
                 text="⚠ No WinUSB dongle found – install WinUSB driver first",
                 text_color="#EF4444",
@@ -1507,7 +1529,7 @@ class App(ctk.CTk):
         self._dongle_menu.configure(values=labels, state="normal")
         self._on_dongle_selected(choice)
         self._dongle_status.configure(
-            text=f"{len(dongles)} dongle(s) found – ready", text_color="#10B981"
+            text=tr("{n} dongle(s) found – ready").format(n=len(dongles)), text_color="#10B981"
         )
         self._start_btn.configure(state="normal")
         self._log(f"Dongle found: {choice}")
@@ -1580,7 +1602,7 @@ class App(ctk.CTk):
                    if addr not in self._connected_devices]
         self._connect_choices = {f"{name}  ({addr})" if name != addr else addr: addr
                                  for addr, name in choices}
-        labels = list(self._connect_choices) or ["no remembered devices"]
+        labels = list(self._connect_choices) or [tr("no remembered devices")]
         self._connect_var.set(labels[0])
         state = "normal" if (self._running and self._connect_choices) else "disabled"
         self._connect_menu.configure(values=labels, state=state)
@@ -1593,7 +1615,7 @@ class App(ctk.CTk):
 
     def _on_connect_failed(self, addr: str) -> None:
         name = self.device_store.name(addr) or addr
-        self._notify("Connection failed", f"{name} is not reachable.")
+        self._notify(tr("Connection failed"), tr("{name} is not reachable.").format(name=name))
 
     def _on_volume_changed_by_source(self, addr: str, vol_127: int) -> None:
         """A source set its absolute volume via AVRCP: follow it on that device's card."""
@@ -1704,12 +1726,13 @@ class App(ctk.CTk):
         if self._tray_icon is None:
             return
         if not self._running:
-            text = "BT-AudioSink – stopped"
+            text = tr("BT-AudioSink – stopped")
         elif self._connected_devices:
             names = ", ".join(self._connected_devices.values())
-            text = f"BT-AudioSink – {len(self._connected_devices)} device(s): {names}"
+            text = tr("BT-AudioSink – {n} device(s): {names}").format(
+                n=len(self._connected_devices), names=names)
         else:
-            text = "BT-AudioSink – waiting for device"
+            text = tr("BT-AudioSink – waiting for device")
         try:
             self._tray_icon.title = text[:127]  # type: ignore[union-attr]  (tooltip limit)
         except Exception as exc:
@@ -1828,7 +1851,7 @@ class App(ctk.CTk):
             text=f"● {STATE_LABELS[state]}", text_color=STATE_COLORS[state]
         )
         if state == SinkState.ERROR:
-            self._notify("Error", "The Bluetooth stack stopped with an error. See the log.")
+            self._notify(tr("Error"), tr("The Bluetooth stack stopped with an error. See the log."))
         self._update_tray_tooltip()
 
     def _on_device_connected(self, address: str) -> None:
@@ -1861,7 +1884,7 @@ class App(ctk.CTk):
             if self._backend:
                 self._backend.set_pairing_mode(False)
             self._log("New pairings: blocked (auto)")
-        self._notify("Device connected", self._connected_devices[addr])
+        self._notify(tr("Device connected"), self._connected_devices[addr])
         self._update_tray_tooltip()
         self._refresh_connect_row()
 
@@ -1876,7 +1899,7 @@ class App(ctk.CTk):
         if not self._connected_devices:
             self._level_value = 0.0
             self._placeholder_lbl.pack(pady=14)
-        self._notify("Device disconnected", name)
+        self._notify(tr("Device disconnected"), name)
         self._update_tray_tooltip()
         self._refresh_connect_row()
 
@@ -1898,7 +1921,7 @@ class App(ctk.CTk):
         if existing and existing.winfo_exists():
             return   # the backend merges retries into the open question
         self._log(f"Pairing request from: {addr}")
-        self._notify("Pairing request", f"{addr} wants to connect – answer within 30 s.")
+        self._notify(tr("Pairing request"), tr("{addr} wants to connect – answer within 30 s.").format(addr=addr))
 
         def answer(approved: bool, remember: bool) -> None:
             self._pairing_dialogs.pop(addr, None)
@@ -1990,19 +2013,19 @@ class App(ctk.CTk):
     def _build_tray_menu(self) -> "_pystray.Menu":
         """Constructs the right-click context menu for the tray icon."""
         return _pystray.Menu(
-            _pystray.MenuItem("Show Window", self._tray_show, default=True),
+            _pystray.MenuItem(tr("Show Window"), self._tray_show, default=True),
             _pystray.MenuItem(
-                "Start BT",
+                tr("Start BT"),
                 self._tray_start,
                 enabled=lambda _: not self._running and bool(self._available_dongles),
             ),
             _pystray.MenuItem(
-                "Stop BT",
+                tr("Stop BT"),
                 self._tray_stop,
                 enabled=lambda _: self._running,
             ),
             _pystray.Menu.SEPARATOR,
-            _pystray.MenuItem("Quit", self._tray_quit),
+            _pystray.MenuItem(tr("Quit"), self._tray_quit),
         )
 
     def _on_unmap(self, event) -> None:
