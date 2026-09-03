@@ -415,6 +415,8 @@ class SinkBackend:
         sbc_subbands: int = 0,              # 4/8, 0 = let the source choose
         sbc_allocation: str = "auto",       # "loudness", "snr" or "auto"
         offer_aptx: bool = False,           # also advertise aptX and aptX HD endpoints
+        multi_device_mode: str = "mix",     # "mix" | "duck" | "solo" (see _policy_gain)
+        duck_level: float = 0.25,           # gain for background devices in "duck" mode
         # Callbacks
         on_state_change: Optional[Callable[[SinkState], None]] = None,
         on_device_connected: Optional[Callable[[str], None]] = None,          # addr
@@ -439,6 +441,9 @@ class SinkBackend:
         self._sbc_subbands = sbc_subbands if sbc_subbands in (4, 8) else 0
         self._sbc_allocation = {"loudness": 1, "snr": 2}.get(sbc_allocation, 0)
         self._vendor_codecs = 3 if offer_aptx else 0   # bit 1 aptX, bit 2 aptX HD
+        self._multi_mode = multi_device_mode if multi_device_mode in ("mix", "duck", "solo") else "mix"
+        self._duck_level = max(0.0, min(1.0, duck_level))
+        self._stream_order: list[str] = []             # streaming devices, most recent last
 
         # Audio parameters
         self._latency_ms = latency_ms
@@ -530,7 +535,35 @@ class SinkBackend:
         """Caller holds self._lock."""
         if addr in self._device_muted:
             return 0.0
-        return self._volume * self._device_volumes.get(addr, 1.0)
+        return self._volume * self._device_volumes.get(addr, 1.0) * self._policy_gain(addr)
+
+    def _policy_gain(self, addr: str) -> float:
+        """
+        Multi-device policy (caller holds self._lock). The device whose stream
+        started most recently is the foreground device.
+          mix   every device plays at full gain (Windows mixes them)
+          duck  background devices are reduced to duck_level while the
+                foreground device streams
+          solo  only the foreground device is audible
+        """
+        if self._multi_mode == "mix" or addr not in self._stream_order:
+            return 1.0   # not streaming: nothing to attenuate, re-evaluated on start
+        if addr == self._stream_order[-1]:
+            return 1.0
+        return self._duck_level if self._multi_mode == "duck" else 0.0
+
+    def _note_stream_started(self, addr: str) -> None:
+        with self._lock:
+            if addr in self._stream_order:
+                self._stream_order.remove(addr)
+            self._stream_order.append(addr)
+        self._apply_gains()
+
+    def _note_stream_stopped(self, addr: str) -> None:
+        with self._lock:
+            if addr in self._stream_order:
+                self._stream_order.remove(addr)
+        self._apply_gains()
 
     def _apply_gains(self, only_addr: Optional[str] = None) -> None:
         with self._lock:
@@ -850,6 +883,7 @@ class SinkBackend:
             else:
                 detail = ""
             self._log(f"Stream START [{addr}] → {sample_rate} Hz, {channels} ch [{codec.upper()}]{detail}")
+            self._note_stream_started(addr)
             self._start_audio_pipeline(addr, sample_rate, channels, codec)
             if self._cb_audio_start:
                 self._cb_audio_start(addr, codec, info)
@@ -859,6 +893,7 @@ class SinkBackend:
             with self._lock:
                 self._streaming.discard(addr)
             self._stop_pipeline(addr)
+            self._note_stream_stopped(addr)
 
         elif evt == "volume_changed":
             if self._cb_volume_changed:
@@ -886,6 +921,7 @@ class SinkBackend:
                 self._session_allowed.pop(addr, None)   # "allow once" ends here
                 none_left = not self._connected_addrs
             self._stop_pipeline(addr)
+            self._note_stream_stopped(addr)
             if none_left and self._state == SinkState.CONNECTED:
                 self._set_state(SinkState.READY)
             if self._cb_disconnected:

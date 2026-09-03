@@ -265,6 +265,8 @@ class Settings:
     media_keys: bool = False               # forward keyboard media keys via AVRCP
     notifications: bool = True             # Windows toasts on connect/disconnect/pairing
     offer_aptx: bool = False               # advertise aptX / aptX HD (experimental)
+    multi_device_mode: str = "mix"         # "mix" | "duck" | "solo"
+    duck_level: int = 25                   # background volume in percent for "duck"
 
     #: Keys persisted in config.json and the JSON types accepted for each.
     _PERSIST: dict[str, tuple[type, ...]] = {
@@ -282,6 +284,8 @@ class Settings:
         "media_keys":             (bool,),
         "notifications":          (bool,),
         "offer_aptx":             (bool,),
+        "multi_device_mode":      (str,),
+        "duck_level":             (int,),
     }
 
     def load(self) -> None:
@@ -354,6 +358,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self._add_bitpool_row()
         self._add_sbc_rows()
         self._add_codec_row()
+        self._add_multi_device_row()
         self._add_audio_device_row()
         self._add_checkboxes()
         self._add_devices_rows(parent.device_store)
@@ -499,6 +504,38 @@ class SettingsDialog(ctk.CTkToplevel):
                  "device refuses to connect.",
             anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF", wraplength=360,
         ).pack(fill="x", padx=44)
+
+    _MULTI_OPTIONS = [
+        ("Mix – all devices play together", "mix"),
+        ("Duck – others get quieter while the latest plays", "duck"),
+        ("Solo – only the latest device is audible", "solo"),
+    ]
+
+    def _add_multi_device_row(self) -> None:
+        """How simultaneous streams from several devices are combined."""
+        ctk.CTkLabel(self._s, text="Several devices playing", anchor="w").pack(
+            fill="x", padx=20, pady=(12, 0))
+        current = next((lbl for lbl, val in self._MULTI_OPTIONS
+                        if val == settings.multi_device_mode), self._MULTI_OPTIONS[0][0])
+        self._multi_var = ctk.StringVar(value=current)
+        ctk.CTkOptionMenu(self._s, values=[lbl for lbl, _ in self._MULTI_OPTIONS],
+                          variable=self._multi_var).pack(fill="x", padx=20)
+        row = ctk.CTkFrame(self._s, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=(4, 0))
+        ctk.CTkLabel(row, text="Duck level", font=ctk.CTkFont(size=11),
+                     text_color="#9CA3AF").pack(side="left")
+        self._duck_var = ctk.IntVar(value=settings.duck_level)
+        self._duck_label = ctk.CTkLabel(row, text=f"{settings.duck_level}%", width=40,
+                                        font=ctk.CTkFont(size=11), text_color="#9CA3AF")
+        self._duck_label.pack(side="right")
+        ctk.CTkSlider(row, from_=0, to=100, number_of_steps=20, variable=self._duck_var,
+                      command=lambda v: self._duck_label.configure(text=f"{int(v)}%"),
+                      ).pack(side="left", fill="x", expand=True, padx=8)
+        ctk.CTkLabel(
+            self._s,
+            text="The device whose stream started last is the foreground device.",
+            anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF", wraplength=360,
+        ).pack(fill="x", padx=20)
 
     def _add_audio_device_row(self) -> None:
         """Dropdown listing all WASAPI output devices."""
@@ -676,6 +713,9 @@ class SettingsDialog(ctk.CTkToplevel):
         settings.sbc_allocation = next(
             (val for lbl, val in self._SBC_ALLOC_OPTIONS if lbl == self._sbc_alloc_var.get()), "auto")
         settings.offer_aptx = self._aptx_var.get()
+        settings.multi_device_mode = next(
+            (val for lbl, val in self._MULTI_OPTIONS if lbl == self._multi_var.get()), "mix")
+        settings.duck_level = int(self._duck_var.get())
         audio_name = self._audio_var.get()
         settings.audio_device_name = None if audio_name == "Default" else audio_name
         settings.debug_mode = self._debug_var.get()
@@ -1715,6 +1755,8 @@ class App(ctk.CTk):
             sbc_subbands=settings.sbc_subbands,
             sbc_allocation=settings.sbc_allocation,
             offer_aptx=settings.offer_aptx,
+            multi_device_mode=settings.multi_device_mode,
+            duck_level=settings.duck_level / 100.0,
             on_state_change=self._ui(gen, self._on_state_change),
             on_device_connected=self._ui(gen, self._on_device_connected),
             on_device_disconnected=self._ui(gen, self._on_device_disconnected),

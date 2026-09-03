@@ -170,7 +170,11 @@ If you already have MSYS2, `bash btstack/do_build.sh` does the clone/patch/build
 | Buffer latency | `50 ms` | Audio buffer size; increase if audio stutters |
 | Max SBC bitpool | `53` | Quality ceiling; higher = better quality, more bandwidth |
 | SBC block length / subbands / allocation | Auto | Restrict what the sink offers; the source must encode with exactly these values (4 blocks / 4 subbands = lowest latency). Auto lets the source choose. The negotiated values are shown on the device card. |
+| Several devices playing | Mix | Mix all streams, duck the others to a set level while the latest plays, or solo the latest device |
+| Offer aptX | off | Also advertise aptX / aptX HD endpoints (experimental) |
 | Audio output device | Default | WASAPI output device (per connected device via its card) |
+| Notifications | on | Windows toasts on connect, disconnect and pairing requests |
+| Media keys | off | Keyboard Play/Pause/Next/Prev/Stop go to the playing phone |
 | Debug log | off | Verbose protocol logging |
 | Autostart | off | Launch with Windows, minimized to tray |
 
