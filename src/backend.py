@@ -118,6 +118,7 @@ class AudioPipeline:
         self._sample_rate = 44100
         self._channels = 2
         self._volume: float = 1.0  # Linear multiplier; 1.0 = unity, 2.0 = double
+        self.underruns = 0         # callbacks that found the PCM queue empty
 
     @property
     def sample_rate(self) -> int:
@@ -130,6 +131,11 @@ class AudioPipeline:
     def set_volume(self, volume: float) -> None:
         """Sets the output volume as a linear multiplier in [0.0, 2.0]."""
         self._volume = max(0.0, min(2.0, volume))
+
+    @property
+    def buffer_ms(self) -> float:
+        """Decoded audio currently queued ahead of the output device."""
+        return self._pcm_q.qsize() * self.BLOCK_SIZE * 1000.0 / self._sample_rate
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -350,6 +356,7 @@ class AudioPipeline:
         except queue.Empty:
             outdata.fill(0)
             block = None  # Underrun – report zero level
+            self.underruns += 1
 
         self._report_level(block)
 
@@ -431,6 +438,7 @@ class SinkBackend:
         on_pairing_timeout: Optional[Callable[[], None]] = None,
         on_playback_status: Optional[Callable[[str, str], None]] = None,      # addr, playing|paused|stopped|...
         on_connect_failed: Optional[Callable[[str], None]] = None,            # addr (outgoing connect)
+        on_stats: Optional[Callable[[str, dict], None]] = None,               # addr, stream statistics
     ):
         # BT / USB parameters
         self._device_name = device_name
@@ -468,6 +476,7 @@ class SinkBackend:
         self._cb_pairing_timeout = on_pairing_timeout
         self._cb_playback_status = on_playback_status
         self._cb_connect_failed = on_connect_failed
+        self._cb_stats = on_stats
 
         # Feature flags / persistence
         self._debug = debug
@@ -951,6 +960,20 @@ class SinkBackend:
         elif evt == "playback":
             if self._cb_playback_status:
                 self._cb_playback_status(addr, str(event.get("status", "")))
+
+        elif evt == "stats":
+            if self._cb_stats:
+                with self._lock:
+                    pipeline = self._pipelines.get(addr)
+                stats = {
+                    "kbps": int(event.get("kbps", 0)),
+                    "packets": int(event.get("packets", 0)),
+                    "lost": int(event.get("lost", 0)),
+                    "lost_total": int(event.get("lost_total", 0)),
+                    "buffer_ms": round(pipeline.buffer_ms) if pipeline else None,
+                    "underruns": pipeline.underruns if pipeline else None,
+                }
+                self._cb_stats(addr, stats)
 
         elif evt == "metadata":
             if self._cb_metadata:

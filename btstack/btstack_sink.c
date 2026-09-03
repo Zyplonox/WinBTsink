@@ -34,6 +34,8 @@
  *                  {"event":"metadata","addr":"...","title":"...","artist":"...","album":"..."}
  *                  {"event":"playback","addr":"...","status":"playing|paused|stopped|seeking|error"}
  *                  {"event":"connect_failed","addr":"...","status":12}   (outgoing connect)
+ *                  {"event":"stats","addr":"...","packets":98,"bytes":52000,"lost":0,"lost_total":3,"kbps":208}
+ *                    every STATS_INTERVAL_MS per streaming device (packets/bytes/lost per interval)
  *                  {"event":"log","msg":"..."}
  *                  {"event":"error","msg":"..."}
  *                  All string values are JSON-escaped.
@@ -106,6 +108,7 @@ const hci_cmd_t hci_le_rand = { 0x2018u, "" };
 #define META_BUF_SIZE           131     /* AVRCP max attribute size + NUL */
 #define JSON_ESC_FACTOR         6       /* worst case: one byte -> \u00XX */
 #define PRE_APPROVE_TTL_MS      15000   /* how long an AVDTP approval pre-approves AVRCP */
+#define STATS_INTERVAL_MS       2000    /* stream statistics reporting period */
 
 /* Vendor codecs (AVDTP_CODEC_NON_A2DP). Media codec information layout:
  *   [vendor id, 4 bytes LE][codec id, 2 bytes LE][codec specific]
@@ -149,6 +152,13 @@ typedef struct {
     char     meta_artist[META_BUF_SIZE];
     char     meta_album[META_BUF_SIZE];
     int      name_pending;      /* remote name request still to be issued/answered */
+    /* Stream statistics (RTP sequence numbers; reset per interval / stream) */
+    uint32_t st_packets;
+    uint32_t st_bytes;
+    uint32_t st_lost;
+    uint32_t st_lost_total;
+    uint16_t st_last_seq;
+    int      st_seq_valid;
 } a2dp_conn_t;
 
 static a2dp_conn_t g_conns[MAX_CONNECTIONS];
@@ -952,6 +962,7 @@ static void on_a2dp_sink_event(uint8_t packet_type, uint16_t channel,
         uint16_t cid = a2dp_subevent_stream_started_get_a2dp_cid(packet);
         a2dp_conn_t *conn = find_conn_by_cid(cid);
         if (conn) {
+            conn->st_seq_valid = 0;   /* new stream: sequence numbers restart */
             if (conn->codec_type == AVDTP_CODEC_MPEG_2_4_AAC || conn->codec_type == AVDTP_CODEC_NON_A2DP) {
                 const char *codec = conn->codec_type == AVDTP_CODEC_MPEG_2_4_AAC ? "aac" :
                                     conn->vendor_codec == VENDOR_APTX_HD ? "aptx_hd" : "aptx";
@@ -1033,10 +1044,26 @@ static void on_a2dp_media_packet(uint8_t seid, uint8_t *packet, uint16_t size) {
     if (!conn) return;
 
     if (conn->codec_type == AVDTP_CODEC_NON_A2DP && conn->vendor_codec == VENDOR_APTX) {
+        conn->st_packets++;
+        conn->st_bytes += size;
         if (size) write_audio_to_stdout(conn->addr, packet, size);
         return;
     }
     if (size < 12) return;
+
+    /* RTP sequence number → detect packets lost over the air */
+    uint16_t seq = (uint16_t)((packet[2] << 8) | packet[3]);
+    if (conn->st_seq_valid) {
+        uint16_t gap = (uint16_t)(seq - (uint16_t)(conn->st_last_seq + 1));
+        if (gap != 0 && gap < 0x8000) {
+            conn->st_lost       += gap;
+            conn->st_lost_total += gap;
+        }
+    }
+    conn->st_last_seq  = seq;
+    conn->st_seq_valid = 1;
+    conn->st_packets++;
+    conn->st_bytes += size;
 
     uint16_t offset = 12 + 4u * (packet[0] & 0x0F);       /* CSRC list */
     if (packet[0] & 0x10) {                                 /* header extension */
@@ -1063,6 +1090,32 @@ static void on_a2dp_media_packet(uint8_t seid, uint8_t *packet, uint16_t size) {
 
     if (size <= offset) return;
     write_audio_to_stdout(conn->addr, packet + offset, (uint16_t)(size - offset));
+}
+
+/* -------------------------------------------------------------------------
+ * Stream statistics timer — one "stats" event per streaming device
+ * ---------------------------------------------------------------------- */
+
+static btstack_timer_source_t g_stats_timer;
+
+static void on_stats_timer(btstack_timer_source_t *ts) {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        a2dp_conn_t *c = &g_conns[i];
+        if (!c->active || c->st_packets == 0) continue;
+        unsigned kbps = (unsigned)((uint64_t)c->st_bytes * 8u * 1000u / STATS_INTERVAL_MS / 1000u);
+        char evt[192];
+        snprintf(evt, sizeof(evt),
+                 "{\"event\":\"stats\",\"addr\":\"%s\",\"packets\":%u,\"bytes\":%u,"
+                 "\"lost\":%u,\"lost_total\":%u,\"kbps\":%u}",
+                 c->addr_str, (unsigned)c->st_packets, (unsigned)c->st_bytes,
+                 (unsigned)c->st_lost, (unsigned)c->st_lost_total, kbps);
+        emit_event(evt);
+        c->st_packets = 0;
+        c->st_bytes   = 0;
+        c->st_lost    = 0;
+    }
+    btstack_run_loop_set_timer(ts, STATS_INTERVAL_MS);
+    btstack_run_loop_add_timer(ts);
 }
 
 /* -------------------------------------------------------------------------
@@ -1663,6 +1716,10 @@ int main(int argc, char *argv[]) {
     btstack_run_loop_set_data_source_handler(&g_stdin_ds, &stdin_ds_callback);
     btstack_run_loop_enable_data_source_callbacks(&g_stdin_ds, DATA_SOURCE_CALLBACK_READ);
     btstack_run_loop_add_data_source(&g_stdin_ds);
+
+    btstack_run_loop_set_timer_handler(&g_stats_timer, &on_stats_timer);
+    btstack_run_loop_set_timer(&g_stats_timer, STATS_INTERVAL_MS);
+    btstack_run_loop_add_timer(&g_stats_timer);
 
     hci_power_control(HCI_POWER_ON);
     btstack_run_loop_execute();   /* does not return; exit() happens in on_hci_event */

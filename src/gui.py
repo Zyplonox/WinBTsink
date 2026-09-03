@@ -1140,6 +1140,13 @@ class DeviceCard(ctk.CTkFrame):
         )
         self._meta_label.pack(fill="x", padx=8, pady=(2, 0))
 
+        # ── Row 3b: stream statistics (bitrate, packet loss, buffer) ───
+        self._stats_label = ctk.CTkLabel(
+            self, text="",
+            font=ctk.CTkFont(family="Consolas", size=10), text_color="#6B7280", anchor="w",
+        )
+        self._stats_label.pack(fill="x", padx=8)
+
         # ── Row 4: MAC address (always shown) ──────────────────────────
         ctk.CTkLabel(
             self, text=addr,
@@ -1197,6 +1204,19 @@ class DeviceCard(ctk.CTkFrame):
         elif info.get("sample_rate"):
             text = f"{text.replace('_', ' ')} {info['sample_rate'] / 1000:g}k"
         self._codec_badge.configure(text=text, width=max(36, 7 * len(text)))
+
+    def set_stats(self, stats: dict) -> None:
+        """Shows bitrate, packets lost over the air, decoded buffer and output underruns."""
+        parts = [f"{stats.get('kbps', 0)} kbps"]
+        lost, lost_total = stats.get("lost", 0), stats.get("lost_total", 0)
+        parts.append(f"lost {lost_total}" + (f" (+{lost})" if lost else ""))
+        if stats.get("buffer_ms") is not None:
+            parts.append(f"buffer {stats['buffer_ms']} ms")
+        if stats.get("underruns"):
+            parts.append(f"underruns {stats['underruns']}")
+        self._stats_label.configure(
+            text="  ·  ".join(parts),
+            text_color="#F59E0B" if (lost or stats.get("underruns")) else "#6B7280")
 
     def set_metadata(self, title: str, artist: str, album: str) -> None:
         """Updates the now-playing line; hides it when all fields are empty."""
@@ -1692,6 +1712,11 @@ class App(ctk.CTk):
         if card and card.winfo_exists():
             card.set_playback(status)
 
+    def _on_stats(self, addr: str, stats: dict) -> None:
+        card = self._device_cards.get(addr.upper())
+        if card and card.winfo_exists():
+            card.set_stats(stats)
+
     def _on_player(self, addr: str, action: str) -> None:
         """Card button pressed: forward the AVRCP command to the source."""
         if self._backend:
@@ -1838,6 +1863,7 @@ class App(ctk.CTk):
             on_pairing_timeout=self._ui(gen, self._on_pairing_timeout),
             on_playback_status=self._ui(gen, self._on_playback_status),
             on_connect_failed=self._ui(gen, self._on_connect_failed),
+            on_stats=self._ui(gen, self._on_stats),
         )
         # Pairing switch state is applied by the backend once BTstack is ready
         if self._pairing_switch:
