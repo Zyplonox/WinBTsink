@@ -76,6 +76,29 @@ class SinkState(Enum):
 
 
 # ---------------------------------------------------------------------------
+# Equalizer → FFmpeg filter graph
+# ---------------------------------------------------------------------------
+
+def build_eq_filter(bass_db: float = 0, mid_db: float = 0, treble_db: float = 0) -> str:
+    """
+    Three-band tone control as an FFmpeg -af graph: shelving bass (100 Hz),
+    peaking mid (1 kHz, Q 1) and shelving treble (8 kHz). Returns "" when
+    every band is flat so the pipeline runs without a filter.
+    """
+    def clamp(v: float) -> float:
+        return max(-12.0, min(12.0, float(v)))
+
+    parts = []
+    if clamp(bass_db):
+        parts.append(f"bass=g={clamp(bass_db):g}:f=100")
+    if clamp(mid_db):
+        parts.append(f"equalizer=f=1000:t=q:w=1:g={clamp(mid_db):g}")
+    if clamp(treble_db):
+        parts.append(f"treble=g={clamp(treble_db):g}:f=8000")
+    return ",".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # WAV recorder – taps the decoded PCM of one device
 # ---------------------------------------------------------------------------
 
@@ -158,12 +181,14 @@ class AudioPipeline:
         latency_ms: int = 150,
         device_index: Optional[int] = None,
         on_level: Optional[Callable[[float], None]] = None,
+        audio_filter: str = "",     # FFmpeg -af graph, e.g. from build_eq_filter()
     ):
         self._codec = codec
         self._ffmpeg_exe = ffmpeg_exe
         self._latency_ms = latency_ms
         self._device_index = device_index
         self._on_level = on_level
+        self._audio_filter = audio_filter
 
         # Inter-thread PCM queue.  Max size limits buffering to ~6 s at 44.1 kHz.
         self._pcm_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=500)
@@ -294,12 +319,14 @@ class AudioPipeline:
         """Launches FFmpeg with codec-appropriate input and raw s16le PCM output via pipes."""
         input_args = [a.format(rate=sample_rate)
                       for a in self._INPUT_ARGS.get(self._codec, self._INPUT_ARGS["sbc"])]
+        filter_args = ["-af", self._audio_filter] if self._audio_filter else []
         return subprocess.Popen(
             [
                 self._ffmpeg_exe,
                 "-loglevel", "quiet",
                 *input_args,
                 "-i", "pipe:0",
+                *filter_args,
                 "-f", "s16le",      # Output: signed 16-bit little-endian PCM
                 "-ar", str(sample_rate),
                 "-ac", str(channels),
@@ -494,6 +521,7 @@ class SinkBackend:
         offer_aptx: bool = False,           # also advertise aptX and aptX HD endpoints
         multi_device_mode: str = "mix",     # "mix" | "duck" | "solo" (see _policy_gain)
         duck_level: float = 0.25,           # gain for background devices in "duck" mode
+        audio_filter: str = "",             # FFmpeg -af graph applied to every stream (EQ)
         # Callbacks
         on_state_change: Optional[Callable[[SinkState], None]] = None,
         on_device_connected: Optional[Callable[[str], None]] = None,          # addr
@@ -531,6 +559,7 @@ class SinkBackend:
         self._volume = max(0.0, min(2.0, volume))
         self._audio_device_index = audio_device_index
         self._ffmpeg_exe = ffmpeg_exe
+        self._audio_filter = audio_filter
 
         # GUI callbacks (assigned first: _log() below needs them)
         self._cb_state = on_state_change
@@ -665,6 +694,27 @@ class SinkBackend:
         if addr:
             cmd["addr"] = addr.upper()
         self._send_cmd(cmd)
+
+    # ---- equalizer -----------------------------------------------------
+
+    def set_audio_filter(self, audio_filter: str) -> None:
+        """
+        Replaces the FFmpeg filter graph (EQ). Running streams are restarted
+        on a worker thread so the change is audible within a second.
+        """
+        with self._lock:
+            if audio_filter == self._audio_filter:
+                return
+            self._audio_filter = audio_filter
+            restart = [(a, p.sample_rate, p.channels, self._codec_types.get(a, "sbc"))
+                       for a, p in self._pipelines.items()]
+
+        def worker() -> None:
+            for addr, rate, ch, codec in restart:
+                self._start_audio_pipeline(addr, rate, ch, codec)
+
+        if restart:
+            threading.Thread(target=worker, daemon=True, name="bt-eq").start()
 
     # ---- recording -----------------------------------------------------
 
@@ -1267,6 +1317,7 @@ class SinkBackend:
                 latency_ms=self._latency_ms,
                 device_index=device_index,
                 on_level=self._cb_level,
+                audio_filter=self._audio_filter,
             )
             with self._lock:
                 pipeline.set_volume(self._effective_gain(addr))

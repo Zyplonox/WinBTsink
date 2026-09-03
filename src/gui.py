@@ -28,7 +28,7 @@ import customtkinter as ctk
 import sounddevice as sd
 from PIL import Image, ImageDraw
 
-from backend import SinkBackend, SinkState
+from backend import SinkBackend, SinkState, build_eq_filter
 from device_store import DeviceStore
 from media_keys import MediaKeyListener
 from usb_devices import list_bluetooth_dongles
@@ -268,6 +268,9 @@ class Settings:
     multi_device_mode: str = "mix"         # "mix" | "duck" | "solo"
     duck_level: int = 25                   # background volume in percent for "duck"
     recording_dir: str = ""                # "" = ~/Music/BT-AudioSink
+    eq_bass: int = 0                       # dB, -12..+12 (0 = flat)
+    eq_mid: int = 0
+    eq_treble: int = 0
 
     #: Keys persisted in config.json and the JSON types accepted for each.
     _PERSIST: dict[str, tuple[type, ...]] = {
@@ -288,7 +291,14 @@ class Settings:
         "multi_device_mode":      (str,),
         "duck_level":             (int,),
         "recording_dir":          (str,),
+        "eq_bass":                (int,),
+        "eq_mid":                 (int,),
+        "eq_treble":              (int,),
     }
+
+    @property
+    def audio_filter(self) -> str:
+        return build_eq_filter(self.eq_bass, self.eq_mid, self.eq_treble)
 
     @property
     def effective_recording_dir(self) -> str:
@@ -1294,8 +1304,8 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title("BT-AudioSink")
-        self.geometry("480x860")
-        self.minsize(480, 700)
+        self.geometry("480x940")
+        self.minsize(480, 760)
         self.resizable(False, True)
 
         self._backend: Optional[SinkBackend] = None
@@ -1315,6 +1325,7 @@ class App(ctk.CTk):
         self._sent_avrcp_volume: dict[str, int] = {}   # addr → last absolute volume sent
         self._active_stream_addr = ""   # device whose stream started most recently
         self._media_keys: Optional[MediaKeyListener] = None
+        self._eq_after: Optional[str] = None   # pending after() id for the EQ debounce
 
         self._build_ui()
         self._log("Ready – scanning USB dongles…")
@@ -1368,6 +1379,7 @@ class App(ctk.CTk):
         self._build_device_section()
         self._build_level_section()
         self._build_volume_section()
+        self._build_eq_section()
         self._build_action_buttons()
         self._build_pairing_row()
         self._build_log_section()
@@ -1505,6 +1517,54 @@ class App(ctk.CTk):
             self, from_=0, to=200, number_of_steps=200,
             variable=self._vol_var, command=self._on_volume_change,
         ).pack(fill="x", padx=16, pady=(2, 8))
+
+    def _build_eq_section(self) -> None:
+        """Three-band equalizer, adjustable live (restarts the FFmpeg decoders)."""
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=20, pady=(4, 0))
+        ctk.CTkLabel(header, text="Equalizer", font=ctk.CTkFont(size=12),
+                     text_color="#9CA3AF").pack(side="left")
+        ctk.CTkButton(header, text="Flat", width=48, height=20, font=ctk.CTkFont(size=11),
+                      fg_color="#374151", hover_color="#4B5563",
+                      command=self._eq_reset).pack(side="right")
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(2, 6))
+        self._eq_vars: dict[str, ctk.IntVar] = {}
+        self._eq_labels: dict[str, ctk.CTkLabel] = {}
+        for key, title in (("eq_bass", "Bass"), ("eq_mid", "Mid"), ("eq_treble", "Treble")):
+            col = ctk.CTkFrame(row, fg_color="transparent")
+            col.pack(side="left", fill="x", expand=True, padx=4)
+            var = ctk.IntVar(value=getattr(settings, key))
+            self._eq_vars[key] = var
+            ctk.CTkSlider(col, from_=-12, to=12, number_of_steps=24, variable=var,
+                          command=lambda v, k=key: self._eq_changed(k, int(v)),
+                          ).pack(fill="x")
+            lbl = ctk.CTkLabel(col, text=f"{title} {getattr(settings, key):+d} dB",
+                               font=ctk.CTkFont(size=11), text_color="#9CA3AF")
+            lbl.pack()
+            self._eq_labels[key] = lbl
+
+    def _eq_changed(self, key: str, value: int) -> None:
+        setattr(settings, key, value)
+        title = {"eq_bass": "Bass", "eq_mid": "Mid", "eq_treble": "Treble"}[key]
+        self._eq_labels[key].configure(text=f"{title} {value:+d} dB")
+        self._schedule_eq_apply()
+
+    def _eq_reset(self) -> None:
+        for key, var in self._eq_vars.items():
+            var.set(0)
+            self._eq_changed(key, 0)
+
+    def _schedule_eq_apply(self) -> None:
+        """Debounces slider drags: the decoders restart 400 ms after the last change."""
+        if self._eq_after is not None:
+            self.after_cancel(self._eq_after)
+        self._eq_after = self.after(400, self._apply_eq)
+
+    def _apply_eq(self) -> None:
+        self._eq_after = None
+        if self._backend:
+            self._backend.set_audio_filter(settings.audio_filter)
 
     def _build_action_buttons(self) -> None:
         """Start/Stop toggle and Settings button side by side."""
@@ -1904,6 +1964,7 @@ class App(ctk.CTk):
             offer_aptx=settings.offer_aptx,
             multi_device_mode=settings.multi_device_mode,
             duck_level=settings.duck_level / 100.0,
+            audio_filter=settings.audio_filter,
             on_state_change=self._ui(gen, self._on_state_change),
             on_device_connected=self._ui(gen, self._on_device_connected),
             on_device_disconnected=self._ui(gen, self._on_device_disconnected),
