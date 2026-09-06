@@ -13,6 +13,44 @@ Devices such as a Nintendo Switch 2, phone, or tablet pair with your PC and stre
 
 ---
 
+## What's new in 2.1
+
+**Per-device control.** Every connected source gets its own card: AVRCP player
+buttons, volume and mute, its own audio output device, the negotiated codec, live
+stream statistics (bitrate, packet loss, buffer, underruns) and a disconnect button.
+
+**Remembered devices.** Names, per-device volume and an auto-connect flag are stored
+and reused. The PC can open a connection itself ("Connect to"), and auto-connect
+devices are connected right after Start.
+
+**More audio options.**
+
+- Playback modes when several devices stream at once: mix, duck the others, or solo the newest
+- Three-band equalizer (bass / mid / treble, +/-12 dB) applied live to all streams
+- Record a device's decoded audio to WAV
+- SBC block length, subbands and allocation are offered as real sink capabilities
+- Optional aptX / aptX HD endpoints (experimental)
+
+**Desktop integration.** Windows toast notifications, a live tray tooltip, keyboard
+media keys forwarded over AVRCP, a German user interface that follows the Windows
+display language, and a start-up check for newer GitHub releases.
+
+**Headless and remote.** The sink runs without a window (`--headless`), and both
+modes can expose a small HTTP control API on localhost with a browser remote page.
+
+**Fixes and internals.**
+
+- Backend rewritten from asyncio to plain threads; stop, crash and pairing races fixed
+- C engine: corrected state handling, clean shutdown, JSON output, and dongle selection by USB device path
+- Incoming AVRCP connections now pass the same approval gate as A2DP
+- Bonding keys live in `%APPDATA%\BT-AudioSink` and are migrated from pre-2.1 installs automatically
+- Toasts and the taskbar entry say BT-AudioSink instead of Python
+- One FFmpeg binary in the EXE instead of two, `pyusb` dropped
+- The BTstack source patches are one marker-guarded script
+- Equalizer: the treble slider is no longer clipped at the window edge
+
+---
+
 ## How it works
 
 Windows supports Bluetooth A2DP Sink mode natively on recent builds
@@ -29,12 +67,12 @@ This program works by:
 1. Installing the **WinUSB driver** for your dongle (via Zadig https://github.com/pbatard/libwdi)
 2. Using **BTstack** (a C Bluetooth stack compiled to `btstack_sink.exe`) to access the dongle directly via USB – bypassing Windows entirely
 3. Advertising the PC as a Bluetooth speaker
-4. Decoding incoming SBC or AAC audio with **FFmpeg** (bundled)
+4. Decoding incoming SBC, AAC or aptX audio with **FFmpeg** (bundled)
 5. Playing the audio through your PC speakers via **sounddevice** (WASAPI)
 
 ```
 BT device (Switch / phone / tablet)
-    │  Bluetooth A2DP / SBC or AAC
+    │  Bluetooth A2DP / SBC, AAC or aptX
     ▼
 USB dongle ──(WinUSB)──▶  btstack_sink.exe  (C, BTstack)
                                 │  audio frames (per-device, tagged)
@@ -61,8 +99,8 @@ USB dongle ──(WinUSB)──▶  btstack_sink.exe  (C, BTstack)
 3. Install the WinUSB driver once: **Install WinUSB…**
 4. Click **Start** → pair your device → done
 
-> **Note:** The EXE is large (~50 MB) because it bundles a full FFmpeg binary
-> needed to decode Bluetooth SBC/AAC audio.
+> **Note:** The EXE is large (~62 MB) because it bundles a full FFmpeg binary
+> needed to decode Bluetooth SBC/AAC/aptX audio.
 
 ### Option B – Run from source
 
@@ -232,7 +270,7 @@ Everything lives in `%APPDATA%\BT-AudioSink\`:
 To reset all pairings use **Settings → Forget all paired devices** (or delete both files).
 
 Upgrading from a version before 2.1 (keys used to live next to `btstack_sink.exe`):
-the old `btstackuildtstack_keys.db` is copied to the new location on first start,
+the old `btstack\build\btstack_keys.db` is copied to the new location on first start,
 so already paired devices keep connecting without pairing again.
 
 ---
@@ -357,6 +395,8 @@ WinBTsink/
 │   ├── device_store.py     ← Remembered devices (name, volume, auto-connect)
 │   ├── api_server.py       ← Local HTTP control API
 │   ├── media_keys.py       ← Keyboard media keys → AVRCP
+│   ├── i18n.py             ← English / German user interface
+│   ├── update_check.py     ← Looks for a newer GitHub release
 │   ├── usb_devices.py      ← Attached USB Bluetooth dongles via SetupAPI
 │   └── winusb_installer.py ← Zadig download / launch helper
 ├── btstack/
