@@ -1424,13 +1424,17 @@ class App(ctk.CTk):
         row.pack(fill="x", padx=16, pady=(2, 6))
         self._eq_vars: dict[str, ctk.IntVar] = {}
         self._eq_labels: dict[str, ctk.CTkLabel] = {}
-        for key, title in (("eq_bass", "Bass"), ("eq_mid", "Mid"), ("eq_treble", "Treble")):
+        # Three equal grid columns: pack would keep the sliders' default 200 px
+        # request and clip the third column at the window's width.
+        for i, (key, title) in enumerate((("eq_bass", "Bass"), ("eq_mid", "Mid"),
+                                          ("eq_treble", "Treble"))):
+            row.grid_columnconfigure(i, weight=1, uniform="eq")
             col = ctk.CTkFrame(row, fg_color="transparent")
-            col.pack(side="left", fill="x", expand=True, padx=4)
+            col.grid(row=0, column=i, sticky="ew", padx=4)
             var = ctk.IntVar(value=getattr(settings, key))
             self._eq_vars[key] = var
             ctk.CTkSlider(col, from_=-12, to=12, number_of_steps=24, variable=var,
-                          command=lambda v, k=key: self._eq_changed(k, int(v)),
+                          width=80, command=lambda v, k=key: self._eq_changed(k, int(v)),
                           ).pack(fill="x")
             lbl = ctk.CTkLabel(col, text=f"{title} {getattr(settings, key):+d} dB",
                                font=ctk.CTkFont(size=11), text_color="#9CA3AF")
