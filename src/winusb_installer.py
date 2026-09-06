@@ -20,8 +20,9 @@ import os
 import subprocess
 import sys
 import threading
+import urllib.parse
 import urllib.request
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from usb_devices import UsbDevice, list_bluetooth_dongles
 
@@ -29,6 +30,12 @@ _RELEASES_API = "https://api.github.com/repos/pbatard/libwdi/releases/latest"
 _USER_AGENT = "BT-AudioSink"
 _ZADIG_MIN_BYTES = 1_000_000      # zadig.exe is ~5 MB; anything smaller is a broken download
 _NET_TIMEOUT_S = 30
+
+#: Hosts a Zadig download may come from. The download URL is taken from
+#: the libwdi release JSON, so it is remote input, and the file it points
+#: at is run with elevation afterwards.
+_ALLOWED_HOSTS = ("github.com", "api.github.com")
+_ALLOWED_HOST_SUFFIX = ".githubusercontent.com"
 
 
 def list_native_bt_devices() -> list[UsbDevice]:
@@ -40,7 +47,36 @@ def list_native_bt_devices() -> list[UsbDevice]:
 # Zadig download and launch
 # ---------------------------------------------------------------------------
 
-def _find_zadig_asset(release_data: dict) -> Optional[dict]:
+def _check_url(url: str) -> str:
+    """
+    Returns *url* if it is an https URL on a GitHub host, else raises.
+
+    Applied to every request and to every redirect: a manipulated release
+    document could otherwise point at file:// (silently copying a local
+    file into the cache) or at http:// on a foreign host, and the result
+    is executed with UAC elevation.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https":
+        raise ValueError(f"refusing a non-https download URL: {url!r}")
+    host = (parts.hostname or "").lower()
+    if host not in _ALLOWED_HOSTS and not host.endswith(_ALLOWED_HOST_SUFFIX):
+        raise ValueError(f"refusing a download from an unexpected host: {host!r}")
+    return url
+
+
+class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
+    """Applies _check_url() to each redirect target; GitHub redirects to its CDN."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _check_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_CheckedRedirects)
+
+
+def _find_zadig_asset(release_data: dict) -> dict | None:
     """Returns the zadig*.exe asset dict from a GitHub release, or None."""
     for asset in release_data.get("assets", []):
         name = asset.get("name", "").lower()
@@ -49,7 +85,7 @@ def _find_zadig_asset(release_data: dict) -> Optional[dict]:
     return None
 
 
-def _download_zadig(dest: str, on_status: Callable[[str], None]) -> Optional[str]:
+def _download_zadig(dest: str, on_status: Callable[[str], None]) -> str | None:
     """
     Downloads the latest Zadig release to *dest*.
     Returns None on success or an error message.  Writes to a temporary
@@ -57,8 +93,9 @@ def _download_zadig(dest: str, on_status: Callable[[str], None]) -> Optional[str
     """
     try:
         on_status("Fetching release info from GitHub…")
-        req = urllib.request.Request(_RELEASES_API, headers={"User-Agent": _USER_AGENT})
-        with urllib.request.urlopen(req, timeout=_NET_TIMEOUT_S) as r:
+        req = urllib.request.Request(_check_url(_RELEASES_API),
+                                     headers={"User-Agent": _USER_AGENT})
+        with _opener.open(req, timeout=_NET_TIMEOUT_S) as r:
             release_data = json.loads(r.read())
     except Exception as exc:
         return f"GitHub request failed: {exc}"
@@ -70,9 +107,9 @@ def _download_zadig(dest: str, on_status: Callable[[str], None]) -> Optional[str
     part = dest + ".part"
     try:
         on_status(f"Downloading {asset['name']}…")
-        req = urllib.request.Request(asset["browser_download_url"],
+        req = urllib.request.Request(_check_url(str(asset.get("browser_download_url", ""))),
                                      headers={"User-Agent": _USER_AGENT})
-        with urllib.request.urlopen(req, timeout=_NET_TIMEOUT_S) as r, open(part, "wb") as f:
+        with _opener.open(req, timeout=_NET_TIMEOUT_S) as r, open(part, "wb") as f:
             while True:
                 chunk = r.read(64 * 1024)
                 if not chunk:

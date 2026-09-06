@@ -12,15 +12,28 @@ from __future__ import annotations
 import json
 import logging
 import re
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Optional
 
 log = logging.getLogger("bt-sink.update")
 
 GITHUB_REPO = "Zyplonox/WinBTsink"
 _API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
+
+
+def _safe_release_url(url: str) -> str:
+    """
+    The release page the GUI opens in a browser comes from the API
+    response, so only an https github.com address is accepted; anything
+    else falls back to the releases page of this repository.
+    """
+    parts = urllib.parse.urlsplit(url or "")
+    if parts.scheme == "https" and (parts.hostname or "").lower() in ("github.com",
+                                                                     "www.github.com"):
+        return url
+    return RELEASES_URL
 
 
 @dataclass(frozen=True)
@@ -45,7 +58,7 @@ def _newer(a: tuple[int, ...], b: tuple[int, ...]) -> bool:
     return a + (0,) * (n - len(a)) > b + (0,) * (n - len(b))
 
 
-def fetch_latest(timeout: float = 10.0) -> Optional[Release]:
+def fetch_latest(timeout: float = 10.0) -> Release | None:
     """Latest published release, or None on any network/API problem."""
     try:
         req = urllib.request.Request(_API, headers={"User-Agent": "BT-AudioSink",
@@ -54,14 +67,14 @@ def fetch_latest(timeout: float = 10.0) -> Optional[Release]:
             data = json.loads(r.read())
         tag = str(data.get("tag_name", ""))
         return Release(tag=tag, version=parse_version(tag),
-                       url=str(data.get("html_url") or RELEASES_URL),
+                       url=_safe_release_url(str(data.get("html_url") or "")),
                        name=str(data.get("name") or tag))
     except Exception as exc:
         log.info("update check skipped: %s", exc)
         return None
 
 
-def check_for_update(current_version: str, timeout: float = 10.0) -> Optional[Release]:
+def check_for_update(current_version: str, timeout: float = 10.0) -> Release | None:
     """Returns the latest release if it is newer than current_version, else None."""
     latest = fetch_latest(timeout)
     if latest is None or not latest.version:
