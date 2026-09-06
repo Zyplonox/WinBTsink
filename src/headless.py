@@ -32,7 +32,6 @@ import logging
 import signal
 import sys
 import threading
-from typing import Optional
 
 from api_server import ApiServer, BackendController
 from backend import SinkBackend, SinkState
@@ -43,7 +42,7 @@ from usb_devices import list_bluetooth_dongles
 log = logging.getLogger("bt-sink.headless")
 
 
-def pick_dongle(wanted: str) -> Optional[str]:
+def pick_dongle(wanted: str) -> str | None:
     dongles = [d for d in list_bluetooth_dongles() if d.uses_winusb]
     if not dongles:
         return None
@@ -56,7 +55,7 @@ def pick_dongle(wanted: str) -> Optional[str]:
     return dongles[0].path_filter
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="BT-AudioSink headless runner")
     parser.add_argument("--dongle", default="")
     parser.add_argument("--name", default="")
@@ -79,7 +78,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.list_dongles:
         for d in list_bluetooth_dongles():
-            print(f"{d.label:50s} driver={d.service or '-':10s} filter={d.path_filter}")
+            print(f"{d.label:50s} driver={d.service or '-':10s} filter={d.path_filter}")  # noqa: T201
         return 0
 
     usb_filter = pick_dongle(args.dongle)
@@ -127,7 +126,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if backend is not None:
             backend.stop()
 
-    api: Optional[ApiServer] = None
+    api: ApiServer | None = None
     port = args.api if args.api is not None else (settings.api_port or 8765)
     if not args.no_api:
         try:

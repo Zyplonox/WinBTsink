@@ -20,15 +20,18 @@ import os
 import sys
 import threading
 import tkinter as tk
+from collections.abc import Callable
 from datetime import datetime
-from typing import Callable, Optional
+from typing import ClassVar
 
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 
+import i18n
 from api_server import ApiServer, BackendController
 from backend import SinkBackend, SinkState
 from config import (
+    VERSION,
     allowed_macs_file as _allowed_macs_file,
     appdata_dir as _appdata_dir,
     configure_logging,
@@ -40,10 +43,10 @@ from config import (
 )
 from device_store import DeviceStore
 from i18n import tr
-import i18n
 from media_keys import MediaKeyListener
 from update_check import RELEASES_URL, check_for_update, fetch_latest
-from config import VERSION
+from usb_devices import list_bluetooth_dongles
+from winusb_installer import download_and_run_zadig, list_native_bt_devices
 
 # Language must be known before the classes below build their option lists.
 settings.load()
@@ -58,8 +61,6 @@ if sys.platform == "win32":
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Zyplonox.BT-AudioSink")
     except Exception:
         pass
-from usb_devices import list_bluetooth_dongles
-from winusb_installer import download_and_run_zadig, list_native_bt_devices
 
 _WINUSB_AVAILABLE = sys.platform == "win32"
 
@@ -127,7 +128,7 @@ class SettingsDialog(ctk.CTkToplevel):
     "Clear remembered devices" button, which acts immediately.
     """
 
-    def __init__(self, parent: "App"):
+    def __init__(self, parent: App):
         super().__init__(parent)
         self.title("Settings")
         self.geometry("420x560")
@@ -171,7 +172,7 @@ class SettingsDialog(ctk.CTkToplevel):
         )
 
     # CoD display names and their corresponding integer CoD values
-    _COD_OPTIONS: list[tuple[str, int]] = [
+    _COD_OPTIONS: ClassVar[list[tuple[str, int]]] = [
         (tr("Headphones (0x240418)"),           0x240418),
         (tr("Speaker / Loudspeaker (0x240414)"), 0x240414),
         (tr("Car Audio (0x240420)"),             0x240420),
@@ -252,9 +253,10 @@ class SettingsDialog(ctk.CTkToplevel):
 
     # SBC encoder parameters the sink offers to the source. "Auto" advertises
     # every option and lets the source pick; a fixed value forces it.
-    _SBC_BLOCK_OPTIONS = ["Auto", "4", "8", "12", "16"]
-    _SBC_SUBBAND_OPTIONS = ["Auto", "4", "8"]
-    _SBC_ALLOC_OPTIONS = [("Auto", "auto"), ("Loudness", "loudness"), ("SNR", "snr")]
+    _SBC_BLOCK_OPTIONS: ClassVar[list[str]] = ["Auto", "4", "8", "12", "16"]
+    _SBC_SUBBAND_OPTIONS: ClassVar[list[str]] = ["Auto", "4", "8"]
+    _SBC_ALLOC_OPTIONS: ClassVar[list[tuple[str, str]]] = [
+        ("Auto", "auto"), ("Loudness", "loudness"), ("SNR", "snr")]
 
     def _add_sbc_rows(self) -> None:
         """Dropdowns for SBC block length, subbands and allocation method."""
@@ -294,13 +296,14 @@ class SettingsDialog(ctk.CTkToplevel):
             anchor="w", font=ctk.CTkFont(size=11), text_color="#9CA3AF", wraplength=360,
         ).pack(fill="x", padx=44)
 
-    _MULTI_OPTIONS = [
+    _MULTI_OPTIONS: ClassVar[list[tuple[str, str]]] = [
         (tr("Mix – all devices play together"), "mix"),
         (tr("Duck – others get quieter while the latest plays"), "duck"),
         (tr("Solo – only the latest device is audible"), "solo"),
     ]
 
-    _LANG_OPTIONS = [(tr("Auto (Windows language)"), "auto"), ("English", "en"), ("Deutsch", "de")]
+    _LANG_OPTIONS: ClassVar[list[tuple[str, str]]] = [
+        (tr("Auto (Windows language)"), "auto"), ("English", "en"), ("Deutsch", "de")]
 
     def _add_language_row(self) -> None:
         ctk.CTkLabel(self._s, text="Language", anchor="w").pack(fill="x", padx=20, pady=(12, 0))
@@ -573,7 +576,9 @@ class SettingsDialog(ctk.CTkToplevel):
             (val for lbl, val in self._MULTI_OPTIONS if lbl == self._multi_var.get()), "mix")
         settings.duck_level = int(self._duck_var.get())
         recdir = self._recdir_var.get().strip()
-        settings.recording_dir = "" if recdir == settings.effective_recording_dir and not settings.recording_dir else recdir
+        # Keep the default as "" so the folder follows the user profile.
+        is_default = recdir == settings.effective_recording_dir and not settings.recording_dir
+        settings.recording_dir = "" if is_default else recdir
         audio_name = self._audio_var.get()
         settings.audio_device_name = None if audio_name == "Default" else audio_name
         settings.debug_mode = self._debug_var.get()
@@ -758,7 +763,8 @@ class WinUSBDialog(ctk.CTkToplevel):
             ).pack(anchor="w", padx=8, pady=2)
 
         self._status_label.configure(
-            text=tr("{n} device(s) without WinUSB – select in Zadig and install driver.").format(n=len(devices)),
+            text=tr("{n} device(s) without WinUSB – select in Zadig and install driver.")
+            .format(n=len(devices)),
             text_color="#9CA3AF",
         )
 
@@ -900,7 +906,7 @@ class DeviceCard(ctk.CTkFrame):
       Row 4:  MAC address in small grey text
     """
 
-    _STATUS_TEXT = {
+    _STATUS_TEXT: ClassVar[dict[str, str]] = {
         "playing": tr("▶ playing"), "paused": tr("⏸ paused"), "stopped": tr("■ stopped"),
         "seeking": tr("⏩ seeking"), "error": tr("player error"), "": "",
     }
@@ -1060,13 +1066,14 @@ class DeviceCard(ctk.CTkFrame):
         """Updates the device name label once the remote name is resolved."""
         self._name_label.configure(text=name)
 
-    def set_codec(self, codec: str, info: Optional[dict] = None) -> None:
+    def set_codec(self, codec: str, info: dict | None = None) -> None:
         """Updates the codec badge, e.g. 'AAC 44.1k' or 'SBC 16/8/L bp53'."""
         text = codec.upper()
         info = info or {}
         if codec == "sbc" and info.get("block_length"):
             alloc = "S" if info.get("allocation") == "snr" else "L"
-            text = f"SBC {info['block_length']}/{info.get('subbands', '?')}/{alloc} bp{info.get('bitpool', '?')}"
+            text = (f"SBC {info['block_length']}/{info.get('subbands', '?')}/{alloc}"
+                    f" bp{info.get('bitpool', '?')}")
         elif info.get("sample_rate"):
             text = f"{text.replace('_', ' ')} {info['sample_rate'] / 1000:g}k"
         self._codec_badge.configure(text=text, width=max(36, 7 * len(text)))
@@ -1126,26 +1133,26 @@ class App(ctk.CTk):
         self.minsize(480, 760)
         self.resizable(False, True)
 
-        self._backend: Optional[SinkBackend] = None
+        self._backend: SinkBackend | None = None
         self.device_store = DeviceStore(_allowed_macs_file())   # shared with backend + settings
         self._backend_gen = 0           # bumped on every start/stop; stale callbacks are dropped
         self._running = False
         self._level_value = 0.0         # written by the audio thread, read by _poll_level
         self._level_smooth = 0.0
         self._available_dongles: list[tuple[str, str]] = []   # (path_filter, label)
-        self._tray_icon: Optional[object] = None
+        self._tray_icon: object | None = None
         self._in_tray = False  # Guards against recursive tray transitions
         self._connected_devices: dict[str, str] = {}  # addr_upper → display name
         self._device_cards: dict[str, DeviceCard] = {}  # addr_upper → card widget
         self._pairing_dialogs: dict[str, PairingDialog] = {}  # addr_upper → open dialog
         self._autostart_bt = start_minimized  # Start BT after dongle scan on autostart
-        self._pairing_switch: Optional[ctk.CTkSwitch] = None
+        self._pairing_switch: ctk.CTkSwitch | None = None
         self._sent_avrcp_volume: dict[str, int] = {}   # addr → last absolute volume sent
         self._active_stream_addr = ""   # device whose stream started most recently
-        self._media_keys: Optional[MediaKeyListener] = None
-        self._eq_after: Optional[str] = None   # pending after() id for the EQ debounce
-        self._api: Optional[ApiServer] = None
-        self._stop_thread: Optional[threading.Thread] = None
+        self._media_keys: MediaKeyListener | None = None
+        self._eq_after: str | None = None   # pending after() id for the EQ debounce
+        self._api: ApiServer | None = None
+        self._stop_thread: threading.Thread | None = None
 
         self._build_ui()
         self._log("Ready – scanning USB dongles…")
@@ -1189,7 +1196,8 @@ class App(ctk.CTk):
             self._update_url = release.url
             self._version_label.configure(text=tr("⬆ Update {tag} available").format(tag=release.tag),
                                           text_color="#F59E0B")
-            self._log(tr("Version {tag} is available – click to open the release page.").format(tag=release.tag))
+            self._log(tr("Version {tag} is available – click to open the release page.")
+                      .format(tag=release.tag))
             self._notify(tr("Update available"), release.name)
         elif not quiet:
             self._log(tr("You are running the latest version ({v}).").format(v=VERSION)
@@ -1230,7 +1238,7 @@ class App(ctk.CTk):
     # Backend → mainloop marshalling
     # ------------------------------------------------------------------
 
-    def _ui(self, gen: Optional[int], fn: Callable) -> Callable:
+    def _ui(self, gen: int | None, fn: Callable) -> Callable:
         """
         Wraps a backend callback so it runs on the Tk mainloop.  With a
         generation number the call is dropped when that backend has since
@@ -1243,7 +1251,7 @@ class App(ctk.CTk):
                 pass  # mainloop already gone (app is quitting)
         return wrapper
 
-    def _dispatch(self, gen: Optional[int], fn: Callable, args: tuple) -> None:
+    def _dispatch(self, gen: int | None, fn: Callable, args: tuple) -> None:
         if gen is not None and gen != self._backend_gen:
             return
         fn(*args)
@@ -2003,7 +2011,8 @@ class App(ctk.CTk):
         if existing and existing.winfo_exists():
             return   # the backend merges retries into the open question
         self._log(f"Pairing request from: {addr}")
-        self._notify(tr("Pairing request"), tr("{addr} wants to connect – answer within 30 s.").format(addr=addr))
+        self._notify(tr("Pairing request"),
+                     tr("{addr} wants to connect – answer within 30 s.").format(addr=addr))
 
         def answer(approved: bool, remember: bool) -> None:
             self._pairing_dialogs.pop(addr, None)
@@ -2092,7 +2101,7 @@ class App(ctk.CTk):
             self._log(f"Tray icon unavailable ({exc}).")
             return False
 
-    def _build_tray_menu(self) -> "_pystray.Menu":
+    def _build_tray_menu(self) -> _pystray.Menu:
         """Constructs the right-click context menu for the tray icon."""
         return _pystray.Menu(
             _pystray.MenuItem(tr("Show Window"), self._tray_show, default=True),

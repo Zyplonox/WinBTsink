@@ -40,13 +40,14 @@ import subprocess
 import sys
 import threading
 import time
+import wave
+from collections.abc import Callable
 from enum import Enum, auto
 from pathlib import Path
-from typing import Callable, Optional
+from typing import ClassVar
 
 import numpy as np
 import sounddevice as sd
-import wave
 
 from device_store import DeviceStore
 
@@ -113,11 +114,11 @@ class WavRecorder:
     def __init__(self, base_path: Path):
         self._base = base_path
         self._lock = threading.Lock()
-        self._wav: Optional[wave.Wave_write] = None
-        self._fmt: Optional[tuple[int, int]] = None
+        self._wav: wave.Wave_write | None = None
+        self._fmt: tuple[int, int] | None = None
         self._part = 0
         self._closed = False
-        self.path: Optional[Path] = None
+        self.path: Path | None = None
         self.frames = 0
 
     def open(self, sample_rate: int, channels: int) -> Path:
@@ -131,7 +132,7 @@ class WavRecorder:
             path = self._base if self._part == 1 else self._base.with_name(
                 f"{self._base.stem}_part{self._part}{self._base.suffix}")
             path.parent.mkdir(parents=True, exist_ok=True)
-            w = wave.open(str(path), "wb")
+            w = wave.open(str(path), "wb")  # noqa: SIM115 - closed by _close_locked()
             w.setnchannels(channels)
             w.setsampwidth(2)
             w.setframerate(sample_rate)
@@ -183,8 +184,8 @@ class AudioPipeline:
         codec: str = "sbc",         # "sbc" or "aac"
         ffmpeg_exe: str = "ffmpeg",
         latency_ms: int = 150,
-        device_index: Optional[int] = None,
-        on_level: Optional[Callable[[float], None]] = None,
+        device_index: int | None = None,
+        on_level: Callable[[float], None] | None = None,
         audio_filter: str = "",     # FFmpeg -af graph, e.g. from build_eq_filter()
     ):
         self._codec = codec
@@ -197,19 +198,19 @@ class AudioPipeline:
         # Inter-thread PCM queue.  Max size limits buffering to ~6 s at 44.1 kHz.
         self._pcm_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=500)
 
-        self._ffmpeg: Optional[subprocess.Popen] = None
-        self._sd_stream: Optional[sd.OutputStream] = None
+        self._ffmpeg: subprocess.Popen | None = None
+        self._sd_stream: sd.OutputStream | None = None
         self._lock = threading.Lock()  # Guards _ffmpeg / _active across threads
         self._active = False
         self._sample_rate = 44100
         self._channels = 2
         self._volume: float = 1.0  # Linear multiplier; 1.0 = unity, 2.0 = double
         self.underruns = 0         # callbacks that found the PCM queue empty
-        self._pcm_tap: Optional[Callable[[bytes], None]] = None  # e.g. WavRecorder.write
-        self._pcm_tap_error: Optional[Callable[[Exception], None]] = None
+        self._pcm_tap: Callable[[bytes], None] | None = None  # e.g. WavRecorder.write
+        self._pcm_tap_error: Callable[[Exception], None] | None = None
 
-    def set_pcm_tap(self, tap: Optional[Callable[[bytes], None]],
-                    on_error: Optional[Callable[[Exception], None]] = None) -> None:
+    def set_pcm_tap(self, tap: Callable[[bytes], None] | None,
+                    on_error: Callable[[Exception], None] | None = None) -> None:
         """
         Receives every decoded PCM block (before volume) on the reader thread.
         If the tap raises it is detached and on_error is called (reader thread).
@@ -318,7 +319,7 @@ class AudioPipeline:
 
     #: FFmpeg demuxer per Bluetooth codec. aptX streams are raw sample data,
     #: so the demuxer has to be told the negotiated rate.
-    _INPUT_ARGS = {
+    _INPUT_ARGS: ClassVar[dict[str, list[str]]] = {
         "sbc":     ["-f", "sbc"],
         "aac":     ["-f", "latm"],
         "aptx":    ["-f", "aptx", "-sample_rate", "{rate}"],
@@ -473,7 +474,7 @@ class AudioPipeline:
 
         self._report_level(block)
 
-    def _report_level(self, block: Optional[np.ndarray]) -> None:
+    def _report_level(self, block: np.ndarray | None) -> None:
         """Computes RMS of the played PCM block and forwards it to the GUI."""
         if not self._on_level:
             return
@@ -497,7 +498,7 @@ class _PendingApproval:
     def __init__(self, addr: str, cid: int):
         self.addr = addr
         self.cids = [cid]
-        self.timer: Optional[threading.Timer] = None
+        self.timer: threading.Timer | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -524,11 +525,11 @@ class SinkBackend:
         latency_ms: int = 50,
         max_bitpool: int = 53,
         volume: float = 1.0,
-        audio_device_index: Optional[int] = None,
+        audio_device_index: int | None = None,
         ffmpeg_exe: str = "ffmpeg",
         debug: bool = False,
-        keystore_path: Optional[str] = None,
-        device_store: Optional[DeviceStore] = None,   # remembered devices (shared with the GUI)
+        keystore_path: str | None = None,
+        device_store: DeviceStore | None = None,   # remembered devices (shared with the GUI)
         discoverable_timeout_s: int = 0,
         class_of_device: int = 0x240418,
         sbc_block_length: int = 0,          # 4/8/12/16, 0 = let the source choose
@@ -539,20 +540,20 @@ class SinkBackend:
         duck_level: float = 0.25,           # gain for background devices in "duck" mode
         audio_filter: str = "",             # FFmpeg -af graph applied to every stream (EQ)
         # Callbacks
-        on_state_change: Optional[Callable[[SinkState], None]] = None,
-        on_device_connected: Optional[Callable[[str], None]] = None,          # addr
-        on_device_disconnected: Optional[Callable[[str], None]] = None,       # addr
-        on_device_name: Optional[Callable[[str, str], None]] = None,          # addr, name
-        on_audio_level: Optional[Callable[[float], None]] = None,
-        on_log: Optional[Callable[[str], None]] = None,
-        on_pairing_request: Optional[Callable[[str, Callable], None]] = None, # addr, resolve(approved, remember)
-        on_volume_changed: Optional[Callable[[str, int], None]] = None,       # addr, vol_0_127
-        on_metadata: Optional[Callable[[str, dict], None]] = None,            # addr, {title,artist,album}
-        on_audio_start: Optional[Callable[[str, str, dict], None]] = None,    # addr, codec, stream info
-        on_pairing_timeout: Optional[Callable[[], None]] = None,
-        on_playback_status: Optional[Callable[[str, str], None]] = None,      # addr, playing|paused|stopped|...
-        on_connect_failed: Optional[Callable[[str], None]] = None,            # addr (outgoing connect)
-        on_stats: Optional[Callable[[str, dict], None]] = None,               # addr, stream statistics
+        on_state_change: Callable[[SinkState], None] | None = None,
+        on_device_connected: Callable[[str], None] | None = None,          # addr
+        on_device_disconnected: Callable[[str], None] | None = None,       # addr
+        on_device_name: Callable[[str, str], None] | None = None,          # addr, name
+        on_audio_level: Callable[[float], None] | None = None,
+        on_log: Callable[[str], None] | None = None,
+        on_pairing_request: Callable[[str, Callable], None] | None = None, # addr, resolve(approved, remember)
+        on_volume_changed: Callable[[str, int], None] | None = None,       # addr, vol_0_127
+        on_metadata: Callable[[str, dict], None] | None = None,            # addr, {title,artist,album}
+        on_audio_start: Callable[[str, str, dict], None] | None = None,    # addr, codec, stream info
+        on_pairing_timeout: Callable[[], None] | None = None,
+        on_playback_status: Callable[[str, str], None] | None = None,      # addr, playing|paused|stopped|...
+        on_connect_failed: Callable[[str], None] | None = None,            # addr (outgoing connect)
+        on_stats: Callable[[str, dict], None] | None = None,               # addr, stream statistics
     ):
         # BT / USB parameters
         self._device_name = device_name
@@ -568,7 +569,7 @@ class SinkBackend:
         self._duck_level = max(0.0, min(1.0, duck_level))
         self._stream_order: list[str] = []             # streaming devices, most recent last
         self._connect_queue: list[str] = []            # outgoing connects, one at a time
-        self._connecting: Optional[str] = None
+        self._connecting: str | None = None
 
         # Audio parameters
         self._latency_ms = latency_ms
@@ -602,7 +603,7 @@ class SinkBackend:
         # Pairing / discoverability control
         self._pairing_allowed = True
         self._discoverable_timeout_s = discoverable_timeout_s
-        self._discoverable_timer: Optional[threading.Timer] = None
+        self._discoverable_timer: threading.Timer | None = None
         self._discoverable_timer_id = 0
         self._pending: dict[str, _PendingApproval] = {}    # addr → open pairing question
         self._session_allowed: dict[str, float] = {}       # "allow once" addr → approval time
@@ -612,7 +613,7 @@ class SinkBackend:
         self._started = False
         self._stopping = False
         self._state = SinkState.IDLE
-        self._proc: Optional[subprocess.Popen] = None
+        self._proc: subprocess.Popen | None = None
         self._cmd_lock = threading.Lock()                  # serialises stdin writes
         self._threads: list[threading.Thread] = []
         self._pipelines: dict[str, AudioPipeline] = {}     # addr → pipeline
@@ -620,7 +621,7 @@ class SinkBackend:
         self._streaming: set[str] = set()                  # addrs between audio_start/stop
         self._connected_addrs: set[str] = set()
         self._codec_types: dict[str, str] = {}             # addr → "sbc" or "aac"
-        self._device_audio_routes: dict[str, Optional[int]] = {}  # addr → sd device index
+        self._device_audio_routes: dict[str, int | None] = {}  # addr → sd device index
         self._device_volumes: dict[str, float] = {}        # addr → per-device gain
         self._device_muted: set[str] = set()
         self._recorders: dict[str, WavRecorder] = {}       # addr → active recording
@@ -741,7 +742,7 @@ class SinkBackend:
                 self._stream_order.remove(addr)
         self._apply_gains()
 
-    def _apply_gains(self, only_addr: Optional[str] = None) -> None:
+    def _apply_gains(self, only_addr: str | None = None) -> None:
         with self._lock:
             targets = [(a, p, self._effective_gain(a)) for a, p in self._pipelines.items()
                        if only_addr is None or a == only_addr]
@@ -807,7 +808,7 @@ class SinkBackend:
         self._log(f"Recording {addr} → {base}")
         return base
 
-    def stop_recording(self, addr: str) -> Optional[Path]:
+    def stop_recording(self, addr: str) -> Path | None:
         addr = addr.upper()
         with self._lock:
             rec = self._recorders.pop(addr, None)
@@ -893,7 +894,7 @@ class SinkBackend:
                 if allowed:
                     self._arm_discoverable_timer()
 
-    def set_device_audio_route(self, addr: str, device_index: Optional[int]) -> None:
+    def set_device_audio_route(self, addr: str, device_index: int | None) -> None:
         """
         Change the sounddevice output for a specific connected source on the
         fly. The pipeline restart takes up to a few seconds, so it runs on a
@@ -973,12 +974,12 @@ class SinkBackend:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _find_btstack_exe() -> Optional[Path]:
+    def _find_btstack_exe() -> Path | None:
         """Locates btstack_sink.exe in a PyInstaller bundle or the source tree."""
         candidates: list[Path] = []
         if getattr(sys, "frozen", False):
             # PyInstaller onefile extracts bundled binaries into _MEIPASS
-            candidates.append(Path(getattr(sys, "_MEIPASS")) / "btstack_sink.exe")
+            candidates.append(Path(sys._MEIPASS) / "btstack_sink.exe")
         here = Path(__file__).resolve().parent
         candidates.append(here.parent / "btstack" / "build" / "btstack_sink.exe")
         candidates.append(here / "btstack_sink.exe")

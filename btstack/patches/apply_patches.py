@@ -32,9 +32,9 @@ from __future__ import annotations
 import re
 import shutil
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 
 class PatchError(Exception):
@@ -146,7 +146,8 @@ void {prefix}_decline_incoming_connection(uint16_t local_cid);
             return (
                 f"{m.group(1)}{indent}/* {marker_callsite} */\n"
                 f"{indent}if ({prefix}_incoming_connection_handler_cb) {{\n"
-                f"{indent}    /* Application decides; it must call {prefix}_accept/decline_incoming_connection() */\n"
+                f"{indent}    /* Application decides; it must call "
+                f"{prefix}_accept/decline_incoming_connection() */\n"
                 f"{indent}    {prefix}_incoming_connection_handler_cb(local_cid, event_addr);\n"
                 f"{indent}}} else {{\n"
                 f"{indent}    l2cap_accept_connection(local_cid);\n"

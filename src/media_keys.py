@@ -17,7 +17,7 @@ import ctypes
 import logging
 import sys
 import threading
-from typing import Callable, Optional
+from collections.abc import Callable
 
 log = logging.getLogger("bt-sink.mediakeys")
 
@@ -38,7 +38,7 @@ class MediaKeyListener:
 
     def __init__(self, on_key: Callable[[str], None]):
         self._on_key = on_key
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._thread_id = 0
         self._ready = threading.Event()
         self._registered = 0

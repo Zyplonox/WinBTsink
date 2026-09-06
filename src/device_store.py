@@ -25,17 +25,16 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Optional
 
 log = logging.getLogger("bt-sink.devices")
 
 
 class DeviceStore:
-    def __init__(self, path: Optional[str]):
+    def __init__(self, path: str | None):
         self.path = Path(path) if path else None
         self.devices: dict[str, dict] = {}
         self.forget_keys: list[str] = []
-        self.load_error: Optional[str] = None
+        self.load_error: str | None = None
         self.load()
 
     # ------------------------------------------------------------------
@@ -77,7 +76,7 @@ class DeviceStore:
             self.load_error = f"{self.path.name}: {exc}"
             log.warning("device store unreadable: %s", exc)
 
-    def save(self) -> Optional[str]:
+    def save(self) -> str | None:
         """
         Writes the file; returns an error message instead of raising. An
         unreadable original is kept as .bak before it is overwritten, so a

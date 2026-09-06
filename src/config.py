@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import sys
-from typing import Optional
+from typing import ClassVar
 
 import sounddevice as sd
 
@@ -57,7 +57,7 @@ def allowed_macs_file() -> str:
     return os.path.join(appdata_dir(), "allowed_macs.json")
 
 
-def migrate_legacy_keystore() -> Optional[str]:
+def migrate_legacy_keystore() -> str | None:
     """
     Versions before 2.1 kept the bonding keys next to btstack_sink.exe
     (btstack\\build\\btstack_keys.db when running from source). Copy that
@@ -85,7 +85,7 @@ def migrate_legacy_keystore() -> Optional[str]:
 # Audio output device enumeration
 # ---------------------------------------------------------------------------
 
-def enumerate_output_devices() -> tuple[list[str], list[Optional[int]]]:
+def enumerate_output_devices() -> tuple[list[str], list[int | None]]:
     """
     Returns (display_names, device_indices) for the WASAPI output devices,
     with "Default" (index None) first.  Only the WASAPI host API is listed
@@ -93,7 +93,7 @@ def enumerate_output_devices() -> tuple[list[str], list[Optional[int]]]:
     are what gets persisted.
     """
     names: list[str] = ["Default"]
-    indices: list[Optional[int]] = [None]
+    indices: list[int | None] = [None]
     try:
         wasapi = next((i for i, api in enumerate(sd.query_hostapis())
                        if "WASAPI" in api["name"].upper()), None)
@@ -109,7 +109,7 @@ def enumerate_output_devices() -> tuple[list[str], list[Optional[int]]]:
     return names, indices
 
 
-def resolve_output_device_index(name: Optional[str]) -> Optional[int]:
+def resolve_output_device_index(name: str | None) -> int | None:
     """Maps a persisted device name to the current sounddevice index (None = default)."""
     if not name:
         return None
@@ -223,7 +223,7 @@ class Settings:
     usb_filter: str = ""                   # Selected dongle; chosen at runtime, not persisted
     latency_ms: int = 50
     max_bitpool: int = 53
-    audio_device_name: Optional[str] = None  # WASAPI output device; None = system default
+    audio_device_name: str | None = None  # WASAPI output device; None = system default
     debug_mode: bool = False
     autostart: bool = False
     volume: float = 1.0
@@ -247,7 +247,7 @@ class Settings:
     update_check: bool = True              # ask GitHub for a newer release at start-up
 
     #: Keys persisted in config.json and the JSON types accepted for each.
-    _PERSIST: dict[str, tuple[type, ...]] = {
+    _PERSIST: ClassVar[dict[str, tuple[type, ...]]] = {
         "device_name":            (str,),
         "latency_ms":             (int,),
         "max_bitpool":            (int,),

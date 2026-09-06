@@ -185,4 +185,4 @@ def _enumerate() -> list[UsbDevice]:
 
 if __name__ == "__main__":
     for dev in list_bluetooth_dongles():
-        print(f"{dev.label:50s} driver={dev.service or '-':10s} filter={dev.path_filter}")
+        print(f"{dev.label:50s} driver={dev.service or '-':10s} filter={dev.path_filter}")  # noqa: T201

@@ -39,8 +39,11 @@ import json
 import logging
 import re
 import threading
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Optional
+from typing import Any
+
+from api_page import INDEX_HTML
 
 log = logging.getLogger("bt-sink.api")
 
@@ -53,28 +56,6 @@ class ApiError(Exception):
         self.status = status
 
 
-_INDEX_HTML = """<!doctype html><meta charset="utf-8"><title>BT-AudioSink</title>
-<style>body{font-family:system-ui;background:#111827;color:#e5e7eb;margin:2em}
-.card{background:#1f2937;border-radius:8px;padding:1em;margin:.5em 0}button{margin:.2em}
-input[type=range]{width:200px}</style>
-<h2>BT-AudioSink</h2><div id="s">loading…</div>
-<script>
-async function api(p,b){const r=await fetch('/api'+p,{method:b?'POST':'GET',headers:{'content-type':'application/json'},body:b?JSON.stringify(b):undefined});return r.json();}
-async function render(){const s=await api('/status');let h=`<p>state: <b>${s.state}</b> · pairing ${s.pairing_allowed?'on':'off'}
- <button onclick="api('/pairing',{allowed:${!s.pairing_allowed}}).then(render)">toggle</button>
- · master <input type=range min=0 max=200 value=${Math.round(s.master_volume*100)} onchange="api('/volume',{percent:+this.value})"></p>`;
-for(const d of s.devices){h+=`<div class=card><b>${d.name||d.addr}</b> <small>${d.addr}</small> ${d.streaming?'▶ '+d.codec:''} ${d.playback}<br>
-<button onclick="api('/devices/${d.addr}/player',{action:'prev'})">⏮</button>
-<button onclick="api('/devices/${d.addr}/player',{action:'${d.playback==='playing'?'pause':'play'}'}).then(render)">${d.playback==='playing'?'⏸':'▶'}</button>
-<button onclick="api('/devices/${d.addr}/player',{action:'next'})">⏭</button>
-<button onclick="api('/devices/${d.addr}/mute',{muted:${!d.muted}}).then(render)">${d.muted?'🔇':'🔊'}</button>
-<input type=range min=0 max=100 value=${Math.round(d.volume*100)} onchange="api('/devices/${d.addr}/volume',{percent:+this.value})">
-<button onclick="api('/devices/${d.addr}/disconnect').then(render)">✕</button></div>`;}
-for(const r of s.remembered){if(!s.devices.some(d=>d.addr===r.addr))h+=`<div class=card>${r.name||r.addr} <small>${r.addr}</small>
- <button onclick="api('/devices/${r.addr}/connect').then(render)">connect</button></div>`;}
-document.getElementById('s').innerHTML=h;}
-render();setInterval(render,3000);
-</script>"""
 
 
 class ApiServer:
@@ -86,8 +67,8 @@ class ApiServer:
         self._controller = controller
         self._host = host
         self._port = int(port)
-        self._server: Optional[ThreadingHTTPServer] = None
-        self._thread: Optional[threading.Thread] = None
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
 
     @property
     def url(self) -> str:
@@ -116,7 +97,7 @@ class ApiServer:
                 try:
                     data = json.loads(self.rfile.read(length))
                 except ValueError:
-                    raise ApiError(400, "body must be JSON")
+                    raise ApiError(400, "body must be JSON") from None
                 if not isinstance(data, dict):
                     raise ApiError(400, "body must be a JSON object")
                 return data
@@ -124,7 +105,7 @@ class ApiServer:
             def do_GET(self):
                 try:
                     if self.path in ("/", "/index.html"):
-                        self._send(200, _INDEX_HTML, "text/html")
+                        self._send(200, INDEX_HTML, "text/html")
                     elif self.path == "/api/status":
                         self._send(200, controller.status())
                     else:
@@ -170,7 +151,7 @@ def _pct(body: dict, key: str = "percent", lo: int = 0, hi: int = 200) -> int:
     try:
         value = int(body[key])
     except (KeyError, TypeError, ValueError):
-        raise ApiError(400, f"'{key}' (integer) required")
+        raise ApiError(400, f"'{key}' (integer) required") from None
     if not lo <= value <= hi:
         raise ApiError(400, f"'{key}' must be {lo}..{hi}")
     return value
@@ -182,7 +163,7 @@ def _flag(body: dict, key: str) -> bool:
     return body[key]
 
 
-def dispatch_post(controller: Any, path: str, body: dict) -> Optional[dict]:
+def dispatch_post(controller: Any, path: str, body: dict) -> dict | None:
     if path == "/api/start":
         controller.start()
     elif path == "/api/stop":
@@ -197,7 +178,7 @@ def dispatch_post(controller: Any, path: str, body: dict) -> Optional[dict]:
             try:
                 bands.append(max(-12, min(12, int(body.get(key, 0)))))
             except (TypeError, ValueError):
-                raise ApiError(400, f"'{key}' must be an integer")
+                raise ApiError(400, f"'{key}' must be an integer") from None
         controller.set_eq(*bands)
     else:
         m = re.match(r"^/api/devices/([^/]+)/([a-z]+)$", path)
