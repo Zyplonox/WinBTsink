@@ -1,0 +1,10 @@
+# Development dependencies (linting, tests, packaging).
+#
+#   python -m pip install -r requirements.txt -r requirements-dev.txt
+#
+# The runtime dependencies in requirements.txt are needed as well: the tests
+# import the real modules.
+
+ruff>=0.6            # lint and import sorting, configured in pyproject.toml
+pytest>=8.0          # tests in tests/
+pyinstaller>=6.0     # builds dist/BT-AudioSink.exe (see build.ps1)

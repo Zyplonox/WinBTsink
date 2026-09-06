@@ -1,0 +1,75 @@
+# Tooling configuration for BT-AudioSink (project name: WinBTsink).
+#
+# The project is not installed as a package; src/ is put on sys.path by the
+# entry points (gui.py, headless.py) and by pytest via `pythonpath` below.
+# This file only carries tool settings.
+#
+#   python -m ruff check .        lint
+#   python -m pytest              tests that need no dongle
+#
+# Install both with:  python -m pip install -r requirements-dev.txt
+
+[tool.ruff]
+# src/ modules import each other flat ("import backend"), so ruff has to know
+# where first-party code lives to sort imports correctly.
+src = ["src"]
+line-length = 110
+target-version = "py310"
+extend-exclude = ["btstack/btstack-src", "build", "dist"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes: undefined names, unused imports and variables
+    "I",    # import sorting
+    "UP",   # pyupgrade: modern syntax for the supported Python versions
+    "B",    # bugbear: likely bugs (mutable defaults, bare raise in except, ...)
+    "C4",   # comprehension style
+    "SIM",  # simplifications
+    "RET",  # return-statement consistency
+    "PIE",  # misc lints
+    "PERF", # obvious performance mistakes
+    "A",    # shadowing a builtin
+    "T20",  # leftover print() calls
+    "RUF",  # ruff's own rules
+]
+ignore = [
+    # The sources deliberately use typographic characters: en dashes in prose,
+    # box drawing in the ASCII diagrams and German text in the translations.
+    "RUF001", "RUF002", "RUF003",
+    # contextlib.suppress() is not clearer than try/except/pass in the audio
+    # and Tk callbacks, and it is slower on the hot paths.
+    "SIM105",
+    # A multi-line if/else stays readable where the ternary would not fit.
+    "SIM108",
+    # dict(a=1, b=2) is intentional where the keys mirror keyword arguments.
+    "C408",
+    # try/except inside a loop is deliberate where one item may fail and the
+    # rest must still be processed.
+    "PERF203",
+]
+
+[tool.ruff.lint.isort]
+# Keep "from config import a, b as _b" in one statement instead of one
+# statement per aliased name.
+combine-as-imports = true
+
+[tool.ruff.lint.per-file-ignores]
+# Build-time script: its output is meant for the console.
+"btstack/patches/apply_patches.py" = ["T201"]
+# One self-contained HTML document: its JavaScript lines cannot be wrapped
+# without hurting readability, and a comment cannot be placed inside a string.
+"src/api_page.py" = ["E501"]
+# Translation table: the English keys must stay verbatim on one line so they
+# can be grepped from the source that produces them.
+"src/i18n.py" = ["E501"]
+
+[tool.ruff.lint.flake8-builtins]
+# Tk and CustomTkinter APIs use these names as keyword arguments.
+builtins-ignorelist = ["id", "type", "format", "filter"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

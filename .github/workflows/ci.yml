@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install ruff
+      - run: python -m ruff check .
+
+  test:
+    name: Tests (pytest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      # The tests import the real modules, so the runtime dependencies are
+      # needed. They never open a dongle, a window or the network.
+      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - run: python -m pytest
+
+  engine-header:
+    name: Engine / Python contract
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # btstack_sink.exe is not built here (it needs MSYS2 and a BTstack
+      # clone). This only checks that the C engine and the Python backend
+      # still agree on the command and event names they exchange.
+      - run: python tools/check_ipc_contract.py

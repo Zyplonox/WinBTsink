@@ -1,0 +1,20 @@
+# Normalise line endings in the repository: everything is stored as LF and
+# checked out with the platform's convention, independent of each clone's
+# core.autocrlf setting.
+* text=auto
+
+# Shell scripts must keep LF. MSYS2's bash tolerates CRLF, but WSL and Linux
+# bash do not, and btstack/do_build.sh is meant to run in either.
+*.sh        text eol=lf
+
+# Windows scripts stay CRLF so Notepad and the shell agree.
+*.ps1       text eol=crlf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# Never touch binaries.
+*.exe       binary
+*.db        binary
+*.png       binary
+*.ico       binary
+*.wav       binary
