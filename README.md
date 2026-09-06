@@ -357,6 +357,26 @@ Device Manager → `USB devices` → `Bluetooth USB Dongle (WinUSB)` → right-c
 
 ---
 
+## Development
+
+```powershell
+python -m pip install -r requirements.txt -r requirements-dev.txt
+
+python -m ruff check .              # lint (rules in pyproject.toml)
+python -m pytest                    # tests that need no dongle
+python tools/check_ipc_contract.py  # C engine and Python backend still agree
+```
+
+All three run in CI on every push and pull request.
+[CONTRIBUTING.md](CONTRIBUTING.md) has the coding rules: the process contract,
+which code runs on which thread, error handling, and where runtime files go.
+
+The tests cover what works without hardware, such as the settings and device
+files, the HTTP API, version comparison, the multi-device gain policy and audio
+frame parsing. Pairing and streaming have to be verified with a real device.
+
+---
+
 ## Technical details
 
 | Component | Purpose |
@@ -408,8 +428,13 @@ WinBTsink/
 │   ├── patches/apply_patches.py ← BTstack source patches (deferred accept, dongle filter)
 │   ├── btstack-src/        ← BTstack source (cloned by build.ps1, git-ignored)
 │   └── build/btstack_sink.exe ← Compiled BT engine (git-ignored)
-└── setup/
-    └── install.ps1         ← One-time Python setup script
+├── setup/
+│   └── install.ps1         ← One-time Python setup script
+├── tests/                  ← pytest suite (no hardware needed)
+├── tools/
+│   └── check_ipc_contract.py ← Compares the C engine and backend interfaces
+├── pyproject.toml          ← ruff and pytest configuration
+└── requirements-dev.txt    ← Lint, test and packaging dependencies
 
 %APPDATA%\BT-AudioSink\     ← Created automatically on first launch
 ├── config.json             ← Saved settings

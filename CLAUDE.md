@@ -8,7 +8,22 @@ WinBTsink turns a USB Bluetooth dongle into an A2DP audio sink on Windows, bypas
 
 ## Commands
 
-There is no test suite and no linter configured. Verification is manual: build, run, pair a device. `python -m pyflakes src/*.py` is a cheap sanity check.
+Checks that run in CI and should be run before committing:
+
+```powershell
+python -m pip install -r requirements.txt -r requirements-dev.txt   # one-time
+
+python -m ruff check .              # lint; rules and rationale in pyproject.toml
+python -m pytest                    # tests/ - no dongle, window, toast or network
+python tools/check_ipc_contract.py  # btstack_sink.c and backend.py still agree
+```
+
+There is no formatter: several tables are aligned by hand and `ruff format` would
+flatten them. The coding rules are in CONTRIBUTING.md; follow them for new code.
+
+Anything touching pairing, streaming or the dongle cannot be tested automatically
+and has to be verified with real hardware. Do not run the GUI tests while the user
+is testing: a window and Windows toasts appear on their desktop.
 
 ```powershell
 # Build the C engine (finds or installs MSYS2/MinGW, clones BTstack v1.6.1 into
